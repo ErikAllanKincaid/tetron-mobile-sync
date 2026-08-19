@@ -8,7 +8,8 @@ See `AGENTS.md` for the spec-first development workflow (same as core tetron and
 
 ## Status
 
-SYNC-001 done: crate + Gradle/Compose app scaffolded (host checks, Android cross-compile via cargo-ndk, UniFFI Kotlin bindings, debug APK with both ABIs, JVM unit + instrumented smoke tests). Nothing transfers yet. The build is scoped as SYNC-001..SYNC-011 in `spec/sync.py`; next implementation requirement: SYNC-002 (embedded oc-rsync engine with the vendored patched fork).
+SYNC-001 done: crate + Gradle/Compose app scaffolded (host checks, Android cross-compile via cargo-ndk, UniFFI Kotlin bindings, debug APK with both ABIs, JVM unit + instrumented smoke tests).
+SYNC-002 done: the embedded oc-rsync engine (vendored patched fork) runs host-side against a real `rsync --daemon` byte-identically, and all three wire-compat/resume tests in `tests/engine_rsyncd.rs` pass, including `--partial` resume from both a receiver-pre-seeded partial and a kill-mid-transfer partial. The build is scoped as SYNC-001..SYNC-011 in `spec/sync.py`; SYNC-003 is next.
 
 ## How it works (the one-paragraph version)
 
@@ -17,7 +18,7 @@ Two apps share a tetron mesh network. This app reads mesh state (own mesh IP, tu
 ## Repo layout
 
 ```
-Cargo.toml, src/lib.rs, uniffi-bindgen.rs   -- the sync-app Rust crate (not yet created; SYNC-001)
+Cargo.toml, src/lib.rs, uniffi-bindgen.rs   -- the sync-app Rust crate (repo root)
 vendor/oc-rsync/                            -- patched oc-rsync fork, applied + tracked (SYNC-002)
 android/                                    -- Gradle/Kotlin/Compose app (SYNC-001)
 spec/, reconcile.py, pyproject.toml         -- spec-first workflow, own from core's

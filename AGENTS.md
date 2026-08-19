@@ -14,46 +14,56 @@ tetron adds one thing: a mesh VPN. This repo is a product built on top of it: a 
 
 ## Roadmap / spec
 
-Status: SYNC-001 done (2026-08-18, `feat/sync-001-repo-scaffold`): crate + Gradle/Compose app scaffolded, host + Android cross-compile + UniFFI Kotlin bindings + debug APK all building, reconcile.py carries the cargo checks. **Correction 2026-08-19: NOT merged to `main`** -- `main` is missing SYNC-001's own scaffold commit (`79c1918`) entirely and sits one commit behind `feat/sync-001-repo-scaffold` (only `ebee5a3`, the pre-SYNC-001 spec-only scaffold commit). No remote is configured for this repo (`git remote -v` empty) -- everything so far is local-only.
+Status: SYNC-001 done (2026-08-18, `feat/sync-001-repo-scaffold`): crate + Gradle/Compose app scaffolded, host + Android cross-compile + UniFFI Kotlin bindings + debug APK all building, reconcile.py carries the cargo checks. Merged to `main` via merge commit `106790c` (2026-08-19); remote `origin` is configured on GitHub (ErikAllanKincaid/tetron-mobile-sync), so future merges go through PRs per the convention above.
 
-SYNC-002 (embedded oc-rsync engine) is functionally working but **still
-uncommitted** on `feat/sync-002-oc-rsync-embedding` as of 2026-08-19 -- a
-future agent picking up this branch should find real, uncommitted work in
-the tree, not a clean starting point. Current state: `vendor/oc-rsync/`
-(patched fork) is vendored and tracked; `src/lib.rs` implements
-`SyncEngine::run_client` against `oc-rsync-core`'s
+SYNC-002 (embedded oc-rsync engine) is **ACCEPTED as of 2026-08-19**.
+`vendor/oc-rsync/` (patched fork) is vendored and tracked; `src/lib.rs`
+implements `SyncEngine::run_client` against `oc-rsync-core`'s
 `run_client_with_observer`, with `SyncProgressListener` wired as a UniFFI
 callback interface; `src/bin/sync-test-helper.rs` (dev-only,
 `test-helper`-feature-gated) and `tests/engine_local.rs` +
 `tests/engine_rsyncd.rs` (the latter `#[ignore]`-gated on `rsync` being on
-PATH) exist. Verified 2026-08-19: `cargo -q check` clean, `cargo test`
-(5 unconditional: 1 lib unit test + 4 in `engine_local.rs`) passes.
+PATH) exist. `cargo -q check` clean, `cargo test` (5 unconditional: 1 lib
+unit test + 4 in `engine_local.rs`) passes, and all three
+`#[ignore]`-gated `tests/engine_rsyncd.rs` cases now pass:
+`cargo test --test engine_rsyncd -- --ignored --test-threads 1` is
+ok in ~82s.
 
-**Known bug, unresolved 2026-08-19: `tests/engine_rsyncd.rs`'s
-`push_resumes_from_existing_partial_at_receiver` hangs indefinitely**
-against a real local `rsync --daemon` -- reproduced twice, isolated by
-running each `#[ignore]`-gated test alone (`cargo test --test engine_rsyncd
--- --ignored --test-threads 1 <name>`). `push_to_rsyncd_is_byte_identical_
-and_idempotent` passes cleanly (1.8s). The hung process sits single-threaded
-in `sigsuspend` (`cat /proc/<pid>/status`/`wchan`), not blocked on socket
-I/O, with an open connected socket fd -- consistent with a deadlock in
-`run_client`'s handling of the "receiver already holds a same-named file
-with matching leading bytes" case specifically (this test pre-seeds the
-daemon module directory with the first 256KiB of the file *before* the
-transfer starts, unlike the SIGKILL test which produces the partial by
-interrupting a real in-flight run). Never got to run
-`killed_push_keeps_partial_and_next_run_resumes` (third test) because the
-suite hangs on the second one first -- its own pass/fail status is unknown,
-not verified passing. This directly contradicts the fork's SYNC-002 spike
-claim ("`--partial` resume... spike-verified 2026-08-19") for at least this
-one code path; do not trust that claim without re-verifying it against
-*this* embedding, not just the spike. Needs a debugging session (`gdb -p
-<pid>`, or instrument `run_client_with_observer`/the basis-file matching
-path in `vendor/oc-rsync/crates/core`) before SYNC-002 can be called
-accepted -- kill any stuck test process and its child `rsync --daemon`
-before retrying (`pkill -9 -f engine_rsyncd; pkill -9 -f 'rsync --daemon'`).
+**Resolved 2026-08-19: the "hang" in
+`push_resumes_from_existing_partial_at_receiver` was misdiagnosed as a
+deadlock in a prior session -- it was a pathological test fixture, not a
+bug in `run_client`.** The 10 MiB fixture was `vec![0xCDu8; N]`, every
+byte identical, which makes every rolling-checksum window in the file
+collide. The matcher's cheap weak-checksum prefilter
+(`tag_table`/`bithash` in `vendor/oc-rsync/crates/matching/src/index/mod.rs`)
+never gets to reject a candidate, so `find_match_slices_filtered` falls
+through to an expensive strong-checksum compute (`xxhash_rust::xxh3`) at
+nearly every byte offset. That is a few seconds of real work in
+`--release`, but the unoptimized `cargo test` debug profile stretched it
+past what a human waits out before calling it a hang. Confirmed with
+`sudo gdb -p <pid> -batch -ex "thread apply all bt"` (this host has
+`yama/ptrace_scope=1`, so attaching needs `sudo`; passwordless sudo is
+configured here): the test thread was actively running inside
+`DeltaGenerator::generate_with_prune`, not asleep on any lock, and a
+`--release` build of the same test completed in 7.6s. **Fix:** replaced
+the uniform-byte fixtures in `tests/engine_rsyncd.rs` with a small
+deterministic splitmix64 PRNG helper (`pseudo_random_bytes`) so
+rolling-checksum windows actually vary -- also a more representative
+fixture, since real photos/video are never a single repeated byte.
+`killed_push_keeps_partial_and_next_run_resumes` had genuinely never run
+before (the suite hung on the test before it in every prior session); with
+the fixture fixed it does run, but its original 400 MiB size still pushed
+the resume-side match past a minute in an unoptimized build, so it is now
+40 MiB with the bwlimit and kill-detection threshold scaled down to match
+(still leaves a multi-second kill window, not flaky). Processes from a
+killed run must be swept with **name-based** `pkill -9 -x rsync` /
+`pkill -9 -x sync-test-helper` only -- `pkill -f` self-matches the invoking
+shell's own command line (it contains these same names as plain text) and
+kills the session instead of the target; this cost real time in this
+session before being caught. See `spec/sync.py`'s SYNC-002 docstring for
+the full writeup.
 
-**Bug found + fixed 2026-08-19 (uncommitted, same branch):**
+**Bug found + fixed 2026-08-19 (committed in `301b0a3`):**
 `reconcile.py`'s `check_cargo_audit` required `count == 0` unconditionally,
 so the moment SYNC-002 landed real code, `python3 reconcile.py` would fail
 outright on the one advisory (RUSTSEC-2023-0071, rsa via russh) that
@@ -64,17 +74,15 @@ before counting; re-run confirms `cargo_audit: {"installed": true, "count":
 0}` now. If you add a new accepted advisory, update spec/sync.py's own
 rationale for it AND this set together, same bar as the first one.
 
-Not yet done: no commit on this branch (code + the fixes/corrections here
-all still sit uncommitted in the working tree -- `git status` before
-assuming a clean start), and SYNC-002's own spec corrections below
-(feature-string, RUSTSEC comment note) need a `libspec diff`-clean commit
-alongside the code. Nothing past SYNC-002 has started. The build is scoped
-as SYNC-001..SYNC-011 in `spec/sync.py`, which also records the decision
-register (consensus 2026-08-18) and the still-open items. Dependency
-ordering (also stated per-class in `spec/sync.py`):
+SYNC-002 is now fully closed out. Nothing past SYNC-002 has started -- the
+next requirement to pick up is SYNC-003 (or SYNC-008/SYNC-010, which have
+no hard dependency on it). The build is scoped as SYNC-001..SYNC-011 in
+`spec/sync.py`, which also records the decision register (consensus
+2026-08-18) and the still-open items. Dependency ordering (also stated
+per-class in `spec/sync.py`):
 
 - SYNC-001 repo scaffold (crate + Gradle/Compose app, GPL-3.0, mirror of tetron-mobile's proven pipeline) — no deps, first.
-- SYNC-002 embedded oc-rsync engine (vendored patched fork `vendor/oc-rsync/`, `--no-default-features --features "openssl-vendored,zstd,lz4,parallel,xattr"`, `--partial` resume, `TransferProgressCallback` through UniFFI) — after SYNC-001.
+- SYNC-002 embedded oc-rsync engine (vendored patched fork `vendor/oc-rsync/`, embed `crates/core` with `default-features = false, features = ["zstd", "lz4", "xattr"]` -- not the spike's root-bin string, see `vendor/oc-rsync/PATCHES.md` "Embedded-build note", `--partial` resume, `TransferProgressCallback` through UniFFI) — after SYNC-001.
 - SYNC-003 mesh bridge client (MOBILE-024 ContentProvider consumer; roster, tunnel state, ConnKind; consent-banner handling) — after SYNC-001; parallel with SYNC-002.
 - SYNC-004 gate evaluation (Wi-Fi default ON, direct-only second-stage default ON via per-target ConnKind — never a network-type heuristic, cellular+Direct exists, low-battery pause default ON ~20%, charging default OFF; gated = skip + coalesced notify) — after SYNC-003.
 - SYNC-005 transfer pipeline (single run path: gates → target → engine → progress → history → notification; `--partial` resume; reentrancy) — after SYNC-002 + SYNC-004.

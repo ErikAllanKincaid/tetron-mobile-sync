@@ -260,23 +260,44 @@ class SyncOcRsyncEmbedding(Requirement):
     client transfer against a stock rsyncd (spike harness shape), transfers
     a seeded directory tree byte-identically, and an interrupted
     (kill-mid-transfer) run resumes with `--partial` on the next invocation;
-    `cargo audit` shows only the known russh advisory.
+    `cargo audit` shows only the known russh advisory. All three
+    `tests/engine_rsyncd.rs` cases pass: `push_to_rsyncd_is_byte_identical_
+    and_idempotent`, `push_resumes_from_existing_partial_at_receiver`, and
+    `killed_push_keeps_partial_and_next_run_resumes`.
 
-    **NOT YET MET, found 2026-08-19:** `tests/engine_rsyncd.rs`'s
-    `push_resumes_from_existing_partial_at_receiver` (a receiver-pre-seeded-
-    with-partial-bytes scenario, distinct from the kill-mid-transfer one
-    above) hangs indefinitely against a real local rsyncd -- reproduced
-    twice in isolation, single-threaded in `sigsuspend`, not blocked on
-    socket I/O. This test suite never reaches
-    `killed_push_keeps_partial_and_next_run_resumes` (the actual
-    kill-mid-transfer test this ACCEPTANCE line names) because the suite
-    hangs on the test before it -- so the kill-mid-transfer resume path
-    itself is UNVERIFIED against this embedding, not merely "spike-verified"
-    as the requirement's opening paragraph claims (that claim was true of
-    the spike harness, `~/code/oc-rsync-spike/FINDINGS.md`, not yet
-    re-confirmed for this crate's actual `run_client` embedding). Do not
-    mark SYNC-002 accepted until this is root-caused and both resume tests
-    pass. See `AGENTS.md`'s Roadmap/spec section for repro steps.
+    **MET, corrected 2026-08-19 (was misdiagnosed as an unresolved hang):**
+    `push_resumes_from_existing_partial_at_receiver` did not hang, and
+    `run_client` has no deadlock. It never returned within manual-testing
+    patience because its 10 MiB fixture was `vec![0xCDu8; N]` -- every byte
+    identical. That makes every rolling-checksum window in the file collide,
+    so the matcher's cheap weak-checksum prefilter (`tag_table`/`bithash` in
+    `vendor/oc-rsync/crates/matching/src/index/mod.rs`) never rejects a
+    candidate and `find_match_slices_filtered` falls through to an expensive
+    strong-checksum compute at nearly every byte offset -- fine at a few
+    seconds in `--release`, but the unoptimized `cargo test` debug profile
+    (which reconcile.py and this workflow always run) stretched that past
+    what anyone waited out, reading as "hangs indefinitely." Confirmed via
+    `sudo gdb -p <pid> -batch -ex "thread apply all bt"` (ptrace needs
+    `sudo` under this host's `yama/ptrace_scope=1`): the test thread was
+    live inside `matching::generator::DeltaGenerator::generate_with_prune`
+    -> `find_match_slices_filtered` -> `xxhash_rust::xxh3`, not asleep on
+    any lock -- and a `--release` run of the same test completed in 7.6s.
+    Fixed by replacing the uniform-byte fixtures with a small deterministic
+    splitmix64 PRNG helper (`pseudo_random_bytes` in `tests/engine_rsyncd.rs`)
+    so rolling-checksum windows actually vary, which is also the more
+    representative fixture -- real photos/video are never a single repeated
+    byte. `killed_push_keeps_partial_and_next_run_resumes` had never
+    actually run before (the suite hung on the test before it); with the
+    fixture fix it does, but its original 400 MiB size still took the
+    resume-side match past a minute in debug, so it is now 40 MiB (bwlimit
+    and the kill-detection threshold scaled down to match, still leaving a
+    multi-second kill window). All three tests now pass deterministically:
+    `cargo test --test engine_rsyncd -- --ignored --test-threads 1` is
+    ok in ~82s. Processes from a killed run must be swept with name-based
+    `pkill -9 -x rsync` / `pkill -9 -x sync-test-helper` only -- `pkill -f`
+    self-matches the invoking shell's own command line (it contains these
+    same names) and kills the session instead of the target.
+    SYNC-002 is now ACCEPTED.
     ENFORCEMENT: reconcile.py cargo build/clippy/test/audit checks carry the
     crate; the wire-compat + resume integration test lives in `tests/`
     (host-side, gated on rsync being installed), an explicit `#[ignore]`

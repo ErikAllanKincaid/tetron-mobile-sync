@@ -107,6 +107,30 @@ fn bytes_at(path: &Path) -> Vec<u8> {
     fs::read(path).unwrap()
 }
 
+/// Deterministic pseudo-random fill (splitmix64) for large fixture files.
+///
+/// A uniform-byte fixture (`vec![0xCDu8; N]`) makes every rolling checksum
+/// window in the file identical, so the matcher's weak-checksum prefilter
+/// never rejects a candidate and falls through to a strong-checksum compute
+/// at nearly every byte offset -- fine in a release build but catastrophically
+/// slow in the debug build `cargo test` runs, reading as an indefinite hang.
+/// Real photos/video are never a single repeated byte either, so varied
+/// content is the more representative fixture regardless.
+fn pseudo_random_bytes(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed;
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        state = state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^= z >> 31;
+        out.extend_from_slice(&z.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
 fn default_options() -> SyncRunOptions {
     SyncRunOptions {
         recursive: true,
@@ -176,7 +200,7 @@ fn push_to_rsyncd_is_byte_identical_and_idempotent() {
 fn push_resumes_from_existing_partial_at_receiver() {
     let daemon = start_daemon();
     let src = tempfile::tempdir().unwrap();
-    let full = vec![0xCDu8; 10 * 1024 * 1024];
+    let full = pseudo_random_bytes(10 * 1024 * 1024, 0xC0FFEE);
     fs::write(src.path().join("video.mp4"), &full).unwrap();
 
     // Receiver already holds the first chunk of the file (an earlier
@@ -202,18 +226,23 @@ fn push_resumes_from_existing_partial_at_receiver() {
 fn killed_push_keeps_partial_and_next_run_resumes() {
     let daemon = start_daemon();
     let src = tempfile::tempdir().unwrap();
-    // Big enough that a 50 MiB/s ceiling leaves a long kill window.
-    let full = vec![0xEEu8; 400 * 1024 * 1024];
+    // 40 MiB at a 5 MiB/s ceiling leaves an ~6s kill window (threshold at
+    // 8 MiB / 1.6s in). Kept well below the 400 MiB the test originally used:
+    // the resume below re-matches this whole file against the receiver's
+    // partial with the embedded matcher's debug-build (unoptimized) codegen,
+    // and that cost scales with file size -- 400 MiB pushed it well past a
+    // minute even on non-degenerate content, which read as a hang.
+    let full = pseudo_random_bytes(40 * 1024 * 1024, 0xB16B00B5);
     fs::write(src.path().join("burst.mp4"), &full).unwrap();
 
     // NOTE: no --partial anywhere -- the engine must force it.
     let src_arg = format!("{}/", src.path().display());
     let url = daemon.url();
 
-    let mut child = run_helper_in_child(&src_arg, &url, Some(50_000));
+    let mut child = run_helper_in_child(&src_arg, &url, Some(5_000));
 
     // Wait until the receiver holds a growing partial, then kill mid-transfer.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let sizes: Vec<u64> = fs::read_dir(&daemon.module)
             .unwrap()
@@ -221,7 +250,7 @@ fn killed_push_keeps_partial_and_next_run_resumes() {
             .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
             .filter(|s| *s > 0)
             .collect();
-        if sizes.iter().any(|s| *s > 20 * 1024 * 1024) {
+        if sizes.iter().any(|s| *s > 8 * 1024 * 1024) {
             break;
         }
         assert!(
