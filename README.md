@@ -8,7 +8,7 @@ See `AGENTS.md` for the spec-first development workflow (same as core tetron and
 
 ## Status
 
-Spec-only scaffold. The build is scoped as SYNC-001..SYNC-011 in `spec/sync.py`; nothing is implemented yet (no Cargo.toml, no Gradle project). First implementation requirement: SYNC-001 (repo scaffold mirroring tetron-mobile's proven crate + Gradle pipeline).
+SYNC-001 done: crate + Gradle/Compose app scaffolded (host checks, Android cross-compile via cargo-ndk, UniFFI Kotlin bindings, debug APK with both ABIs, JVM unit + instrumented smoke tests). Nothing transfers yet. The build is scoped as SYNC-001..SYNC-011 in `spec/sync.py`; next implementation requirement: SYNC-002 (embedded oc-rsync engine with the vendored patched fork).
 
 ## How it works (the one-paragraph version)
 

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- SYNC-001: android:Theme.DeviceDefault.DayNight, a platform
+         (framework) theme, day/night-aware, needing no AppCompat or
+         Material Components library. The no-action-bar window attributes
+         are set explicitly (".NoActionBar" is not itself a pre-composed
+         framework style name; tetron-mobile confirmed a link failure).
+         Real theming lives in the SYNC-009 Compose pass; this XML theme
+         only governs pre-Compose window chrome and system dialogs. -->
+    <style name="Theme.TetronSync" parent="android:Theme.DeviceDefault.DayNight">
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+    </style>
+</resources>

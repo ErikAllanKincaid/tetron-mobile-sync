@@ -1,0 +1,35 @@
+# SYNC-001: scaffold crate for the tetron-mobile-sync Android addon.
+#
+# Unlike tetron-mobile (which embeds the tetron daemon core in-process),
+# this crate embeds NO tetron core: the sync app has no daemon of its own.
+# It talks to the mesh only through tetron-mobile's MOBILE-024 ContentProvider
+# bridge (SYNC-003, Kotlin side) and transfers via an embedded oc-rsync
+# client (SYNC-002). No rustls-platform-verifier Android init is needed here
+# (no iroh) -- a difference from MOBILE-004 that exists by design.
+#
+# GPL-3.0-only: this repo embeds oc-rsync (GPL-3.0) in-process, route (a)
+# (plan decision #16). See AGENTS.md and LICENSE.
+[package]
+name = "tetron-mobile-sync"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+authors = ["ErikAllanKincaid"]
+description = "GPL-3.0 Android photo-backup addon for the tetron mesh (oc-rsync embedded)"
+license = "GPL-3.0-only"
+publish = false
+
+[dependencies]
+uniffi = "0.28"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+# SYNC-001: generates the Kotlin bindings for the cdylib built above, in
+# library mode (reads UniFFI metadata out of the compiled .so, no .udl file).
+# `required-features` keeps the extra clap-based CLI surface out of the
+# cdylib build (host or Android) -- it only applies to this bin target.
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["uniffi/cli"]

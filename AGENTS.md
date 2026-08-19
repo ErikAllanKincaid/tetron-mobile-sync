@@ -14,7 +14,7 @@ tetron adds one thing: a mesh VPN. This repo is a product built on top of it: a 
 
 ## Roadmap / spec
 
-Status: spec-only scaffold. The build is scoped as SYNC-001..SYNC-011 in `spec/sync.py`, which also records the decision register (consensus 2026-08-18) and the still-open items. Dependency ordering (also stated per-class in `spec/sync.py`):
+Status: SYNC-001 done (2026-08-18, `feat/sync-001-repo-scaffold`): crate + Gradle/Compose app scaffolded, host + Android cross-compile + UniFFI Kotlin bindings + debug APK all building, reconcile.py carries the cargo checks. Nothing transfers yet. The build is scoped as SYNC-001..SYNC-011 in `spec/sync.py`, which also records the decision register (consensus 2026-08-18) and the still-open items. Dependency ordering (also stated per-class in `spec/sync.py`):
 
 - SYNC-001 repo scaffold (crate + Gradle/Compose app, GPL-3.0, mirror of tetron-mobile's proven pipeline) — no deps, first.
 - SYNC-002 embedded oc-rsync engine (vendored patched fork `vendor/oc-rsync/`, `--no-default-features --features "openssl-vendored,zstd,lz4,parallel,xattr"`, `--partial` resume, `TransferProgressCallback` through UniFFI) — after SYNC-001.
@@ -36,7 +36,7 @@ Same loop as core and tetron-mobile:
 - **Diff Spec (mandatory before coding):** `uv run libspec diff`.
 - **Test Driven Development / Implement / reconcile.py green / commit.** Conventional commit subjects, no authorship trailers, same as core.
 
-`reconcile.py` currently checks only the spec tree (`libspec diff` clean against HEAD); the cargo build/clippy/test/audit checks arrive with SYNC-001.
+`reconcile.py` carries the spec-tree check (`libspec diff` clean against HEAD) plus the standard cargo checks (build/clippy/test/cargo-audit, added with SYNC-001).
 
 ## Conventions
 

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Working name; the app/product name is an open item (spec/sync.py
+         "Still open"). -->
+    <string name="app_name">tetron sync</string>
+</resources>
