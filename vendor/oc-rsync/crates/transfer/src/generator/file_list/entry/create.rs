@@ -1,0 +1,1494 @@
+//! `FileEntry` construction from filesystem metadata for the generator role.
+//!
+//! Implements `create_entry`, which classifies the on-disk file type and
+//! populates mode, mtime, uid/gid, atime/crtime, symlink targets, device
+//! numbers, xattrs, ACLs, and hardlink dev/ino fields based on the active
+//! preservation flags. Also implements the fake-super stat override lookup
+//! consumed during construction.
+
+use std::io;
+use std::path::{Path, PathBuf};
+
+use protocol::flist::FileEntry;
+
+use super::super::super::GeneratorContext;
+
+#[cfg(unix)]
+use super::device::rdev_to_major_minor;
+#[cfg(unix)]
+use super::fake_super::build_entry_from_fake_super;
+use super::munge::strip_symlink_munge_prefix;
+
+impl GeneratorContext {
+    /// Creates a `FileEntry` from filesystem metadata for wire transmission.
+    ///
+    /// Populates mode, mtime, uid/gid, atime/crtime, symlink targets, device numbers,
+    /// and hardlink dev/ino fields based on the active preservation flags.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `flist.c:make_file()` - determines file type and populates the `file_struct`
+    /// - Device files (block/char) use `new_block_device`/`new_char_device` with rdev fields
+    /// - Special files (FIFOs/sockets) use `new_fifo`/`new_socket`
+    pub(in crate::generator) fn create_entry(
+        &self,
+        full_path: &Path,
+        relative_path: PathBuf,
+        metadata: &std::fs::Metadata,
+    ) -> io::Result<FileEntry> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        // upstream: flist.c:1396-1398 DEBUG_GTE(FLIST, 2)
+        // ALL_FILTERS = 2 is the common filter_level for send_file_list paths.
+        logging::debug_log!(
+            Flist,
+            2,
+            "[sender] make_file({},*,2)",
+            relative_path.display()
+        );
+
+        let file_type = metadata.file_type();
+
+        // Native Windows reparse-point detection. `std::fs::FileType::is_symlink`
+        // only returns `true` for `IO_REPARSE_TAG_SYMLINK` and
+        // `IO_REPARSE_TAG_MOUNT_POINT`; tags like `IO_REPARSE_TAG_AF_UNIX`,
+        // `IO_REPARSE_TAG_ONEDRIVE`, and the cloud-files range therefore slip
+        // through and would otherwise serialise as plain regular files. The
+        // `FILE_ATTRIBUTE_REPARSE_POINT` attribute catches every reparse
+        // shape; we route the entry through the symlink branch so the WPC-8
+        // classifier (`metadata::windows::reparse::classify_path`) governs the
+        // wire emission rather than the surface `FileType` probe.
+        //
+        // Upstream rsync runs through Cygwin on Windows and treats every
+        // reparse point as a POSIX symbolic link; this mirror keeps the wire
+        // output compatible without losing the classifier's distinction.
+        #[cfg(windows)]
+        let is_reparse_point = {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        };
+
+        // upstream: xattrs.c:get_stat_xattr() - when `--fake-super` is in
+        // effect, a previous fake-super receiver may have recorded the real
+        // ownership, permissions, and device numbers in the source file's
+        // `user.rsync.%stat` xattr (the on-disk file is a placeholder).
+        // Decoding it here lets the sender round-trip the original metadata
+        // instead of forwarding the placeholder uid/gid/mode/dev. The
+        // override carries POSIX-only fields (uid/gid/rdev), so the Windows
+        // path never consults it - we skip the lookup entirely there.
+        #[cfg(unix)]
+        let fake_super_override = self.fake_super_override(full_path, metadata);
+
+        // Windows reparse-point branch. Run before the regular-file probe so
+        // non-symlink reparse points (cloud placeholders, AF_UNIX sockets,
+        // opaque vendor tags) do not slip into the regular-file emission.
+        // Junctions and mount-points already pass through
+        // `file_type.is_symlink()`, but routing them here too lets the
+        // classifier choose the wire shape for every flavour in one place.
+        #[cfg(windows)]
+        let reparse_kind = if is_reparse_point {
+            metadata::windows::classify_path(full_path).ok()
+        } else {
+            None
+        };
+
+        // upstream: flist.c:1419-1428 - `copy_devices && am_sender &&
+        // IS_DEVICE(st.st_mode)` rewrites a block/char device into a regular
+        // file: mode becomes `S_IFREG | ACCESSPERMS`, mtime is forced to "now",
+        // and the size is the device's readable byte length. The device's
+        // contents are then streamed like a plain file. This generator only ever
+        // builds the sender's file list, so `am_sender` is implicit here.
+        #[cfg(unix)]
+        let copy_device_override: Option<(u64, u32)> = {
+            use std::os::unix::fs::FileTypeExt;
+            if self.config.flags.copy_devices
+                && (file_type.is_block_device() || file_type.is_char_device())
+            {
+                let mode = metadata.mode() & 0o7777;
+                // upstream: flist.c:1421-1424 - open the device and size it when
+                // st_size is 0 (block devices report 0). `device_readable_size`
+                // mirrors get_device_size() with a macOS ioctl fallback.
+                let size = if metadata.len() != 0 {
+                    metadata.len()
+                } else {
+                    ::metadata::device_readable_size(full_path).unwrap_or(0)
+                };
+                Some((size, mode))
+            } else {
+                None
+            }
+        };
+        #[cfg(not(unix))]
+        let copy_device_override: Option<(u64, u32)> = None;
+
+        let mut entry = if let Some((dev_size, dev_mode)) = copy_device_override {
+            // upstream: flist.c:1425 - st.st_mode = S_IFREG | (mode & ACCESSPERMS)
+            FileEntry::new_file(relative_path, dev_size, dev_mode)
+        } else if file_type.is_file() && {
+            #[cfg(windows)]
+            {
+                !is_reparse_point
+            }
+            #[cfg(not(windows))]
+            {
+                true
+            }
+        } {
+            #[cfg(unix)]
+            let mode = metadata.mode() & 0o7777;
+            #[cfg(not(unix))]
+            let mode = if metadata.permissions().readonly() {
+                0o444
+            } else {
+                0o644
+            };
+
+            // upstream: xattrs.c:get_stat_xattr() - the xattr's mode replaces
+            // the entire st_mode (type + perms) so a regular placeholder file
+            // can masquerade as a device/symlink/special on the wire.
+            #[cfg(unix)]
+            let entry = if let Some(stat) = fake_super_override.as_ref() {
+                build_entry_from_fake_super(relative_path, metadata.len(), stat)
+            } else {
+                FileEntry::new_file(relative_path, metadata.len(), mode)
+            };
+            #[cfg(not(unix))]
+            let entry = FileEntry::new_file(relative_path, metadata.len(), mode);
+            entry
+        } else if file_type.is_dir() {
+            #[cfg(unix)]
+            let mode = metadata.mode() & 0o7777;
+            #[cfg(not(unix))]
+            let mode = 0o755;
+
+            // upstream: flist.c:1662 - `file->len32 = (uint32)st.st_size` runs for
+            // every entry; only devices/specials are zeroed (flist.c:1484-1486).
+            // Directories therefore carry their on-disk inode size on the wire,
+            // which feeds `--list-only`, `%l`, and the `--stats` total.
+            let mut entry = FileEntry::new_directory(relative_path, mode);
+            entry.set_size(metadata.len());
+            entry
+        } else if file_type.is_symlink() || {
+            #[cfg(windows)]
+            {
+                is_reparse_point
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        } {
+            // upstream: flist.c:readlink_stat() returns the link target as
+            // recorded on disk. On Windows the kernel exposes junctions and
+            // symlinks through `read_link`; cloud placeholders and AF_UNIX
+            // sockets do not have a portable target and we fall back to an
+            // empty path so the receiver materialises a stub link rather than
+            // dropping the entry. The WPC-8 classification is consulted only
+            // to decide whether we trust `read_link` (Symlink/Junction) or
+            // emit an empty target (OneDrive/AfUnix/Other); the on-wire
+            // type is always SYMLINK for Cygwin parity.
+            #[cfg(windows)]
+            let raw_target = match reparse_kind {
+                Some(metadata::windows::ReparseKind::Symlink)
+                | Some(metadata::windows::ReparseKind::Junction)
+                | Some(metadata::windows::ReparseKind::MountPoint)
+                | None => std::fs::read_link(full_path).unwrap_or_else(|_| PathBuf::from("")),
+                Some(metadata::windows::ReparseKind::OneDrive)
+                | Some(metadata::windows::ReparseKind::AfUnix)
+                | Some(metadata::windows::ReparseKind::Other(_)) => PathBuf::from(""),
+            };
+            #[cfg(not(windows))]
+            let raw_target = std::fs::read_link(full_path).unwrap_or_else(|_| PathBuf::from(""));
+
+            // upstream: flist.c:222-226 - sender strips the `/rsyncd-munged/`
+            // prefix from the readlink result when the daemon module has
+            // `munge symlinks = yes`, restoring the original target before it
+            // is sent on the wire. The matching prepend on the receive side
+            // re-applies the prefix when the link is materialized on disk.
+            let target = strip_symlink_munge_prefix(self.config.munge_symlinks, raw_target);
+
+            // upstream: flist.c:1501 - symlinks carry `st_size`, which lstat
+            // reports as the byte length of the link target. The receiver gets
+            // the target separately, so this length is purely the size shown by
+            // `--list-only`/`%l` and summed into the `--stats` total.
+            let mut entry = FileEntry::new_symlink(relative_path, target);
+            entry.set_size(metadata.len());
+            entry
+        } else {
+            // Device and special file types (Unix only)
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                let mode = metadata.mode() & 0o7777;
+                if file_type.is_block_device() {
+                    let (major, minor) = rdev_to_major_minor(metadata.rdev());
+                    FileEntry::new_block_device(relative_path, mode, major, minor)
+                } else if file_type.is_char_device() {
+                    let (major, minor) = rdev_to_major_minor(metadata.rdev());
+                    FileEntry::new_char_device(relative_path, mode, major, minor)
+                } else if file_type.is_fifo() {
+                    FileEntry::new_fifo(relative_path, mode)
+                } else if file_type.is_socket() {
+                    FileEntry::new_socket(relative_path, mode)
+                } else {
+                    FileEntry::new_file(relative_path, 0, 0o644)
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                FileEntry::new_file(relative_path, 0, 0o644)
+            }
+        };
+
+        // upstream: flist.c:make_file() - set mtime
+        #[cfg(unix)]
+        {
+            entry.set_mtime(metadata.mtime(), metadata.mtime_nsec() as u32);
+        }
+        #[cfg(not(unix))]
+        {
+            if let Ok(mtime) = metadata.modified() {
+                if let Ok(duration) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                    entry.set_mtime(duration.as_secs() as i64, duration.subsec_nanos());
+                }
+            }
+        }
+
+        // upstream: flist.c:1427 - the device mtime is not up-to-date, so a
+        // `--copy-devices` entry carries `time(NULL)` instead of the on-disk
+        // stat time. This is a no-op on non-device entries and on non-Unix.
+        if copy_device_override.is_some() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
+            entry.set_mtime(now, 0);
+        }
+
+        // Set access time if preserving (upstream: flist.c:489-494)
+        #[cfg(unix)]
+        if self.config.flags.atimes && !entry.is_dir() {
+            entry.set_atime(metadata.atime());
+        }
+        #[cfg(not(unix))]
+        if self.config.flags.atimes && !entry.is_dir() {
+            if let Ok(atime) = metadata.accessed() {
+                if let Ok(duration) = atime.duration_since(std::time::UNIX_EPOCH) {
+                    entry.set_atime(duration.as_secs() as i64);
+                }
+            }
+        }
+
+        // Set creation time if preserving (upstream: flist.c:495-498)
+        if self.config.flags.crtimes {
+            if let Ok(crtime) = metadata.created() {
+                if let Ok(duration) = crtime.duration_since(std::time::UNIX_EPOCH) {
+                    entry.set_crtime(duration.as_secs() as i64);
+                }
+            }
+        }
+
+        // upstream: flist.c:make_file() - set uid/gid
+        // When the fake-super xattr overrode the stat values, prefer the
+        // decoded uid/gid so a round-trip through a fake-super sender
+        // preserves the original ownership.
+        #[cfg(unix)]
+        if self.config.flags.owner {
+            let uid = fake_super_override
+                .as_ref()
+                .map_or_else(|| metadata.uid(), |s| s.uid);
+            entry.set_uid(uid);
+            // upstream: flist.c:478-482 - add_uid() looks up name for inline
+            // sending via XMIT_USER_NAME_FOLLOWS when INC_RECURSE is active.
+            // Without names, the receiver can't map uid->name on the remote.
+            if self.config.flags.numeric_ids.is_off() {
+                if let Ok(Some(name_bytes)) = metadata::id_lookup::lookup_user_name_cached(uid) {
+                    if let Ok(name) = String::from_utf8(name_bytes) {
+                        entry.set_user_name(name);
+                    }
+                }
+            }
+        }
+        #[cfg(unix)]
+        if self.config.flags.group {
+            let gid = fake_super_override
+                .as_ref()
+                .map_or_else(|| metadata.gid(), |s| s.gid);
+            entry.set_gid(gid);
+            // upstream: flist.c:488-492 - add_gid() looks up name for inline
+            // sending via XMIT_GROUP_NAME_FOLLOWS when INC_RECURSE is active.
+            if self.config.flags.numeric_ids.is_off() {
+                if let Ok(Some(name_bytes)) = metadata::id_lookup::lookup_group_name_cached(gid) {
+                    if let Ok(name) = String::from_utf8(name_bytes) {
+                        entry.set_group_name(name);
+                    }
+                }
+            }
+        }
+
+        // Store dev/ino for hardlink detection (post-sort assignment).
+        // upstream: flist.c:make_file() stores tmp_dev/tmp_ino when preserve_hard_links
+        #[cfg(unix)]
+        if self.config.flags.hard_links && metadata.nlink() > 1 && !metadata.is_dir() {
+            entry.set_hardlink_dev(metadata.dev() as i64);
+            entry.set_hardlink_ino(metadata.ino() as i64);
+        }
+
+        // upstream: flist.c:make_file() -> get_xattr() reads xattrs for -X mode
+        #[cfg(unix)]
+        if self.config.flags.xattrs {
+            // upstream: xattrs.c:303-334 - get_xattr() only reads for regular files,
+            // dirs, symlinks (if preserve_links), specials (if preserve_specials),
+            // and devices (if preserve_devices).
+            let should_read = file_type.is_file()
+                || file_type.is_dir()
+                || (file_type.is_symlink() && self.config.flags.links);
+
+            if should_read {
+                // Follow symlinks only for non-symlink entries (lgetxattr for symlinks)
+                let follow = !file_type.is_symlink();
+                let xattr_filter = self.xattr_name_filter();
+                let predicate = xattr_filter.map(|set| {
+                    move |name: &str| set.xattr_name_allowed(name, filters::XattrSide::Sender)
+                });
+                let opts = metadata::XattrSendOptions {
+                    role: metadata::XattrRole::Sender,
+                    follow_symlinks: follow,
+                    // upstream: xattrs.c:237 - `am_sender` forces user_only = 0,
+                    // so the sender transmits every namespace but system.*, and
+                    // never claims root, so system.* stays local.
+                    am_root: false,
+                    // upstream: xattrs.c:274 - `am_sender && preserve_xattrs < 2`
+                    // strips the rsync.%FOO store; -XX transmits it.
+                    preserve_xattrs: self.config.flags.xattrs_level,
+                    fake_super: self.config.fake_super,
+                    filter: predicate.as_ref().map(|f| f as &dyn Fn(&str) -> bool),
+                    checksum_seed: self.checksum_seed,
+                };
+                match metadata::read_xattrs_for_wire(full_path, &opts) {
+                    Ok(list) => {
+                        if !list.is_empty() {
+                            entry.set_xattr_list(list);
+                        }
+                    }
+                    Err(_) => {
+                        // Non-fatal: silently skip, matching upstream behavior
+                        // where xattr read failures don't abort the transfer
+                    }
+                }
+            }
+        }
+
+        // Windows ACL collection: when --acls is on (and on Windows the
+        // `acl` feature is compiled in) read the full SDDL security
+        // descriptor and attach it to the entry under the reserved
+        // `user.win32.security_descriptor` xattr slot. The receiver routes
+        // the slot through `apply_sddl_from_xattrs` so Windows->Windows
+        // transfers preserve the descriptor verbatim; non-Windows
+        // receivers drop the slot.
+        #[cfg(all(feature = "acl", windows))]
+        if self.config.flags.acls {
+            let should_read = file_type.is_file() || file_type.is_dir();
+            if should_read {
+                if let Ok(Some(sddl_entry)) = metadata::sddl_xattr_entry(full_path) {
+                    let mut list = entry.xattr_list().cloned().unwrap_or_default();
+                    list.push(sddl_entry);
+                    list.sort_by_name();
+                    entry.set_xattr_list(list);
+                }
+            }
+        }
+
+        // upstream: flist.c:1580-1581 send_file_name() applies the client
+        // `--chmod` (chmod_modes) to each entry's mode as the sender builds the
+        // file list, and clientserver.c:1217 appends the daemon module
+        // `outgoing chmod` to that same `chmod_modes` list. On a push oc is the
+        // sender, so both modifier sources must rewrite the wire-emitted mode
+        // here; only then does the remote receiver materialise the transformed
+        // mode and itemize the `p` (perms-changed) flag. Applied after every
+        // other flist field is populated but before the caller serialises it.
+        // Symlinks are skipped (upstream `!S_ISLNK(file->mode)`); the chmod
+        // parser preserves the file-type bits, so the entry's S_IFREG/S_IFDIR
+        // classification is untouched. Order mirrors the receiver's
+        // merge_chmod: daemon modes first, then the client's.
+        if !entry.is_symlink() {
+            for modifiers in [
+                self.config.daemon_outgoing_chmod.as_ref(),
+                self.config.chmod.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let rewritten = modifiers.apply(entry.mode(), file_type);
+                entry.set_mode(rewritten);
+            }
+        }
+
+        // upstream: flist.c:1444-1447 - `always_checksum && am_sender &&
+        // S_ISREG(st.st_mode)` computes the per-file checksum with
+        // `file_checksum()` (checksum.c:401, unseeded) and stores it in
+        // `F_SUM(file)` so it travels in the flist (send_file_entry writes it
+        // at flist.c:1003). The receiver's quick-check (generator.c:633,
+        // quick_check_ok) compares its own `file_checksum()` of the basis file
+        // against this value to decide whether the file is unchanged. Without
+        // it the sender emits an all-zero checksum, the receiver's `-c`
+        // quick-check never matches, and every content-identical file is
+        // needlessly re-transferred.
+        if self.config.flags.checksum && entry.is_file() {
+            if let Some(sum) = self.compute_flist_checksum(full_path, entry.size()) {
+                entry.set_checksum(sum);
+            }
+        }
+
+        Ok(entry)
+    }
+
+    /// Computes the unseeded whole-file checksum stored in the flist under
+    /// `--checksum`, mirroring upstream `file_checksum()` (checksum.c:401).
+    ///
+    /// The algorithm matches the receiver's quick-check hash
+    /// ([`get_checksum_algorithm`](Self::get_checksum_algorithm)); both sides
+    /// use the unseeded negotiated digest so the comparison in
+    /// `quick_check_matches` agrees. Reads exactly `file_size` bytes, matching
+    /// upstream's `map_file()` over `st_size`. Returns `None` on any I/O error
+    /// so the transfer falls back to sending the file (upstream sets an
+    /// all-zero sum on open failure, which likewise never matches).
+    fn compute_flist_checksum(&self, path: &Path, file_size: u64) -> Option<Vec<u8>> {
+        use std::io::Read;
+
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut verifier =
+            crate::delta_apply::ChecksumVerifier::for_algorithm(self.get_checksum_algorithm());
+        // upstream: rsync.h MAX_MAP_SIZE = 256*1024 - the map_file() window.
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut remaining = file_size;
+        while remaining > 0 {
+            let to_read = buf.len().min(remaining as usize);
+            file.read_exact(&mut buf[..to_read]).ok()?;
+            verifier.update(&buf[..to_read]);
+            remaining -= to_read as u64;
+        }
+        let mut digest = [0u8; crate::delta_apply::ChecksumVerifier::MAX_DIGEST_LEN];
+        let len = verifier.finalize_into(&mut digest);
+        Some(digest[..len].to_vec())
+    }
+
+    /// Reads the source-side `user.rsync.%stat` xattr when fake-super is active.
+    ///
+    /// Returns the decoded [`metadata::FakeSuperStat`] only when:
+    /// - `--fake-super` (or daemon `fake super = yes`) is in effect,
+    /// - the on-disk entry is neither a device nor a special file (matching
+    ///   upstream's `IS_DEVICE(fst->st_mode) || IS_SPECIAL(fst->st_mode)`
+    ///   early-return in `xattrs.c:get_stat_xattr()`), and
+    /// - the xattr exists and decodes successfully.
+    ///
+    /// Mirrors the override path upstream applies via `x_lstat()`/`x_stat()`
+    /// before `make_file()` reads the stat values, so a round-trip through a
+    /// fake-super sender preserves the original ownership/perms/device.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `xattrs.c:1127 get_stat_xattr()`
+    /// - `xattrs.c:1258 x_lstat()` (called from `flist.c:link_stat()`)
+    #[cfg(unix)]
+    fn fake_super_override(
+        &self,
+        full_path: &Path,
+        metadata: &std::fs::Metadata,
+    ) -> Option<metadata::FakeSuperStat> {
+        if !self.config.fake_super {
+            return None;
+        }
+        // upstream: xattrs.c:1133 - skip when the on-disk file is already a
+        // device or special; the xattr only applies to regular placeholders.
+        use std::os::unix::fs::FileTypeExt;
+        let ft = metadata.file_type();
+        if ft.is_block_device() || ft.is_char_device() || ft.is_fifo() || ft.is_socket() {
+            return None;
+        }
+        // Silently swallow read/decode errors: upstream's `get_stat_xattr`
+        // logs but does not abort on ENOTSUP/ENOATTR, and any other error
+        // here is treated like a missing xattr so the stat-derived values
+        // remain in use.
+        metadata::load_fake_super(full_path).ok().flatten()
+    }
+
+    // The non-Unix branch deliberately omits `fake_super_override`. The only
+    // caller is `#[cfg(unix)]`-gated in `build_file_entry`, so a Windows
+    // stub would be dead code (rejected by `-D dead-code`). Adding a Windows
+    // call site later should reintroduce a stub here.
+}
+
+#[cfg(all(test, unix, feature = "xattr"))]
+mod fake_super_round_trip_tests {
+    //! End-to-end sender override: place a fake-super xattr on a regular
+    //! placeholder file, then verify `create_entry` consumes it and emits
+    //! the decoded mode/uid/gid/rdev instead of the on-disk stat values.
+
+    use crate::config::ServerConfig;
+    use crate::generator::GeneratorContext;
+    use crate::handshake::HandshakeResult;
+    use crate::role::ServerRole;
+    use ::metadata::{FAKE_SUPER_XATTR, FakeSuperStat};
+    use protocol::ProtocolVersion;
+    use protocol::flist::FileType;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn make_generator(fake_super: bool, owner: bool, group: bool) -> GeneratorContext {
+        let handshake = HandshakeResult {
+            protocol: ProtocolVersion::try_from(32u8).unwrap(),
+            buffered: Vec::new(),
+            compat_exchanged: false,
+            client_args: None,
+            io_timeout: None,
+            negotiated_algorithms: None,
+            compat_flags: None,
+            checksum_seed: 0,
+        };
+        let mut config = ServerConfig {
+            role: ServerRole::Generator,
+            protocol: ProtocolVersion::try_from(32u8).unwrap(),
+            flag_string: "-logDtpre.".to_owned(),
+            args: vec![OsString::from(".")],
+            fake_super,
+            ..Default::default()
+        };
+        config.flags.owner = owner;
+        config.flags.group = group;
+        config.flags.numeric_ids = crate::NumericIds::Explicit; // skip uid/gid name lookups in tests
+        GeneratorContext::new_for_test(&handshake, config)
+    }
+
+    fn write_placeholder_with_xattr(tmp: &TempDir, stat: &FakeSuperStat) -> PathBuf {
+        let path = tmp.path().join("placeholder");
+        std::fs::write(&path, b"x").unwrap();
+        match xattr::set(&path, FAKE_SUPER_XATTR, stat.encode().as_bytes()) {
+            Ok(()) => path,
+            Err(e) => {
+                // tmpfs / sandboxed filesystems may reject user.* xattrs; skip
+                // the test gracefully so CI on such hosts does not flake.
+                eprintln!("skipping: xattr unsupported on test filesystem: {e}");
+                std::process::exit(0);
+            }
+        }
+    }
+
+    #[test]
+    fn fake_super_off_returns_no_override() {
+        let tmp = TempDir::new().unwrap();
+        let stat = FakeSuperStat {
+            mode: 0o100600,
+            uid: 4321,
+            gid: 8765,
+            rdev: None,
+        };
+        let path = write_placeholder_with_xattr(&tmp, &stat);
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+
+        let ctx = make_generator(false, true, true);
+        let entry = ctx
+            .create_entry(&path, PathBuf::from("placeholder"), &meta)
+            .unwrap();
+        // Without --fake-super, the on-disk uid/gid (the test user) is sent.
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(entry.uid(), Some(meta.uid()));
+        assert_eq!(entry.gid(), Some(meta.gid()));
+        assert_eq!(entry.file_type(), FileType::Regular);
+    }
+
+    #[test]
+    fn fake_super_on_override_uid_gid_for_regular_file() {
+        let tmp = TempDir::new().unwrap();
+        let stat = FakeSuperStat {
+            mode: 0o100600,
+            uid: 4321,
+            gid: 8765,
+            rdev: None,
+        };
+        let path = write_placeholder_with_xattr(&tmp, &stat);
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+
+        let ctx = make_generator(true, true, true);
+        let entry = ctx
+            .create_entry(&path, PathBuf::from("placeholder"), &meta)
+            .unwrap();
+        assert_eq!(entry.uid(), Some(4321), "uid must come from %stat xattr");
+        assert_eq!(entry.gid(), Some(8765), "gid must come from %stat xattr");
+        assert_eq!(entry.file_type(), FileType::Regular);
+    }
+
+    #[test]
+    fn fake_super_on_promotes_regular_placeholder_to_block_device() {
+        let tmp = TempDir::new().unwrap();
+        let stat = FakeSuperStat {
+            mode: 0o60660,
+            uid: 0,
+            gid: 6,
+            rdev: Some((8, 0)),
+        };
+        let path = write_placeholder_with_xattr(&tmp, &stat);
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+
+        let ctx = make_generator(true, true, true);
+        let entry = ctx
+            .create_entry(&path, PathBuf::from("sda"), &meta)
+            .unwrap();
+        assert_eq!(entry.file_type(), FileType::BlockDevice);
+        assert_eq!(entry.uid(), Some(0));
+        assert_eq!(entry.gid(), Some(6));
+        assert_eq!(entry.rdev_major(), Some(8));
+        assert_eq!(entry.rdev_minor(), Some(0));
+    }
+
+    /// Builds a sender generator with `--copy-devices` active.
+    fn make_copy_devices_generator() -> GeneratorContext {
+        let handshake = HandshakeResult {
+            protocol: ProtocolVersion::try_from(32u8).unwrap(),
+            buffered: Vec::new(),
+            compat_exchanged: false,
+            client_args: None,
+            io_timeout: None,
+            negotiated_algorithms: None,
+            compat_flags: None,
+            checksum_seed: 0,
+        };
+        let mut config = ServerConfig {
+            role: ServerRole::Generator,
+            protocol: ProtocolVersion::try_from(32u8).unwrap(),
+            flag_string: "-logtpre.".to_owned(),
+            args: vec![OsString::from(".")],
+            ..Default::default()
+        };
+        config.flags.copy_devices = true;
+        config.flags.numeric_ids = crate::NumericIds::Explicit;
+        GeneratorContext::new_for_test(&handshake, config)
+    }
+
+    /// upstream: flist.c:1419-1428 - with `--copy-devices` the sender must emit a
+    /// character/block device as a regular file (its contents are streamed like a
+    /// plain file), not as a device node. Verified against `/dev/zero`, a char
+    /// device present on every supported Unix. Without the conversion the receiver
+    /// would create a device node and then block waiting for file data that never
+    /// arrives (issue #229 deadlock).
+    #[cfg(unix)]
+    #[test]
+    fn copy_devices_encodes_char_device_as_regular_file() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let dev = std::path::Path::new("/dev/zero");
+        let Ok(meta) = std::fs::symlink_metadata(dev) else {
+            eprintln!("skipping: /dev/zero unavailable on this host");
+            return;
+        };
+        if !meta.file_type().is_char_device() {
+            eprintln!("skipping: /dev/zero is not a char device here");
+            return;
+        }
+
+        let ctx = make_copy_devices_generator();
+        let entry = ctx.create_entry(dev, PathBuf::from("zero"), &meta).unwrap();
+
+        // The device is presented as a regular file, not a device node.
+        assert_eq!(
+            entry.file_type(),
+            FileType::Regular,
+            "copy-devices must convert the device to a regular file"
+        );
+        assert_eq!(entry.rdev_major(), None, "regular file carries no rdev");
+        assert_eq!(entry.rdev_minor(), None, "regular file carries no rdev");
+        // upstream: st.st_mtime = time(NULL) - the entry carries a fresh mtime.
+        assert!(
+            entry.mtime() > 0,
+            "copy-devices entry must set mtime to now"
+        );
+    }
+
+    /// Without `--copy-devices`, `create_entry` classifies the same char device
+    /// as a device node - the conversion is strictly gated on the flag.
+    #[cfg(unix)]
+    #[test]
+    fn without_copy_devices_char_device_stays_device_node() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let dev = std::path::Path::new("/dev/zero");
+        let Ok(meta) = std::fs::symlink_metadata(dev) else {
+            eprintln!("skipping: /dev/zero unavailable on this host");
+            return;
+        };
+        if !meta.file_type().is_char_device() {
+            eprintln!("skipping: /dev/zero is not a char device here");
+            return;
+        }
+
+        // make_generator has --devices (D) but not --copy-devices.
+        let ctx = make_generator(false, false, false);
+        let entry = ctx.create_entry(dev, PathBuf::from("zero"), &meta).unwrap();
+        assert_eq!(
+            entry.file_type(),
+            FileType::CharDevice,
+            "without copy-devices the device stays a device node"
+        );
+    }
+
+    #[test]
+    fn fake_super_on_without_xattr_falls_back_to_stat() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("plain");
+        std::fs::write(&path, b"x").unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+
+        let ctx = make_generator(true, true, true);
+        let entry = ctx
+            .create_entry(&path, PathBuf::from("plain"), &meta)
+            .unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(entry.uid(), Some(meta.uid()));
+        assert_eq!(entry.gid(), Some(meta.gid()));
+        assert_eq!(entry.file_type(), FileType::Regular);
+    }
+
+    #[test]
+    fn fake_super_decoded_format_matches_upstream_byte_for_byte() {
+        // upstream: xattrs.c:1233 - snprintf("%o %u,%u %u:%u", ...)
+        let stat = FakeSuperStat {
+            mode: 0o100644,
+            uid: 1234,
+            gid: 5678,
+            rdev: None,
+        };
+        assert_eq!(stat.encode(), "100644 0,0 1234:5678");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod daemon_outgoing_chmod_tests {
+    //! Daemon `outgoing chmod = SPEC` regression: the sender must rewrite the
+    //! wire-emitted mode for each file list entry when the daemon module has
+    //! an `outgoing chmod` directive configured. Mirrors upstream
+    //! `clientserver.c:rsync_module()` arming `daemon_chmod_modes` and
+    //! `flist.c:make_file()` applying them as file_struct values are built.
+
+    use crate::config::ServerConfig;
+    use crate::generator::GeneratorContext;
+    use crate::handshake::HandshakeResult;
+    use crate::role::ServerRole;
+    use ::metadata::ChmodModifiers;
+    use protocol::ProtocolVersion;
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn make_generator(outgoing_chmod: Option<ChmodModifiers>) -> GeneratorContext {
+        let handshake = HandshakeResult {
+            protocol: ProtocolVersion::try_from(32u8).unwrap(),
+            buffered: Vec::new(),
+            compat_exchanged: false,
+            client_args: None,
+            io_timeout: None,
+            negotiated_algorithms: None,
+            compat_flags: None,
+            checksum_seed: 0,
+        };
+        let mut config = ServerConfig {
+            role: ServerRole::Generator,
+            protocol: ProtocolVersion::try_from(32u8).unwrap(),
+            flag_string: "-logDtpre.".to_owned(),
+            args: vec![OsString::from(".")],
+            daemon_outgoing_chmod: outgoing_chmod,
+            ..Default::default()
+        };
+        config.flags.numeric_ids = crate::NumericIds::Explicit;
+        GeneratorContext::new_for_test(&handshake, config)
+    }
+
+    /// `outgoing chmod = Fg-r` must clear the group-read bit on the wire-emitted
+    /// mode for every file entry the sender constructs. The on-disk source
+    /// retains its original permissions; only the file list entry is rewritten.
+    #[test]
+    fn outgoing_chmod_clears_group_read_bit_on_wire() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("source.txt");
+        std::fs::write(&path, b"payload").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664))
+            .expect("set source perms");
+
+        let modifiers = ChmodModifiers::parse("Fg-r").expect("parse chmod spec");
+        let ctx = make_generator(Some(modifiers));
+        let meta = std::fs::symlink_metadata(&path).expect("metadata");
+        let entry = ctx
+            .create_entry(&path, PathBuf::from("source.txt"), &meta)
+            .expect("create_entry");
+
+        // Group-read (0o040) must be cleared; other bits left intact.
+        let perms = entry.permissions() & 0o7777;
+        assert_eq!(perms & 0o040, 0, "group-read must be cleared on wire");
+        assert_eq!(perms, 0o624, "Fg-r rewrites 0o664 to 0o624");
+    }
+
+    /// When no `outgoing chmod` is configured, `create_entry` must emit the
+    /// on-disk mode verbatim - no rewrite, no silent default.
+    #[test]
+    fn no_outgoing_chmod_leaves_mode_untouched() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("source.txt");
+        std::fs::write(&path, b"payload").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664))
+            .expect("set source perms");
+
+        let ctx = make_generator(None);
+        let meta = std::fs::symlink_metadata(&path).expect("metadata");
+        let entry = ctx
+            .create_entry(&path, PathBuf::from("source.txt"), &meta)
+            .expect("create_entry");
+
+        assert_eq!(entry.permissions() & 0o7777, 0o664);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod client_chmod_tests {
+    //! Client `--chmod` push regression: on a push the local client IS the
+    //! sender, so `create_entry` must rewrite each outgoing flist entry's mode
+    //! with the parsed `--chmod` modifiers. Mirrors upstream
+    //! `flist.c:1580-1581 send_file_name() -> tweak_mode()`, where the sender
+    //! applies `chmod_modes` to `file->mode` before serialising the entry. The
+    //! transformed mode is what the remote receiver materialises on disk and
+    //! compares against for the itemize `p` (perms-changed) flag; without the
+    //! rewrite a push left every file/dir at its source mode.
+
+    use crate::config::ServerConfig;
+    use crate::generator::GeneratorContext;
+    use crate::handshake::HandshakeResult;
+    use crate::role::ServerRole;
+    use ::metadata::ChmodModifiers;
+    use protocol::ProtocolVersion;
+    use std::ffi::OsString;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn make_generator(chmod: Option<ChmodModifiers>) -> GeneratorContext {
+        let handshake = HandshakeResult {
+            protocol: ProtocolVersion::try_from(32u8).unwrap(),
+            buffered: Vec::new(),
+            compat_exchanged: false,
+            client_args: None,
+            io_timeout: None,
+            negotiated_algorithms: None,
+            compat_flags: None,
+            checksum_seed: 0,
+        };
+        let mut config = ServerConfig {
+            role: ServerRole::Generator,
+            protocol: ProtocolVersion::try_from(32u8).unwrap(),
+            flag_string: "-logDtpre.".to_owned(),
+            args: vec![OsString::from(".")],
+            chmod,
+            ..Default::default()
+        };
+        config.flags.numeric_ids = crate::NumericIds::Explicit;
+        GeneratorContext::new_for_test(&handshake, config)
+    }
+
+    /// `--chmod=Dg+s,Fo-rwx` on a push: a 0644 file becomes 0640 and a 0755
+    /// directory becomes 02755 on the wire. This is the exact spec from the
+    /// drop-in bug report where the ssh/daemon push left both at their source
+    /// modes while the pull applied the same modifiers correctly.
+    #[test]
+    fn client_chmod_dir_setgid_and_file_clear_other() {
+        let tmp = TempDir::new().expect("tempdir");
+        let file = tmp.path().join("f644");
+        std::fs::write(&file, b"payload").expect("write");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
+            .expect("set file perms");
+        let dir = tmp.path().join("sub");
+        std::fs::create_dir(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("set dir perms");
+
+        let modifiers = ChmodModifiers::parse("Dg+s,Fo-rwx").expect("parse chmod spec");
+        let ctx = make_generator(Some(modifiers));
+
+        let fmeta = std::fs::symlink_metadata(&file).expect("metadata");
+        let fentry = ctx
+            .create_entry(&file, PathBuf::from("f644"), &fmeta)
+            .expect("create_entry file");
+        assert_eq!(
+            fentry.permissions() & 0o7777,
+            0o640,
+            "Fo-rwx must clear other rwx on the wire (0644 -> 0640)",
+        );
+
+        let dmeta = std::fs::symlink_metadata(&dir).expect("metadata");
+        let dentry = ctx
+            .create_entry(&dir, PathBuf::from("sub"), &dmeta)
+            .expect("create_entry dir");
+        assert_eq!(
+            dentry.permissions() & 0o7777,
+            0o2755,
+            "Dg+s must set the setgid bit on the wire (0755 -> 02755)",
+        );
+    }
+
+    /// Numeric `--chmod=D2755,F640` sets exact modes per file type.
+    #[test]
+    fn client_chmod_numeric_dir_and_file_modes() {
+        let tmp = TempDir::new().expect("tempdir");
+        let file = tmp.path().join("f");
+        std::fs::write(&file, b"x").expect("write");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+            .expect("set file perms");
+        let dir = tmp.path().join("d");
+        std::fs::create_dir(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("set dir perms");
+
+        let modifiers = ChmodModifiers::parse("D2755,F640").expect("parse chmod spec");
+        let ctx = make_generator(Some(modifiers));
+
+        let fmeta = std::fs::symlink_metadata(&file).expect("metadata");
+        let fentry = ctx
+            .create_entry(&file, PathBuf::from("f"), &fmeta)
+            .expect("create_entry file");
+        assert_eq!(
+            fentry.permissions() & 0o7777,
+            0o640,
+            "F640 sets file to 0640"
+        );
+
+        let dmeta = std::fs::symlink_metadata(&dir).expect("metadata");
+        let dentry = ctx
+            .create_entry(&dir, PathBuf::from("d"), &dmeta)
+            .expect("create_entry dir");
+        assert_eq!(
+            dentry.permissions() & 0o7777,
+            0o2755,
+            "D2755 sets directory to 02755",
+        );
+    }
+
+    /// Symlinks are exempt from `--chmod` on the sender, matching upstream's
+    /// `!S_ISLNK(file->mode)` guard at flist.c:1580. The link entry's mode must
+    /// survive the rewrite unchanged.
+    #[test]
+    fn client_chmod_skips_symlinks() {
+        let tmp = TempDir::new().expect("tempdir");
+        let link = tmp.path().join("link");
+        symlink("target", &link).expect("symlink");
+
+        let modifiers = ChmodModifiers::parse("Fo-rwx,Do-rwx").expect("parse chmod spec");
+        let ctx = make_generator(Some(modifiers));
+        let meta = std::fs::symlink_metadata(&link).expect("metadata");
+        let before = ctx
+            .create_entry(&link, PathBuf::from("link"), &meta)
+            .expect("create_entry");
+        let unmodified = make_generator(None)
+            .create_entry(&link, PathBuf::from("link"), &meta)
+            .expect("create_entry");
+
+        assert_eq!(
+            before.permissions() & 0o7777,
+            unmodified.permissions() & 0o7777,
+            "symlink entry mode must be untouched by --chmod (upstream !S_ISLNK)",
+        );
+    }
+
+    /// Without `--chmod` the sender emits the on-disk mode verbatim.
+    #[test]
+    fn no_client_chmod_leaves_mode_untouched() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("f");
+        std::fs::write(&path, b"x").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("set perms");
+
+        let ctx = make_generator(None);
+        let meta = std::fs::symlink_metadata(&path).expect("metadata");
+        let entry = ctx
+            .create_entry(&path, PathBuf::from("f"), &meta)
+            .expect("create_entry");
+
+        assert_eq!(entry.permissions() & 0o7777, 0o644);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod munge_symlinks_tests {
+    //! Sender-side `munge symlinks` regression tests.
+    //!
+    //! upstream: flist.c:222-226 - when the daemon enabled `munge symlinks`,
+    //! the sender strips the `/rsyncd-munged/` prefix after `readlink()` so
+    //! the wire format carries the original target. The matching prepend on
+    //! the receive side lives in `crate::receiver::directory::links`.
+
+    use crate::config::ServerConfig;
+    use crate::generator::GeneratorContext;
+    use crate::handshake::HandshakeResult;
+    use crate::role::ServerRole;
+    use protocol::ProtocolVersion;
+    use std::ffi::OsString;
+    use std::os::unix::fs::symlink;
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
+
+    fn generator_with_munge(munge_symlinks: bool) -> GeneratorContext {
+        let handshake = HandshakeResult {
+            protocol: ProtocolVersion::try_from(32u8).unwrap(),
+            buffered: Vec::new(),
+            compat_exchanged: false,
+            client_args: None,
+            io_timeout: None,
+            negotiated_algorithms: None,
+            compat_flags: None,
+            checksum_seed: 0,
+        };
+        let config = ServerConfig {
+            role: ServerRole::Generator,
+            protocol: ProtocolVersion::try_from(32u8).unwrap(),
+            flag_string: "-logDtpre.".to_owned(),
+            args: vec![OsString::from(".")],
+            munge_symlinks,
+            ..Default::default()
+        };
+        GeneratorContext::new_for_test(&handshake, config)
+    }
+
+    #[test]
+    fn sender_strips_munge_prefix_before_emitting_wire_target() {
+        // upstream: flist.c:222-226 - when the daemon enabled `munge symlinks`,
+        // the sender restores the original target before encoding the flist
+        // entry. Verify the in-memory `FileEntry` carries the stripped path so
+        // the wire format never leaks `/rsyncd-munged/`.
+        let tmp = TempDir::new().unwrap();
+        let link = tmp.path().join("escape");
+        symlink(Path::new("/rsyncd-munged//etc/passwd"), &link).unwrap();
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+
+        let ctx = generator_with_munge(true);
+        let entry = ctx
+            .create_entry(&link, PathBuf::from("escape"), &meta)
+            .unwrap();
+
+        assert_eq!(
+            entry.link_target().map(PathBuf::as_path),
+            Some(Path::new("/etc/passwd")),
+            "sender must strip `/rsyncd-munged/` before transmission \
+             (upstream flist.c:222-226)",
+        );
+    }
+
+    #[test]
+    fn sender_preserves_prefix_when_munge_disabled() {
+        // Negative control: with `munge_symlinks=false` the prefix on the
+        // source link is part of the user's intentional target and must
+        // travel verbatim on the wire.
+        let tmp = TempDir::new().unwrap();
+        let link = tmp.path().join("escape");
+        symlink(Path::new("/rsyncd-munged//etc/passwd"), &link).unwrap();
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+
+        let ctx = generator_with_munge(false);
+        let entry = ctx
+            .create_entry(&link, PathBuf::from("escape"), &meta)
+            .unwrap();
+
+        assert_eq!(
+            entry.link_target().map(PathBuf::as_path),
+            Some(Path::new("/rsyncd-munged//etc/passwd")),
+            "without `munge symlinks`, the prefix is part of the target and \
+             must round-trip verbatim",
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_reparse_tests {
+    //! Windows reparse-point classification regression tests (WPC-8'.9).
+    //!
+    //! Verifies that `create_entry` routes NTFS reparse points through the
+    //! WPC-8 classifier so junctions, symbolic links, and non-symlink
+    //! reparse points serialise as SYMLINK-class `FileEntry` values
+    //! (matching upstream's Cygwin behaviour) rather than as regular files.
+    //!
+    //! `mklink /j` runs without elevation on Windows 10+; `mklink /d`
+    //! (directory symlink) requires admin or developer mode and is
+    //! downgraded to a runtime skip when the privilege is missing, matching
+    //! the in-tree integration tests that ship with the classifier itself.
+    //!
+    //! Mount-point coverage is left to the classifier-level integration
+    //! tests because `mountvol` requires admin elevation and a free volume
+    //! GUID; the wiring contract under test here is "every reparse-point
+    //! attribute routes through `metadata::windows::classify_path` and lands
+    //! in the symlink branch", which the junction case already verifies
+    //! end-to-end.
+
+    use crate::config::ServerConfig;
+    use crate::generator::GeneratorContext;
+    use crate::handshake::HandshakeResult;
+    use crate::role::ServerRole;
+    use protocol::ProtocolVersion;
+    use protocol::flist::FileType;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn windows_generator() -> GeneratorContext {
+        let handshake = HandshakeResult {
+            protocol: ProtocolVersion::try_from(32u8).unwrap(),
+            buffered: Vec::new(),
+            compat_exchanged: false,
+            client_args: None,
+            io_timeout: None,
+            negotiated_algorithms: None,
+            compat_flags: None,
+            checksum_seed: 0,
+        };
+        let config = ServerConfig {
+            role: ServerRole::Generator,
+            protocol: ProtocolVersion::try_from(32u8).unwrap(),
+            flag_string: "-logDtpre.".to_owned(),
+            args: vec![OsString::from(".")],
+            ..Default::default()
+        };
+        GeneratorContext::new_for_test(&handshake, config)
+    }
+
+    /// Returns `Some(status)` when `mklink` succeeded, `None` when the test
+    /// should be skipped because `cmd.exe` is unavailable or the privilege
+    /// to create the reparse point is missing.
+    fn try_mklink(args: &[&str]) -> Option<()> {
+        let status = Command::new("cmd").args(args).status().ok()?;
+        if status.success() { Some(()) } else { None }
+    }
+
+    /// Regular file: stays Regular, does not flip to Symlink.
+    ///
+    /// Negative control: ensures the reparse-attribute probe does not
+    /// false-positive on non-reparse entries.
+    #[test]
+    fn regular_file_is_classified_as_regular() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("plain.txt");
+        std::fs::write(&path, b"data").expect("write file");
+        let meta = std::fs::symlink_metadata(&path).expect("symlink_metadata");
+
+        let ctx = windows_generator();
+        let entry = ctx
+            .create_entry(&path, PathBuf::from("plain.txt"), &meta)
+            .expect("create_entry");
+
+        assert_eq!(entry.file_type(), FileType::Regular);
+        assert_eq!(entry.size(), 4);
+    }
+
+    /// Directory junction (`mklink /j`): WPC-8 classifies as `Junction`,
+    /// `create_entry` emits a `Symlink` FileEntry whose target is preserved.
+    ///
+    /// Mirrors upstream rsync Cygwin behaviour (every reparse point becomes
+    /// a POSIX symbolic link on the wire) while exercising the wiring that
+    /// PR #5579 + PR #5592 deferred behind the classifier API.
+    #[test]
+    fn junction_is_emitted_as_symlink_entry() {
+        let tmp = TempDir::new().expect("tempdir");
+        let target = tmp.path().join("target");
+        let junction = tmp.path().join("link");
+        std::fs::create_dir(&target).expect("create target dir");
+
+        let junction_str = match junction.to_str() {
+            Some(s) => s,
+            None => return, // non-UTF8 tempdir, skip
+        };
+        let target_str = match target.to_str() {
+            Some(s) => s,
+            None => return,
+        };
+        if try_mklink(&["/c", "mklink", "/j", junction_str, target_str]).is_none() {
+            // junction creation refused (no cmd.exe, or filesystem rejects);
+            // skip rather than fail so non-admin CI runners stay green.
+            return;
+        }
+
+        let meta = std::fs::symlink_metadata(&junction).expect("symlink_metadata");
+        let ctx = windows_generator();
+        let entry = ctx
+            .create_entry(&junction, PathBuf::from("link"), &meta)
+            .expect("create_entry");
+
+        assert_eq!(
+            entry.file_type(),
+            FileType::Symlink,
+            "junction must serialise as SYMLINK for Cygwin parity"
+        );
+        let link_target = entry.link_target().cloned().unwrap_or_default();
+        assert!(
+            !link_target.as_os_str().is_empty(),
+            "junction target must be preserved (got empty), \
+             entry={entry:?}"
+        );
+    }
+
+    /// Directory symlink (`mklink /d`): WPC-8 classifies as `Symlink`,
+    /// `create_entry` emits a `Symlink` FileEntry with a non-empty target.
+    ///
+    /// Skipped at runtime when `mklink /d` is refused (requires admin or
+    /// Windows 10 developer mode).
+    #[test]
+    fn directory_symlink_is_emitted_as_symlink_entry() {
+        let tmp = TempDir::new().expect("tempdir");
+        let target = tmp.path().join("target");
+        let link = tmp.path().join("link");
+        std::fs::create_dir(&target).expect("create target dir");
+
+        let link_str = match link.to_str() {
+            Some(s) => s,
+            None => return,
+        };
+        let target_str = match target.to_str() {
+            Some(s) => s,
+            None => return,
+        };
+        if try_mklink(&["/c", "mklink", "/d", link_str, target_str]).is_none() {
+            return; // privilege missing, skip
+        }
+
+        let meta = std::fs::symlink_metadata(&link).expect("symlink_metadata");
+        let ctx = windows_generator();
+        let entry = ctx
+            .create_entry(&link, PathBuf::from("link"), &meta)
+            .expect("create_entry");
+
+        assert_eq!(entry.file_type(), FileType::Symlink);
+        let link_target = entry.link_target().cloned().unwrap_or_default();
+        assert!(
+            !link_target.as_os_str().is_empty(),
+            "directory symlink target must be preserved, entry={entry:?}"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod entry_length_tests {
+    //! `F_LENGTH` parity regression for directory and symlink entries.
+    //!
+    //! upstream: flist.c:1662 - `file->len32 = (uint32)st.st_size` runs for
+    //! every entry type; only devices and specials are zeroed at flist.c:1484
+    //! and flist.c:1486. Directories therefore carry their on-disk inode size
+    //! and symlinks carry `st_size` (the target byte length). That field is
+    //! summed into the `--stats` "Total file size" total at flist.c:691 and
+    //! rendered by `--list-only` and `%l`, so emitting 0 here would diverge
+    //! from upstream's observable output byte-for-byte.
+
+    use crate::config::ServerConfig;
+    use crate::generator::GeneratorContext;
+    use crate::handshake::HandshakeResult;
+    use crate::role::ServerRole;
+    use protocol::ProtocolVersion;
+    use protocol::flist::FileType;
+    use std::ffi::OsString;
+    use std::os::unix::fs::symlink;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn generator() -> GeneratorContext {
+        let handshake = HandshakeResult {
+            protocol: ProtocolVersion::try_from(32u8).unwrap(),
+            buffered: Vec::new(),
+            compat_exchanged: false,
+            client_args: None,
+            io_timeout: None,
+            negotiated_algorithms: None,
+            compat_flags: None,
+            checksum_seed: 0,
+        };
+        let mut config = ServerConfig {
+            role: ServerRole::Generator,
+            protocol: ProtocolVersion::try_from(32u8).unwrap(),
+            flag_string: "-logDtpre.".to_owned(),
+            args: vec![OsString::from(".")],
+            ..Default::default()
+        };
+        config.flags.numeric_ids = crate::NumericIds::Explicit;
+        GeneratorContext::new_for_test(&handshake, config)
+    }
+
+    #[test]
+    fn directory_entry_carries_on_disk_size() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("subdir");
+        std::fs::create_dir(&dir).expect("create dir");
+        let meta = std::fs::symlink_metadata(&dir).expect("metadata");
+
+        let ctx = generator();
+        let entry = ctx
+            .create_entry(&dir, PathBuf::from("subdir"), &meta)
+            .expect("create_entry");
+
+        assert_eq!(entry.file_type(), FileType::Directory);
+        assert!(
+            meta.len() > 0,
+            "directories report a non-zero on-disk st_size on Unix",
+        );
+        assert_eq!(
+            entry.size(),
+            meta.len(),
+            "directory F_LENGTH must mirror st_size (upstream flist.c:1501), \
+             not the hardcoded 0 from FileEntry::new_directory",
+        );
+    }
+
+    #[test]
+    fn symlink_entry_carries_target_length() {
+        let tmp = TempDir::new().expect("tempdir");
+        let link = tmp.path().join("link");
+        // lstat reports st_size == strlen(target) for symlinks.
+        let target = "some/relative/target";
+        symlink(target, &link).expect("create symlink");
+        let meta = std::fs::symlink_metadata(&link).expect("metadata");
+
+        let ctx = generator();
+        let entry = ctx
+            .create_entry(&link, PathBuf::from("link"), &meta)
+            .expect("create_entry");
+
+        assert_eq!(entry.file_type(), FileType::Symlink);
+        assert_eq!(
+            entry.size(),
+            target.len() as u64,
+            "symlink F_LENGTH must equal the target byte length \
+             (upstream flist.c:1465), not the hardcoded 0 from \
+             FileEntry::new_symlink",
+        );
+        assert_eq!(
+            entry.size(),
+            meta.len(),
+            "F_LENGTH must mirror lstat st_size"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod flist_checksum_tests {
+    //! Sender-side `--checksum` (`-c`) per-file flist checksum regression.
+    //!
+    //! upstream: flist.c:1590 - `always_checksum && am_sender && S_ISREG`
+    //! computes `file_checksum()` (checksum.c:401, unseeded) and stores it in
+    //! `F_SUM(file)`; send_file_entry (flist.c:1003) writes it into the flist.
+    //! The receiver's quick-check (generator.c:633 `quick_check_ok`) compares
+    //! its own unseeded `file_checksum()` of the basis against this value to
+    //! decide the file is unchanged and skip the transfer.
+    //!
+    //! WHY this matters: without the sender populating the checksum, the flist
+    //! carries an all-zero sum, the receiver's `-c` quick-check can never match
+    //! a content-identical basis, and every unchanged file is re-transferred
+    //! over the wire (a real over-transfer, not merely a mislabeled itemize
+    //! row). These tests pin that the sender emits the exact unseeded digest
+    //! the receiver recomputes, so the two sides agree.
+
+    use crate::config::ServerConfig;
+    use crate::delta_apply::ChecksumVerifier;
+    use crate::generator::GeneratorContext;
+    use crate::handshake::HandshakeResult;
+    use crate::role::ServerRole;
+    use protocol::ProtocolVersion;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn generator(checksum: bool) -> GeneratorContext {
+        let handshake = HandshakeResult {
+            protocol: ProtocolVersion::try_from(32u8).unwrap(),
+            buffered: Vec::new(),
+            compat_exchanged: false,
+            client_args: None,
+            io_timeout: None,
+            negotiated_algorithms: None,
+            compat_flags: None,
+            checksum_seed: 0,
+        };
+        let mut config = ServerConfig {
+            role: ServerRole::Generator,
+            protocol: ProtocolVersion::try_from(32u8).unwrap(),
+            flag_string: "-logDtpre.".to_owned(),
+            args: vec![OsString::from(".")],
+            ..Default::default()
+        };
+        config.flags.checksum = checksum;
+        config.flags.numeric_ids = crate::NumericIds::Explicit;
+        GeneratorContext::new_for_test(&handshake, config)
+    }
+
+    /// Reference digest: the exact unseeded hash the receiver recomputes in
+    /// `quick_check_matches` -> `file_checksum_matches`.
+    fn expected_sum(ctx: &GeneratorContext, data: &[u8]) -> Vec<u8> {
+        let mut verifier = ChecksumVerifier::for_algorithm(ctx.get_checksum_algorithm());
+        verifier.update(data);
+        let mut digest = [0u8; ChecksumVerifier::MAX_DIGEST_LEN];
+        let len = verifier.finalize_into(&mut digest);
+        digest[..len].to_vec()
+    }
+
+    #[test]
+    fn checksum_flag_populates_regular_file_sum() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("payload.bin");
+        let data = b"the quick brown fox jumps over the lazy dog";
+        std::fs::write(&path, data).unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+
+        let ctx = generator(true);
+        let entry = ctx
+            .create_entry(&path, PathBuf::from("payload.bin"), &meta)
+            .unwrap();
+
+        assert_eq!(
+            entry.checksum().map(<[u8]>::to_vec),
+            Some(expected_sum(&ctx, data)),
+            "sender must store the unseeded per-file checksum the receiver \
+             recomputes (upstream flist.c:1444); otherwise -c re-transfers \
+             content-identical files",
+        );
+    }
+
+    #[test]
+    fn empty_file_gets_checksum_of_empty_input() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("empty");
+        std::fs::write(&path, b"").unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+
+        let ctx = generator(true);
+        let entry = ctx
+            .create_entry(&path, PathBuf::from("empty"), &meta)
+            .unwrap();
+
+        assert_eq!(
+            entry.checksum().map(<[u8]>::to_vec),
+            Some(expected_sum(&ctx, b"")),
+            "a zero-length regular file still carries its (empty-input) sum",
+        );
+    }
+
+    #[test]
+    fn without_checksum_flag_no_sum_is_stored() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("payload.bin");
+        std::fs::write(&path, b"data").unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+
+        let ctx = generator(false);
+        let entry = ctx
+            .create_entry(&path, PathBuf::from("payload.bin"), &meta)
+            .unwrap();
+
+        assert_eq!(
+            entry.checksum(),
+            None,
+            "without --checksum the flist carries no per-file sum \
+             (upstream gates on always_checksum)",
+        );
+    }
+}

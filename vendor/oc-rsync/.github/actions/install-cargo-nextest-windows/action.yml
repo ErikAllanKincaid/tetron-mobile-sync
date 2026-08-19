@@ -1,0 +1,96 @@
+name: Install cargo-nextest (Windows)
+description: >-
+  Installs an exact cargo-nextest version on the Windows runners without
+  invoking bash, and without fetching anything once the version has been
+  cached by a previous run.
+
+inputs:
+  version:
+    description: >-
+      Exact cargo-nextest version to install. The default is the single source
+      of truth for every Windows cell; override only to test a specific build.
+    required: false
+    default: "0.9.114"
+
+runs:
+  using: composite
+  steps:
+    # The binary is cached HERE rather than relied upon from the Rust cache.
+    # Swatinem/rust-cache restores the registry, git DB and target dir but
+    # deliberately does not preserve installed binaries, so ~/.cargo/bin is
+    # empty on a fresh runner even on a full-match Rust cache hit. Observed
+    # directly: a job logged `Restored from cache ... full match: true` and
+    # then still fell through to the download, which is the transient that
+    # took the cell down. Caching the exact pinned executable is what actually
+    # removes the network from the common path.
+    - name: Restore cargo-nextest ${{ inputs.version }}
+      id: nextest-cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cargo/bin/cargo-nextest.exe
+        # Version is in the key, so bumping the pin misses cleanly and
+        # re-downloads instead of silently reusing the old executable.
+        key: cargo-nextest-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}
+
+    - name: Install cargo-nextest ${{ inputs.version }}
+      if: steps.nextest-cache.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: |
+        # taiki-e/install-action shells out to bash, which fails to start on the
+        # Windows partner runners (actions/partner-runner-images#169), so the
+        # binary is fetched directly through PowerShell instead.
+        #
+        # This runs only on a cache miss, and downloads exactly once. There is
+        # no retry and no backoff: a fetch failure here fails the job
+        # immediately and loudly rather than being re-attempted. The cache
+        # above is what keeps the common path off the network.
+        #
+        # The version is pinned by the caller rather than tracking `latest`, so
+        # a re-run of an old commit installs what that commit was tested
+        # against instead of whatever upstream has published since.
+        $ErrorActionPreference = 'Stop'
+
+        $want = '${{ inputs.version }}'
+        $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+        New-Item -ItemType Directory -Force -Path $cargoBin | Out-Null
+        $zip = Join-Path $env:RUNNER_TEMP 'nextest.zip'
+        Invoke-WebRequest -UseBasicParsing -Uri "https://get.nexte.st/$want/windows" -OutFile $zip
+        Expand-Archive -Force -Path $zip -DestinationPath $cargoBin
+
+    # Runs on both paths. On a miss it catches get.nexte.st serving something
+    # other than the requested release; on a hit it catches a cache entry whose
+    # key says one version while the executable is another. Either way the
+    # matrix must never silently test a build the pin does not name.
+    - name: Verify cargo-nextest ${{ inputs.version }}
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        $want = '${{ inputs.version }}'
+        $exe = Join-Path (Join-Path $env:USERPROFILE '.cargo\bin') 'cargo-nextest.exe'
+        if (-not (Test-Path $exe)) {
+          throw "cargo-nextest.exe missing at $exe after install/restore"
+        }
+
+        # `cargo-nextest --version` prints a MULTI-LINE block, not one line:
+        #
+        #   cargo-nextest 0.9.114
+        #   release: 0.9.114
+        #   commit-hash: 9daab1c50cd0389236508435f71434f01aa2eca1
+        #   commit-date: 2025-11-19
+        #   host: x86_64-pc-windows-msvc
+        #
+        # So `& $exe --version` yields a string ARRAY. Taking the first line is
+        # load-bearing: `-replace` over an array returns an array (only the
+        # first element matches, the rest pass through untouched), and `-ne`
+        # against an array FILTERS rather than compares, so a non-empty result
+        # is truthy and the equality guard below fires on a correct install.
+        # `@(...)` forces an array even for single-line output, so [0] is always
+        # safe. Indexing rather than `Select-Object -First 1` avoids
+        # terminating the native command's pipeline early.
+        $lines = @(& $exe --version)
+        $got = ($lines[0] -replace '^cargo-nextest\s+([0-9][0-9.]*).*$', '$1').Trim()
+        if ($got -ne $want) {
+          throw "cargo-nextest version mismatch: pinned $want, installed $got"
+        }
+        Write-Host "cargo-nextest $got ready (cache-hit: ${{ steps.nextest-cache.outputs.cache-hit }})"

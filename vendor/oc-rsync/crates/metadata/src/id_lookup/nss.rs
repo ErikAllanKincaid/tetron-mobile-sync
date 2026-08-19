@@ -1,0 +1,340 @@
+//! POSIX NSS lookup functions for UID/GID name resolution.
+//!
+//! Wraps the thread-safe `_r` variants of `getpwuid`, `getpwnam`, `getgrgid`,
+//! and `getgrnam`. A thread-local name converter, when installed, *replaces*
+//! the libc call rather than being tried ahead of it - see
+//! [`with_name_converter`](super::converter::with_name_converter).
+//!
+//! upstream: uidlist.c - getpwuid_r / getpwnam_r / getgrgid_r / getgrnam_r usage
+
+#![allow(unsafe_code)]
+
+use super::converter::with_name_converter;
+use rustix::process::{RawGid, RawUid};
+use std::ffi::{CStr, CString};
+use std::io;
+use std::mem::MaybeUninit;
+use std::ptr;
+
+/// Looks up the username for a given UID.
+///
+/// Returns `Ok(Some(name))` if the user exists, `Ok(None)` if not found.
+/// Uses `getpwuid_r` for thread-safe lookup. When a name converter is
+/// installed via [`super::set_name_converter`], delegates to it instead.
+pub fn lookup_user_name(uid: RawUid) -> Result<Option<Vec<u8>>, io::Error> {
+    // upstream: uidlist.c:114-121 - the converter replaces getpwuid outright.
+    if let Some(answer) = with_name_converter(|nc| nc.uid_to_name(uid)) {
+        return Ok(answer.map(String::into_bytes));
+    }
+
+    let mut buffer = vec![0_u8; 1024];
+    loop {
+        let mut pwd = MaybeUninit::<libc::passwd>::zeroed();
+        let mut result: *mut libc::passwd = ptr::null_mut();
+        // SAFETY: All arguments are valid pointers with sufficient lifetimes:
+        // - `pwd` is uninitialized but will be written by getpwuid_r
+        // - `buffer` provides scratch space owned by this function
+        // - `result` receives the output pointer
+        let errno = unsafe {
+            libc::getpwuid_r(
+                uid as libc::uid_t,
+                pwd.as_mut_ptr(),
+                buffer.as_mut_ptr() as *mut libc::c_char,
+                buffer.len(),
+                &mut result,
+            )
+        };
+
+        if errno == 0 {
+            if result.is_null() {
+                return Ok(None);
+            }
+            // SAFETY: `result` is non-null, so getpwuid_r successfully initialized `pwd`.
+            let pwd = unsafe { pwd.assume_init() };
+            // SAFETY: `pw_name` is a valid C string set by getpwuid_r, backed by `buffer`.
+            let name = unsafe { CStr::from_ptr(pwd.pw_name) };
+            return Ok(Some(name.to_bytes().to_vec()));
+        }
+
+        if errno == libc::ERANGE {
+            buffer.resize(buffer.len().saturating_mul(2), 0);
+            continue;
+        }
+
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+}
+
+/// Looks up the UID for a given username.
+///
+/// Returns `Ok(Some(uid))` if the user exists, `Ok(None)` if not found.
+/// Uses `getpwnam_r` for thread-safe lookup. When a name converter is
+/// installed via [`super::set_name_converter`], delegates to it instead.
+pub fn lookup_user_by_name(name: &[u8]) -> Result<Option<RawUid>, io::Error> {
+    // upstream: uidlist.c:146 `user_to_uid()` - an empty name is "no id",
+    // decided before the converter or the host database is consulted.
+    if name.is_empty() {
+        return Ok(None);
+    }
+
+    // upstream: uidlist.c:131-138 - the converter replaces getpwnam outright.
+    if let Ok(name_str) = std::str::from_utf8(name)
+        && let Some(answer) = with_name_converter(|nc| nc.name_to_uid(name_str))
+    {
+        return Ok(answer.map(|uid| uid as RawUid));
+    }
+
+    let Ok(c_name) = CString::new(name) else {
+        return Ok(None);
+    };
+
+    let mut buffer = vec![0_u8; 1024];
+    loop {
+        let mut pwd = MaybeUninit::<libc::passwd>::zeroed();
+        let mut result: *mut libc::passwd = ptr::null_mut();
+        // SAFETY: All arguments are valid pointers with sufficient lifetimes:
+        // - `c_name` is a valid CString
+        // - `pwd` is uninitialized but will be written by getpwnam_r
+        // - `buffer` provides scratch space owned by this function
+        // - `result` receives the output pointer
+        let errno = unsafe {
+            libc::getpwnam_r(
+                c_name.as_ptr(),
+                pwd.as_mut_ptr(),
+                buffer.as_mut_ptr() as *mut libc::c_char,
+                buffer.len(),
+                &mut result,
+            )
+        };
+
+        if errno == 0 {
+            if result.is_null() {
+                return Ok(None);
+            }
+            // SAFETY: `result` is non-null, so getpwnam_r successfully initialized `pwd`.
+            let pwd = unsafe { pwd.assume_init() };
+            return Ok(Some(pwd.pw_uid as RawUid));
+        }
+
+        if errno == libc::ERANGE {
+            buffer.resize(buffer.len().saturating_mul(2), 0);
+            continue;
+        }
+
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+}
+
+/// Looks up the group name for a given GID.
+///
+/// Returns `Ok(Some(name))` if the group exists, `Ok(None)` if not found.
+/// Uses `getgrgid_r` for thread-safe lookup. When a name converter is
+/// installed via [`super::set_name_converter`], delegates to it instead.
+pub fn lookup_group_name(gid: RawGid) -> Result<Option<Vec<u8>>, io::Error> {
+    // upstream: uidlist.c:154-163 - the converter replaces getgrgid outright.
+    if let Some(answer) = with_name_converter(|nc| nc.gid_to_name(gid)) {
+        return Ok(answer.map(String::into_bytes));
+    }
+
+    let mut buffer = vec![0_u8; 1024];
+    loop {
+        let mut grp = MaybeUninit::<libc::group>::zeroed();
+        let mut result: *mut libc::group = ptr::null_mut();
+        // SAFETY: All arguments are valid pointers with sufficient lifetimes:
+        // - `grp` is uninitialized but will be written by getgrgid_r
+        // - `buffer` provides scratch space owned by this function
+        // - `result` receives the output pointer
+        let errno = unsafe {
+            libc::getgrgid_r(
+                gid as libc::gid_t,
+                grp.as_mut_ptr(),
+                buffer.as_mut_ptr() as *mut libc::c_char,
+                buffer.len(),
+                &mut result,
+            )
+        };
+
+        if errno == 0 {
+            if result.is_null() {
+                return Ok(None);
+            }
+            // SAFETY: `result` is non-null, so getgrgid_r successfully initialized `grp`.
+            let grp = unsafe { grp.assume_init() };
+            // SAFETY: `gr_name` is a valid C string set by getgrgid_r, backed by `buffer`.
+            let name = unsafe { CStr::from_ptr(grp.gr_name) };
+            return Ok(Some(name.to_bytes().to_vec()));
+        }
+
+        if errno == libc::ERANGE {
+            buffer.resize(buffer.len().saturating_mul(2), 0);
+            continue;
+        }
+
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+}
+
+/// Looks up the GID for a given group name.
+///
+/// Returns `Ok(Some(gid))` if the group exists, `Ok(None)` if not found.
+/// Uses `getgrnam_r` for thread-safe lookup. When a name converter is
+/// installed via [`super::set_name_converter`], delegates to it instead.
+pub fn lookup_group_by_name(name: &[u8]) -> Result<Option<RawGid>, io::Error> {
+    // upstream: uidlist.c:172 `group_to_gid()` - an empty name is "no id",
+    // decided before the converter or the host database is consulted.
+    if name.is_empty() {
+        return Ok(None);
+    }
+
+    // upstream: uidlist.c:180-189 - the converter replaces getgrnam outright.
+    if let Ok(name_str) = std::str::from_utf8(name)
+        && let Some(answer) = with_name_converter(|nc| nc.name_to_gid(name_str))
+    {
+        return Ok(answer.map(|gid| gid as RawGid));
+    }
+
+    let Ok(c_name) = CString::new(name) else {
+        return Ok(None);
+    };
+
+    let mut buffer = vec![0_u8; 1024];
+    loop {
+        let mut grp = MaybeUninit::<libc::group>::zeroed();
+        let mut result: *mut libc::group = ptr::null_mut();
+        // SAFETY: All arguments are valid pointers with sufficient lifetimes:
+        // - `c_name` is a valid CString
+        // - `grp` is uninitialized but will be written by getgrnam_r
+        // - `buffer` provides scratch space owned by this function
+        // - `result` receives the output pointer
+        let errno = unsafe {
+            libc::getgrnam_r(
+                c_name.as_ptr(),
+                grp.as_mut_ptr(),
+                buffer.as_mut_ptr() as *mut libc::c_char,
+                buffer.len(),
+                &mut result,
+            )
+        };
+
+        if errno == 0 {
+            if result.is_null() {
+                return Ok(None);
+            }
+            // SAFETY: `result` is non-null, so getgrnam_r successfully initialized `grp`.
+            let grp = unsafe { grp.assume_init() };
+            return Ok(Some(grp.gr_gid as RawGid));
+        }
+
+        if errno == libc::ERANGE {
+            buffer.resize(buffer.len().saturating_mul(2), 0);
+            continue;
+        }
+
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+}
+
+/// Returns every group the given uid belongs to, with the user's primary
+/// group first.
+///
+/// Resolves the passwd entry for `uid` and calls `getgrouplist(pw_name,
+/// pw_gid)` via the safe `nix` wrapper, so no additional unsafe FFI is
+/// introduced. Used by the daemon to implement a module `gid = *` directive,
+/// which installs the full group set with `setgroups`.
+///
+/// upstream: uidlist.c:576 `getallgroups()` - `getpwuid()` then
+/// `getgrouplist(pw->pw_name, pw->pw_gid, ...)`; consumed by
+/// clientserver.c:797 `want_all_groups()` for `gid = *`.
+pub fn supplementary_gids_for_uid(uid: RawUid) -> Result<Vec<u32>, io::Error> {
+    use nix::unistd::{Uid, User};
+
+    let user = User::from_uid(Uid::from_raw(uid))
+        .map_err(|err| io::Error::from_raw_os_error(err as i32))?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no passwd entry for uid {uid}"),
+            )
+        })?;
+
+    let name = CString::new(user.name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "user name contains an interior NUL byte",
+        )
+    })?;
+
+    group_list_for(&name, user.gid.as_raw())
+}
+
+/// Returns the names of every group the named user belongs to, primary group
+/// first, then supplementary groups.
+///
+/// Resolves the user's uid with `getpwnam`, enumerates the full group set with
+/// `getgrouplist` (via [`supplementary_gids_for_uid`]), then maps each gid to
+/// its group name with `getgrgid`. A gid without a name entry is skipped, just
+/// as upstream drops a NULL `gid_to_group()` result. A user with no passwd
+/// entry yields an empty list rather than an error, mirroring upstream's
+/// `user_to_uid()` failure path (which treats the user as having no groups).
+///
+/// Used by the rsync daemon to authorize an `auth users = @group` token: the
+/// token (minus the `@`) is `wildmatch`ed against each returned group name.
+///
+/// upstream: authenticate.c:283-295 `auth_server()` - `user_to_uid()` then
+/// `getallgroups()` then `gid_to_group()` for each gid.
+pub fn groups_for_user(username: &str) -> Result<Vec<String>, io::Error> {
+    let Some(uid) = lookup_user_by_name(username.as_bytes())? else {
+        return Ok(Vec::new());
+    };
+    let gids = supplementary_gids_for_uid(uid)?;
+    let mut names = Vec::with_capacity(gids.len());
+    for gid in gids {
+        if let Some(name) = lookup_group_name(gid)? {
+            if let Ok(name) = String::from_utf8(name) {
+                names.push(name);
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// Group-list lookup on platforms where `nix` exposes `getgrouplist`
+/// (Linux and friends).
+#[cfg(not(target_vendor = "apple"))]
+fn group_list_for(name: &CStr, primary: u32) -> Result<Vec<u32>, io::Error> {
+    let groups = nix::unistd::getgrouplist(name, nix::unistd::Gid::from_raw(primary))
+        .map_err(|err| io::Error::from_raw_os_error(err as i32))?;
+    Ok(groups.into_iter().map(|gid| gid.as_raw()).collect())
+}
+
+/// Group-list lookup on Apple targets, where `nix` gates out `getgrouplist`.
+///
+/// Calls `libc::getgrouplist` directly (Apple's variant uses an `int` group
+/// array), growing the buffer on the documented `-1` "too small" return.
+#[cfg(target_vendor = "apple")]
+fn group_list_for(name: &CStr, primary: u32) -> Result<Vec<u32>, io::Error> {
+    let mut ngroups: libc::c_int = 32;
+    loop {
+        let mut groups = vec![0 as libc::c_int; ngroups.max(1) as usize];
+        // SAFETY: `name` is a valid C string; `groups` has `ngroups` capacity;
+        // `ngroups` is a valid out-pointer. On success the call writes at most
+        // `ngroups` entries and updates the count.
+        let rc = unsafe {
+            libc::getgrouplist(
+                name.as_ptr(),
+                primary as libc::c_int,
+                groups.as_mut_ptr(),
+                &mut ngroups,
+            )
+        };
+        if rc >= 0 {
+            groups.truncate(ngroups.max(0) as usize);
+            return Ok(groups.into_iter().map(|gid| gid as u32).collect());
+        }
+        // rc == -1: the buffer was too small and `ngroups` now holds the
+        // required size. Guard against a non-growing count to avoid a loop.
+        if ngroups <= groups.len() as libc::c_int {
+            return Err(io::Error::other("getgrouplist failed to size group list"));
+        }
+    }
+}

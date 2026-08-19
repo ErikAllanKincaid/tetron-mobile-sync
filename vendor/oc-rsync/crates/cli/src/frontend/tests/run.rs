@@ -1,0 +1,152 @@
+use super::common::*;
+use super::*;
+
+// upstream: options.c:1762-1766 - a rejected --chmod arg prints
+// `Invalid argument passed to --chmod (%s)` (verbatim raw arg) and exits
+// RERR_SYNTAX (1). We assert the message and exit code byte-for-byte.
+#[test]
+fn run_reports_invalid_chmod_specification() {
+    use tempfile::tempdir;
+
+    let tmp = tempdir().expect("tempdir");
+    let source = tmp.path().join("source.txt");
+    let destination = tmp.path().join("dest.txt");
+    std::fs::write(&source, b"data").expect("write source");
+
+    // A lone category letter (u/g/o) in the permission half is a valid
+    // permission COPY since rsync 3.5.0, but mixing it with literal bits, with
+    // `s`/`t`, or with a second copy letter still hits chmod.c STATE_2ND_HALF's
+    // error transitions - as does `a`, which is never a copy source. Also
+    // exercise a plainly bogus letter.
+    for spec in ["a+q", "g=ur", "o=gs", "u+gg", "g=a"] {
+        let (code, stdout, stderr) = run_with_args([
+            OsString::from(RSYNC),
+            OsString::from(format!("--chmod={spec}")),
+            source.clone().into_os_string(),
+            destination.clone().into_os_string(),
+        ]);
+
+        assert_eq!(code, 1, "`--chmod={spec}` must exit RERR_SYNTAX");
+        assert!(stdout.is_empty());
+        let rendered = String::from_utf8(stderr).expect("diagnostic utf8");
+        assert!(
+            rendered.contains(&format!("Invalid argument passed to --chmod ({spec})")),
+            "diagnostic for `{spec}` was: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn clap_error_uses_canonical_exit_code_text() {
+    let (code, _stdout, stderr) = run_with_args([
+        OsString::from(OC_RSYNC),
+        OsString::from("--definitely-invalid-option"),
+    ]);
+
+    assert_eq!(code, 1);
+
+    let rendered = String::from_utf8(stderr).expect("diagnostic utf8");
+    assert!(rendered.contains("syntax or usage error"));
+    assert!(
+        rendered.contains("--definitely-invalid-option"),
+        "diagnostic should include the clap-provided detail"
+    );
+}
+
+// upstream: options.c:1749-1754 - the 21st alt-dest arg overflows the shared
+// `basis_dir[]` array (rsync.h:196 MAX_BASIS_DIRS) and exits RERR_SYNTAX (1)
+// with a verbatim `ERROR: at most 20 <opt> args may be specified` message. We
+// assert both the exit code and the message end-to-end.
+#[test]
+fn run_rejects_excess_alt_dest_dirs() {
+    let mut args = vec![OsString::from(OC_RSYNC)];
+    for index in 0..21 {
+        args.push(OsString::from(format!("--link-dest=dir{index}")));
+    }
+    args.push(OsString::from("src"));
+    args.push(OsString::from("dst"));
+
+    let (code, stdout, stderr) = run_with_args(args);
+
+    assert_eq!(code, 1, "21 alt-dest dirs must exit RERR_SYNTAX");
+    assert!(stdout.is_empty());
+    let rendered = String::from_utf8(stderr).expect("diagnostic utf8");
+    assert!(
+        rendered.contains("ERROR: at most 20 --link-dest args may be specified"),
+        "diagnostic was: {rendered}"
+    );
+}
+
+#[test]
+fn clap_value_error_does_not_double_error_prefix() {
+    // A clap value-validation failure (here `--io-uring-depth`) surfaces through
+    // `clap::Error::to_string()`, which prepends a stock `error: ` header. oc
+    // wraps the detail with the canonical `syntax or usage error: ` category
+    // (upstream `rerr_names`), so an unstripped clap header would render the
+    // wording twice as `syntax or usage error: error: ...`. Upstream rsync
+    // prints the category exactly once; this guards that parity.
+    //
+    // The vehicle used to be `--block-size=abc`, but that option no longer
+    // fails at the clap layer: its validation moved to the shared size parser
+    // so the upstream suffix grammar (`1K`, `1KiB`, `1.5K`) could reach it.
+    // Any option that still raises a clap `ValueValidation` serves equally -
+    // the guard is about the prefix, not about which option produced it.
+    let (code, _stdout, stderr) = run_with_args([
+        OsString::from(OC_RSYNC),
+        OsString::from("--io-uring-depth=abc"),
+        OsString::from("src"),
+        OsString::from("dst"),
+    ]);
+
+    // RERR_SYNTAX (1) must be preserved; only the wording changes.
+    assert_eq!(code, 1);
+
+    let rendered = String::from_utf8(stderr).expect("diagnostic utf8");
+    assert!(
+        rendered.contains("syntax or usage error"),
+        "diagnostic should keep the canonical rerr_names category"
+    );
+    assert!(
+        rendered.contains("invalid --io-uring-depth value 'abc'"),
+        "diagnostic should include the clap-provided detail"
+    );
+    assert!(
+        !rendered.contains("syntax or usage error: error:"),
+        "clap's stock `error: ` header must not double the category prefix"
+    );
+    assert_contains_client_trailer(&rendered);
+}
+
+#[test]
+fn run_without_operands_emits_usage_for_oc_rsync() {
+    let (code, stdout, stderr) = run_with_args([OsString::from(OC_RSYNC)]);
+
+    assert_eq!(code, 1);
+
+    let stdout_text = String::from_utf8(stdout).expect("stdout utf8");
+    assert_eq!(
+        stdout_text,
+        render_missing_operands_stdout(ProgramName::OcRsync)
+    );
+
+    let stderr_text = String::from_utf8(stderr).expect("stderr utf8");
+    assert!(stderr_text.contains("syntax or usage error"));
+    assert_contains_client_trailer(&stderr_text);
+}
+
+#[test]
+fn run_without_operands_emits_usage_for_legacy_rsync() {
+    let (code, stdout, stderr) = run_with_args([OsString::from(RSYNC)]);
+
+    assert_eq!(code, 1);
+
+    let stdout_text = String::from_utf8(stdout).expect("stdout utf8");
+    assert_eq!(
+        stdout_text,
+        render_missing_operands_stdout(ProgramName::Rsync)
+    );
+
+    let stderr_text = String::from_utf8(stderr).expect("stderr utf8");
+    assert!(stderr_text.contains("syntax or usage error"));
+    assert_contains_client_trailer(&stderr_text);
+}

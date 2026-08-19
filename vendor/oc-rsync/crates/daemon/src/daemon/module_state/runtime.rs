@@ -1,0 +1,217 @@
+use std::collections::HashMap;
+use std::io;
+use std::num::NonZeroU32;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use crate::error::DaemonError;
+
+use super::{ConnectionLimiter, ConnectionLockGuard, MaxConnections, ModuleDefinition};
+
+/// Pairs each module definition with the connection limiter that enforces its
+/// `max connections` cap, honouring a per-module `lock file` override.
+///
+/// A module that sets its own `lock file` gets a limiter bound to that path;
+/// modules without an override share `global_limiter` (the daemon-wide lock
+/// file). Distinct override paths are opened once and shared via the cache so
+/// two modules naming the same file coordinate through one handle.
+///
+/// upstream: clientserver.c:746 calls `claim_connection(lp_lock_file(i),
+/// lp_max_connections(i))`. The lock file is a P_LOCAL parameter, so each module
+/// claims its slot in the file named by its own (inherited or overridden) value.
+pub(in crate::daemon) fn build_module_runtimes(
+    definitions: Vec<ModuleDefinition>,
+    global_limiter: &Option<Arc<ConnectionLimiter>>,
+) -> Result<Vec<ModuleRuntime>, DaemonError> {
+    let mut cache: HashMap<PathBuf, Arc<ConnectionLimiter>> = HashMap::new();
+    let mut runtimes = Vec::with_capacity(definitions.len());
+    for definition in definitions {
+        let limiter = match definition.lock_file.clone() {
+            Some(path) => {
+                let limiter = match cache.get(&path) {
+                    Some(existing) => Arc::clone(existing),
+                    None => {
+                        let created = Arc::new(ConnectionLimiter::open(path.clone())?);
+                        cache.insert(path, Arc::clone(&created));
+                        created
+                    }
+                };
+                Some(limiter)
+            }
+            None => global_limiter.clone(),
+        };
+        runtimes.push(ModuleRuntime::new(definition, limiter));
+    }
+    Ok(runtimes)
+}
+
+/// Live state for a module, pairing its static definition with runtime connection tracking.
+///
+/// upstream: clientserver.c - upstream rsync maintains a global connection count
+/// per module via `lp_lock_file()`. Our `AtomicU32` tracks in-process counts
+/// while the optional `ConnectionLimiter` coordinates across daemon processes.
+pub(crate) struct ModuleRuntime {
+    pub(crate) definition: ModuleDefinition,
+    pub(crate) active_connections: AtomicU32,
+    pub(crate) connection_limiter: Option<Arc<ConnectionLimiter>>,
+}
+
+/// Error returned when a module connection cannot be established.
+#[derive(Debug)]
+pub(crate) enum ModuleConnectionError {
+    /// The module's connection limit has been reached. Carries the configured
+    /// number verbatim, so a module disabled with a negative `max connections`
+    /// reports its minus sign exactly as upstream's `%d` does.
+    Limit(i32),
+    /// An I/O error occurred while managing connection state.
+    Io(io::Error),
+}
+
+impl ModuleConnectionError {
+    /// Creates an `Io` variant from the given error.
+    pub(in crate::daemon) const fn io(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<io::Error> for ModuleConnectionError {
+    fn from(error: io::Error) -> Self {
+        ModuleConnectionError::Io(error)
+    }
+}
+
+impl ModuleRuntime {
+    /// Creates a new runtime with the given definition and optional connection limiter.
+    pub(in crate::daemon) const fn new(
+        definition: ModuleDefinition,
+        connection_limiter: Option<Arc<ConnectionLimiter>>,
+    ) -> Self {
+        Self {
+            definition,
+            active_connections: AtomicU32::new(0),
+            connection_limiter,
+        }
+    }
+
+    /// Attempts to acquire a connection slot, honouring the module's
+    /// `max connections` setting.
+    ///
+    /// The step order mirrors upstream: connection.c:claim_connection:26-46
+    /// returns success for a zero limit *before* the lock file is opened, opens
+    /// the lock file for every other value (so an unopenable file reports the
+    /// open failure rather than the cap), and only then scans
+    /// `[0, max_connections)`. A negative limit runs no iterations, so it
+    /// consumes no slot and falls through to the refusal after the descriptor
+    /// is closed - the drop of `lock_guard` on the error path below.
+    pub(in crate::daemon) fn try_acquire_connection(
+        &self,
+    ) -> Result<ModuleConnectionGuard<'_>, ModuleConnectionError> {
+        let configured = self.definition.max_connections();
+        let slots = match configured {
+            MaxConnections::Unlimited => return Ok(ModuleConnectionGuard::unlimited()),
+            MaxConnections::Limited(limit) => Some(limit),
+            MaxConnections::Disabled(_) => None,
+        };
+
+        let lock_guard = match &self.connection_limiter {
+            Some(limiter) => Some(limiter.acquire(&self.definition.name, configured)?),
+            None => None,
+        };
+
+        match slots {
+            Some(limit) => {
+                self.acquire_local_slot(limit)?;
+                Ok(ModuleConnectionGuard::limited(self, lock_guard))
+            }
+            None => Err(ModuleConnectionError::Limit(configured.display_value())),
+        }
+    }
+
+    /// Atomically acquires a local connection slot using compare-and-swap.
+    fn acquire_local_slot(&self, limit: NonZeroU32) -> Result<(), ModuleConnectionError> {
+        let limit_value = limit.get();
+        let mut current = self.active_connections.load(Ordering::Acquire);
+        loop {
+            if current >= limit_value {
+                return Err(ModuleConnectionError::Limit(
+                    MaxConnections::Limited(limit).display_value(),
+                ));
+            }
+
+            match self.active_connections.compare_exchange(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(updated) => current = updated,
+            }
+        }
+    }
+
+    /// Releases a connection slot, decrementing the active count.
+    ///
+    /// Only a positive `max connections` ever takes a local slot, so the
+    /// unlimited and disabled settings have nothing to give back.
+    pub(in crate::daemon) fn release(&self) {
+        if matches!(
+            self.definition.max_connections(),
+            MaxConnections::Limited(_)
+        ) {
+            self.active_connections.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl From<ModuleDefinition> for ModuleRuntime {
+    fn from(definition: ModuleDefinition) -> Self {
+        Self::new(definition, None)
+    }
+}
+
+impl std::ops::Deref for ModuleRuntime {
+    type Target = ModuleDefinition;
+
+    fn deref(&self) -> &Self::Target {
+        &self.definition
+    }
+}
+
+/// RAII guard that releases a module connection slot on drop.
+pub(in crate::daemon) struct ModuleConnectionGuard<'a> {
+    pub(in crate::daemon) module: Option<&'a ModuleRuntime>,
+    pub(in crate::daemon) lock_guard: Option<ConnectionLockGuard>,
+}
+
+impl<'a> ModuleConnectionGuard<'a> {
+    /// Creates a guard for a connection-limited module.
+    pub(in crate::daemon) const fn limited(
+        module: &'a ModuleRuntime,
+        lock_guard: Option<ConnectionLockGuard>,
+    ) -> Self {
+        Self {
+            module: Some(module),
+            lock_guard,
+        }
+    }
+
+    /// Creates a guard for a module with no connection limit.
+    pub(in crate::daemon) const fn unlimited() -> Self {
+        Self {
+            module: None,
+            lock_guard: None,
+        }
+    }
+}
+
+impl<'a> Drop for ModuleConnectionGuard<'a> {
+    fn drop(&mut self) {
+        if let Some(module) = self.module.take() {
+            module.release();
+        }
+
+        self.lock_guard.take();
+    }
+}

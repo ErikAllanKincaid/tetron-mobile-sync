@@ -1,0 +1,26 @@
+[package]
+name = "batch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Batch mode support for offline rsync transfer workflows"
+repository.workspace = true
+
+[features]
+# Enables protocol's zstd codec. Batch replay itself never decodes zstd -
+# upstream pins batch compression to zlib (compat.c:417-418) - so this only
+# lets the test suite construct a zstd-framed batch body to prove replay
+# refuses to auto-detect it.
+zstd = ["protocol/zstd"]
+
+[dependencies]
+thiserror = { workspace = true }
+protocol = { path = "../protocol" }
+metadata = { path = "../metadata" }
+filetime = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+protocol = { path = "../protocol" }

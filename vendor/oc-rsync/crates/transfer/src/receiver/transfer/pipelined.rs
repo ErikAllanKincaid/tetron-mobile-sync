@@ -1,0 +1,419 @@
+//! Pipelined receiver transfer driving loop.
+//!
+//! Drives the two-phase pipelined receive path: phase 1 with the short
+//! signature length, phase 2 redo with the full signature length for any file
+//! whose phase-1 strong checksum failed. Delegates the per-file pipeline body
+//! to `run_pipeline_loop_decoupled` (see `pipeline.rs`).
+
+use std::io::{self, Read, Write};
+use std::path::PathBuf;
+
+use logging::{PhaseTimer, debug_log, info_log};
+use protocol::codec::{MonotonicNdxWriter, create_ndx_codec};
+
+use crate::pipeline::PipelineConfig;
+use crate::receiver::stats::TransferStats;
+use crate::receiver::{REDO_CHECKSUM_LENGTH, ReceiverContext};
+
+use super::mode::ReceiverMode;
+
+impl ReceiverContext {
+    /// Runs the pipelined receiver transfer loop.
+    ///
+    /// Creates directories and symlinks, optionally deletes extraneous files,
+    /// builds the candidate list, runs the pipeline loop, handles redo pass,
+    /// and finalizes the transfer.
+    ///
+    /// Phase 1 uses `SHORT_SUM_LENGTH` (2 bytes) for reduced signature overhead.
+    /// Phase 2 redo uses `SUM_LENGTH` (16 bytes) for full collision resistance.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `receiver.c:720` - `recv_files()` main loop
+    /// - `generator.c:2157-2163` - phase 1 vs phase 2 checksum length
+    pub fn run_pipelined<R: Read, W: Write + crate::writer::MsgInfoSender + ?Sized>(
+        &mut self,
+        reader: crate::reader::ServerReader<R>,
+        writer: &mut W,
+        pipeline_config: PipelineConfig,
+        mut progress: Option<&mut dyn crate::TransferProgressCallback>,
+    ) -> io::Result<TransferStats> {
+        let _t = PhaseTimer::new("receiver-transfer-pipelined");
+        // Buffer itemize rows and flush them once in flist-index order before
+        // finalization, so a directory row immediately precedes its children
+        // (upstream's single flist-index-order walk, generator.c:2329-2344)
+        // rather than oc's two-phase "all dirs, then all files" emission.
+        self.defer_itemize = true;
+        // Interleave plain `-v` (name-only, no `-i`) client-mode file names
+        // with --progress in flist order, matching upstream log_before_transfer
+        // (receiver.c:1008-1012). `-i`/`-vi` itemize output is unaffected (it
+        // flows through the deferred itemize_rows path). Every non-transfer mode
+        // is excluded via the shared `select_mode`, so a mode added there cannot
+        // silently acquire the interleaving.
+        self.interleave_names = self.config.flags.verbose
+            && self.config.connection.client_mode
+            && !self.should_emit_itemize()
+            && matches!(self.select_mode(), ReceiverMode::Transfer);
+        self.names_to_stderr = self.config.flags.msgs_to_stderr;
+        self.progress_active = progress.is_some();
+        let (mut reader, file_count, mut setup) = self.setup_transfer(reader, writer)?;
+        let reader = &mut reader;
+
+        // upstream: main.c:1383-1392 - a client handed an empty list skips
+        // do_recv() entirely and reports the io_error the end marker carried.
+        // Checked before the sub-list fetch below because upstream's own
+        // `if (inc_recurse && file_total == 1) recv_additional_file_list()`
+        // (main.c:1380-1381) cannot fire with a file_total of 0 either.
+        if self.is_empty_client_flist(file_count) {
+            return self.finish_empty_client_flist(reader, writer);
+        }
+
+        // Materialize any INC_RECURSE sub-list segments the setup no longer
+        // drains, so the batched candidate build below sees the complete list.
+        // No-op without INC_RECURSE (`flist_eof` is already set, so no wire read
+        // occurs). upstream: generator.c:2299-2368 fetches sub-lists on demand.
+        let mut flist_ndx_codec = create_ndx_codec(self.protocol.as_u8());
+        self.ensure_all_segments_loaded(reader, &mut flist_ndx_codec)?;
+
+        // Decide the plain-`-v` directory NAME lines from the PRE-transfer
+        // state, before create_directories applies metadata or child mkdirs
+        // bump a parent's mtime. Upstream names a directory only when
+        // set_file_attrs() changed it (generator.c:1503-1505); a directory
+        // absent pre-transfer is treated as newly created and named.
+        let verbose_dir_lines = if self.config.flags.verbose
+            && self.config.connection.client_mode
+            && !self.should_emit_itemize()
+        {
+            self.verbose_dir_name_lines(&setup.dest_dir)
+        } else {
+            Vec::new()
+        };
+
+        // upstream: generator.c:1329-1338 - make_path() for relative_paths
+        self.ensure_relative_parents(&setup.dest_dir);
+        let mut metadata_errors = self.create_directories(
+            &setup.dest_dir,
+            &setup.metadata_opts,
+            setup.acl_cache.as_deref(),
+            setup.acl_id_map.as_deref(),
+            writer,
+            #[cfg(unix)]
+            setup.sandbox.as_deref(),
+        )?;
+        #[cfg(unix)]
+        self.create_symlinks(&setup.dest_dir, setup.sandbox.as_deref(), writer)?;
+        #[cfg(not(unix))]
+        self.create_symlinks(&setup.dest_dir, writer)?;
+        #[cfg(unix)]
+        self.create_specials(&setup.dest_dir, setup.sandbox.as_deref(), writer)?;
+        #[cfg(not(unix))]
+        self.create_specials(&setup.dest_dir, writer)?;
+
+        // upstream: generator.c:1360-1366 - missing_args == 2 && file->mode == 0
+        // deletes the destination path and skips any creation for the sentinel.
+        self.process_missing_args_sentinels(
+            &setup.dest_dir,
+            #[cfg(unix)]
+            setup.sandbox.as_deref(),
+        )?;
+
+        // upstream: receiver.c:653-654 DEBUG_GTE(RECV, 1)
+        debug_log!(Recv, 1, "recv_files({}) starting", file_count);
+
+        // upstream: flist.c:2699-2712 - classify the received file list into the
+        // per-type tallies so the pulling client reconstructs the `--stats`
+        // "Number of files" breakdown (`reg: R, dir: D, link: L, ...`). Without
+        // this the client counted every entry as a regular file.
+        let (num_dirs, num_symlinks, num_devices, num_specials) = self.file_type_counts();
+        let mut stats = TransferStats {
+            files_listed: file_count,
+            num_dirs,
+            num_symlinks,
+            num_devices,
+            num_specials,
+            entries_received: file_count as u64,
+            io_error: self.flist_reader_io_error() | self.flist_io_error,
+            ..Default::default()
+        };
+
+        // upstream: generator.c:2280-2281 - --delete-before / --delete-during
+        // sweep before the per-file loop. --delete-after / --delete-delay defer
+        // the sweep until after the transfer (see the late call below) so the
+        // destination `.rsync-filter` merge files transferred by this run are
+        // present and consulted at delete time.
+        if self.delete_pass_is_early() {
+            self.run_receiver_delete_pass(
+                super::DeletePassPhase::Early,
+                &setup.dest_dir,
+                #[cfg(unix)]
+                setup.sandbox.as_ref(),
+                writer,
+                &mut stats,
+            )?;
+        }
+
+        let files_to_transfer = self.build_files_to_transfer(
+            writer,
+            &setup.dest_dir,
+            &setup.metadata_opts,
+            None,
+            &mut metadata_errors,
+            &mut stats,
+            setup.acl_cache.as_deref(),
+            setup.acl_id_map.as_deref(),
+        );
+
+        // Both assigned by every arm of the mode match below.
+        // upstream: receiver.c:784 total_transferred_size, summed with files_transferred.
+        let mut files_transferred: usize;
+        let mut transferred_file_size: u64;
+        let mut bytes_received: u64 = 0;
+        let mut literal_data: u64 = 0;
+        let mut matched_data: u64 = 0;
+        let mut redo_count: usize = 0;
+        let mut all_delayed_updates: Vec<(PathBuf, PathBuf)> = Vec::new();
+
+        // Buffer directory `-v` names under their flist index so each is
+        // released immediately before its first child is reached in the
+        // transfer loop below (upstream emits the directory row as its flist
+        // entry is reached, so a directory precedes its children). Trailing
+        // directories with no transferred child flush at end of run.
+        if self.interleave_names {
+            for (idx, name) in &verbose_dir_lines {
+                self.buffer_deferred_name(*idx, format!("{name}\n"));
+            }
+        }
+
+        // One shared decision (see `mode.rs`) with one shared body per
+        // non-transfer mode, so this driver and run_pipelined_incremental cannot
+        // drift again. The match is exhaustive by design: a new ReceiverMode
+        // variant is a compile error in every driver that does not handle it.
+        match self.select_mode() {
+            ReceiverMode::NonTransfer(non_transfer) => {
+                (files_transferred, transferred_file_size) = self.run_non_transfer_mode(
+                    non_transfer,
+                    reader,
+                    writer,
+                    &setup,
+                    &files_to_transfer,
+                    &mut stats,
+                )?;
+            }
+            ReceiverMode::Transfer => {
+                let total_files = files_to_transfer.len();
+                // Stage 0: hand the pipeline the transfer set by flist index;
+                // the in-flight window clones each FileEntry as it is pushed
+                // (O(window)), so the loop no longer borrows `self.file_list`.
+                let files_to_transfer: Vec<(usize, PathBuf, u32)> = files_to_transfer
+                    .into_iter()
+                    .map(|(idx, _entry, path, iflags)| (idx, path, iflags))
+                    .collect();
+                let redo_config = pipeline_config.clone();
+                let redo_indices;
+                let delayed;
+                // upstream: io.c::write_ndx / read_ndx keep a single
+                // connection-wide prev_positive/prev_negative. The phase-2 redo
+                // re-requests files (generator.c:2178-2216) through that SAME
+                // state, so one codec pair is threaded through both the phase-1
+                // and the redo pass. Fresh per-pass codecs would reset the diff
+                // base and desync the daemon-sender's NDX decode on the redo.
+                let mut ndx_write_codec = MonotonicNdxWriter::new(self.protocol.as_u8());
+                let mut ndx_read_codec = create_ndx_codec(self.protocol.as_u8());
+                (
+                    files_transferred,
+                    transferred_file_size,
+                    bytes_received,
+                    literal_data,
+                    matched_data,
+                    redo_indices,
+                    delayed,
+                ) = self.run_pipeline_loop_decoupled(
+                    reader,
+                    writer,
+                    pipeline_config,
+                    &setup,
+                    files_to_transfer,
+                    &mut metadata_errors,
+                    false,
+                    total_files,
+                    &mut progress,
+                    &mut ndx_write_codec,
+                    &mut ndx_read_codec,
+                )?;
+                all_delayed_updates.extend(delayed);
+
+                // Phase 2: redo pass for files that failed checksum verification.
+                redo_count = redo_indices.len();
+                if !redo_indices.is_empty() {
+                    setup.checksum_length = REDO_CHECKSUM_LENGTH;
+
+                    // upstream: generator.c:2200 - the phase-2 redo re-enters the
+                    // ordinary recv_generator() for the redo index, so the retry
+                    // is a full re-request: ITEM_TRANSFER (generator.c:1940), a
+                    // re-stat of the destination, and a fresh block signature
+                    // built from it (generator.c:1967).
+                    let redo_files: Vec<(usize, PathBuf, u32)> = redo_indices
+                        .iter()
+                        .filter_map(|&idx| {
+                            self.file_list.get(idx).map(|entry| {
+                                let p = entry.path();
+                                let file_path = if p.as_os_str() == "." {
+                                    setup.dest_dir.clone()
+                                } else {
+                                    setup.dest_dir.join(p)
+                                };
+                                (idx, file_path, crate::generator::ItemFlags::ITEM_TRANSFER)
+                            })
+                        })
+                        .collect();
+
+                    let (
+                        redo_transferred,
+                        redo_transferred_size,
+                        redo_bytes,
+                        redo_literal,
+                        redo_matched,
+                        _,
+                        redo_delayed,
+                    ) = self.run_pipeline_loop_decoupled(
+                        reader,
+                        writer,
+                        redo_config,
+                        &setup,
+                        redo_files,
+                        &mut metadata_errors,
+                        true,
+                        total_files,
+                        &mut progress,
+                        &mut ndx_write_codec,
+                        &mut ndx_read_codec,
+                    )?;
+
+                    files_transferred += redo_transferred;
+                    transferred_file_size += redo_transferred_size;
+                    bytes_received += redo_bytes;
+                    literal_data += redo_literal;
+                    matched_data += redo_matched;
+                    all_delayed_updates.extend(redo_delayed);
+                }
+            }
+        }
+
+        // When interleaving `-v` names (the plain `-v` client pull), directory
+        // names were buffered up front and released in flist order alongside
+        // their children in the transfer loop above, so skip this end-of-run
+        // block; any trailing directories flush just below via flush_names_all.
+        if self.config.flags.verbose
+            && self.config.connection.client_mode
+            && !self.interleave_names
+            && !self.should_emit_itemize()
+        {
+            for (_idx, name) in &verbose_dir_lines {
+                info_log!(Name, 1, "{name}");
+            }
+        }
+
+        // upstream: receiver.c:694-695 then :551-552 - handle_delayed_updates()
+        // renames each delay-updates leader to its final path in phase 2, and
+        // only then are followers hard-linked to it. See
+        // finalize_delayed_updates_and_hardlinks for the ordering rationale.
+        #[cfg(unix)]
+        self.finalize_delayed_updates_and_hardlinks(
+            &setup.dest_dir,
+            setup.sandbox.as_deref(),
+            &all_delayed_updates,
+            writer,
+        )?;
+        #[cfg(not(unix))]
+        self.finalize_delayed_updates_and_hardlinks(&setup.dest_dir, &all_delayed_updates, writer)?;
+
+        // upstream: io.c:1702-1712 - the receiver ORs each MSG_IO_ERROR into the
+        // global `io_error` and forwards it to the generator, so by the time the
+        // generator runs its late sweep the bits are already visible to
+        // `delete_in_dir`'s guard (generator.c:304-311). oc has no generator
+        // peer - the receive path is unified - so the equivalent is to drain the
+        // reader's accumulator here, BEFORE the sweep consults `stats.io_error`.
+        //
+        // The sender emits MSG_IO_ERROR immediately before the phase-1 NDX_DONE
+        // (sender.c:809-817), which the pipeline loop above must consume to
+        // return, so the bits are already accumulated by this point. Draining
+        // only after `finalize_transfer` (below) would let --delete-after remove
+        // destination entries that upstream preserves.
+        //
+        // `take_io_error` is destructive, and both drains OR into the same field,
+        // so the later one still folds in anything that arrives during the
+        // goodbye handshake without double-counting these bits.
+        stats.io_error |= reader.take_io_error();
+
+        // upstream: generator.c:2425-2428 - --delete-after / --delete-delay run
+        // the sweep only after every file (including each destination
+        // `.rsync-filter` and any --delay-updates staged file committed just
+        // above) has landed, so per-directory merge protect rules are honoured
+        // at delete time. Runs before touch_up_dirs so deletion-induced parent
+        // mtime changes are re-tidied (upstream touch_up_dirs at generator.c:2449
+        // follows the late delete pass).
+        if self.delete_pass_is_late() {
+            self.run_receiver_delete_pass(
+                super::DeletePassPhase::Late,
+                &setup.dest_dir,
+                #[cfg(unix)]
+                setup.sandbox.as_ref(),
+                writer,
+                &mut stats,
+            )?;
+        }
+
+        // upstream: generator.c:2093-2146 - touch_up_dirs() re-applies
+        // directory mtimes after file writes clobber them.
+        self.touch_up_dirs(&setup.dest_dir, writer);
+
+        // Flush any trailing buffered `-v` directory names (those with no
+        // transferred child to release them mid-loop), then drain the deferred
+        // itemize rows in flist-index order before the goodbye handshake,
+        // matching upstream's single-pass emission ordering.
+        self.flush_names_all()?;
+        self.flush_itemize_rows(writer)?;
+
+        self.finalize_transfer(reader, writer)?;
+
+        // upstream: io.c:1547 - io_error |= val on MSG_IO_ERROR from the sender.
+        // The sender emits MSG_IO_ERROR (sender.c:485-486) for source files that
+        // vanished or could not be opened during its send loop. Fold those bits
+        // into the exit-code io_error so the receiver reports 24/23; MSG_NO_SEND
+        // alone only skips the file and carries no exit-code bits.
+        stats.io_error |= reader.take_io_error();
+
+        // upstream: log.c:310-311 - every MSG_ERROR_XFER read off the wire sets
+        // got_xfer_error, the only report an ENOENT source argument produces
+        // (flist.c:2431 withholds IOERR_GENERAL for it).
+        stats.got_xfer_error = reader.xfer_error_count() > 0 || self.got_xfer_error.get();
+
+        let total_source_bytes: u64 = self.total_source_size();
+
+        stats.files_transferred = files_transferred;
+        stats.transferred_file_size = transferred_file_size;
+        stats.bytes_received = bytes_received;
+        stats.literal_data = literal_data;
+        stats.matched_data = matched_data;
+        stats.total_source_bytes = total_source_bytes;
+        if !metadata_errors.is_empty() {
+            stats.io_error |= crate::generator::io_error_flags::IOERR_GENERAL;
+        }
+        stats.metadata_errors = metadata_errors;
+        stats.redo_count = redo_count;
+        // upstream: main.c:803-805 - count the pre-flight-created destination
+        // root (FLAG_DIR_CREATED -> ITEM_IS_NEW) as a created dir; oc mkdir's it
+        // out-of-band so the dir loop treats it as existing. See the incremental
+        // path for the full rationale.
+        if self.dest_root_created {
+            self.record_created(protocol::flist::FileType::Directory.to_mode_bits());
+        }
+        // Fold the per-type created tally (dirs, symlinks, specials, and new
+        // regular files) accumulated across the creation and transfer passes
+        // into the returned stats so the client reconstructs the "Number of
+        // created files" breakdown. upstream: receiver.c:733-746.
+        stats.created_stats = self.created_stats.get();
+
+        Ok(stats)
+    }
+}

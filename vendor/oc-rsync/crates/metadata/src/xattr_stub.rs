@@ -1,0 +1,144 @@
+//! No-op xattr stubs for platforms without extended attribute support.
+//!
+//! On non-Unix platforms or when the `xattr` feature is disabled,
+//! extended attributes are not available. This module provides no-op
+//! versions of `sync_xattrs` and `apply_xattrs_from_list` so callers
+//! can use the same API unconditionally.
+
+use crate::error::MetadataError;
+use crate::xattr_send::XattrSendOptions;
+use crate::xattr_send::XattrSyncFilters;
+use protocol::xattr::XattrList;
+use std::path::Path;
+use std::sync::Once;
+
+/// Emits a one-time warning that extended attributes are not supported.
+fn warn_xattr_unsupported() {
+    static WARN_ONCE: Once = Once::new();
+    WARN_ONCE.call_once(|| {
+        eprintln!(
+            "warning: extended attributes are not supported on this platform; skipping xattr preservation"
+        );
+    });
+}
+
+/// Synchronises extended attributes from `source` to `destination`.
+///
+/// On platforms without xattr support, emits a one-time warning and
+/// returns `Ok(())`.
+pub fn sync_xattrs(
+    _source: &Path,
+    _destination: &Path,
+    _follow_symlinks: bool,
+    _filters: XattrSyncFilters<'_>,
+) -> Result<(), MetadataError> {
+    warn_xattr_unsupported();
+    Ok(())
+}
+
+/// Reports whether the transferable xattrs of two paths match.
+///
+/// On platforms without xattr support there are no attributes to compare, so
+/// this trivially reports a match.
+pub fn xattrs_match(_a: &Path, _b: &Path, _follow_symlinks: bool) -> Result<bool, MetadataError> {
+    Ok(true)
+}
+
+/// Removes from `destination` every extended attribute that also exists on
+/// `source`.
+///
+/// On platforms without xattr support there are no attributes to strip, so
+/// this returns `Ok(())` without warning (no preservation was promised).
+pub fn strip_source_xattrs(
+    _source: &Path,
+    _destination: &Path,
+    _follow_symlinks: bool,
+) -> Result<(), MetadataError> {
+    Ok(())
+}
+
+/// Reads xattr data from a file and returns it as a wire-format `XattrList`.
+///
+/// On platforms without xattr support, returns an empty list.
+pub fn read_xattrs_for_wire(
+    _path: &Path,
+    _opts: &XattrSendOptions<'_>,
+) -> Result<XattrList, MetadataError> {
+    Ok(XattrList::new())
+}
+
+/// Applies parsed xattrs from a wire protocol [`XattrList`] to a destination file.
+///
+/// On platforms without xattr support, emits a one-time warning and
+/// returns `Ok(())`.
+pub fn apply_xattrs_from_list(
+    _destination: &Path,
+    _xattr_list: &XattrList,
+    _follow_symlinks: bool,
+    _basis: Option<&Path>,
+    _filter: Option<&dyn Fn(&str) -> bool>,
+) -> Result<(), MetadataError> {
+    warn_xattr_unsupported();
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::xattr_send::XattrRole;
+    use std::path::Path;
+
+    #[test]
+    fn sync_xattrs_returns_ok() {
+        let src = Path::new("/nonexistent/src");
+        let dst = Path::new("/nonexistent/dst");
+        let result = sync_xattrs(src, dst, false, XattrSyncFilters::default());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn sync_xattrs_with_filter_returns_ok() {
+        let src = Path::new("/nonexistent/src");
+        let dst = Path::new("/nonexistent/dst");
+        let filter = |_name: &str| true;
+        let result = sync_xattrs(src, dst, true, XattrSyncFilters::uniform(&filter));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn read_xattrs_for_wire_returns_empty_list() {
+        let path = Path::new("/nonexistent/file");
+        let result = read_xattrs_for_wire(path, &XattrSendOptions::new(XattrRole::Sender)).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn read_xattrs_for_wire_as_root_returns_empty_list() {
+        let path = Path::new("/nonexistent/file");
+        let opts = XattrSendOptions {
+            follow_symlinks: true,
+            am_root: true,
+            preserve_xattrs: 2,
+            checksum_seed: 42,
+            ..XattrSendOptions::new(XattrRole::Sender)
+        };
+        let result = read_xattrs_for_wire(path, &opts).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn apply_xattrs_from_list_returns_ok() {
+        let dst = Path::new("/nonexistent/dst");
+        let xattr_list = XattrList::new();
+        let result = apply_xattrs_from_list(dst, &xattr_list, false, None, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn apply_xattrs_from_list_follow_symlinks_returns_ok() {
+        let dst = Path::new("/nonexistent/dst");
+        let xattr_list = XattrList::new();
+        let result = apply_xattrs_from_list(dst, &xattr_list, true, None, None);
+        assert!(result.is_ok());
+    }
+}

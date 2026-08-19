@@ -1,0 +1,767 @@
+//! Itemize string formatting from raw wire item flags.
+//!
+//! Converts [`ItemFlags`] into the upstream 11-character `YXcstpoguax` string
+//! for `--itemize-changes` output. This is the server-side counterpart of the
+//! CLI's `format_itemized_changes()`, operating directly on raw iflags rather
+//! than `ClientEvent` abstractions.
+//!
+//! # Upstream Reference
+//!
+//! - `log.c:695-746` - `%i` expansion in `log_formatted()`
+//! - `rsync.h:214-236` - `ITEM_*` flag definitions
+
+use std::path::PathBuf;
+
+use protocol::flist::FileEntry;
+
+use super::item_flags::ItemFlags;
+use crate::progress::ItemizeRow;
+
+/// Assembles the structured [`ItemizeRow`] handed to a client itemize callback.
+///
+/// Borrows the entry's path/target and the caller-owned `line`/`itemize`
+/// strings, and copies out the scalar metadata a client needs to render an
+/// arbitrary `--out-format` template (`%l`/`%M`/`%B`/`%U`/`%G`) without touching
+/// the sender's `FileEntry` internals.
+pub(crate) fn build_itemize_row<'a>(
+    entry: &'a FileEntry,
+    iflags: &ItemFlags,
+    line: &'a str,
+    itemize: &'a str,
+    source_prefix: Option<&'a std::path::Path>,
+) -> ItemizeRow<'a> {
+    let raw = iflags.raw();
+    ItemizeRow {
+        line,
+        itemize,
+        name: entry.path().as_path(),
+        source_prefix,
+        size: entry.size(),
+        mtime: entry.mtime(),
+        mtime_nsec: entry.mtime_nsec(),
+        mode: entry.mode(),
+        uid: entry.uid(),
+        gid: entry.gid(),
+        is_dir: entry.is_dir(),
+        is_symlink: entry.is_symlink(),
+        symlink_target: entry.link_target().map(PathBuf::as_path),
+        // The push sender renders a hard-link follower's ` => leader` suffix from
+        // the wire xname in its own itemize path, not through this row builder.
+        hardlink_leader: None,
+        is_new: raw & ItemFlags::ITEM_IS_NEW != 0,
+        is_deletion: raw & ItemFlags::ITEM_DELETED != 0,
+    }
+}
+
+/// Context needed for correct time-position rendering in itemize output.
+///
+/// Upstream rsync uses global variables (`preserve_mtimes`, `receiver_symlink_times`)
+/// to decide whether position 4 shows `t` (time preserved) or `T` (time set to
+/// transfer time / symlink time-set failed). This struct captures those values.
+///
+/// # Upstream Reference
+///
+/// - `log.c:708-710` - symlink: `T` when `!preserve_mtimes || !receiver_symlink_times || TIMEFAIL`
+/// - `log.c:716-717` - non-symlink: `T` when `!preserve_mtimes`
+#[derive(Debug, Clone, Copy)]
+pub struct ItemizeContext {
+    /// Whether `--times` is active (`preserve_mtimes` in upstream).
+    pub preserve_mtimes: bool,
+    /// Whether the receiver can set symlink timestamps (`receiver_symlink_times` in upstream).
+    pub receiver_symlink_times: bool,
+}
+
+impl Default for ItemizeContext {
+    /// Defaults to `preserve_mtimes = true` and `receiver_symlink_times = true`,
+    /// producing lowercase `t` for all time reports - the common case.
+    fn default() -> Self {
+        Self {
+            preserve_mtimes: true,
+            receiver_symlink_times: true,
+        }
+    }
+}
+
+/// Formats the 11-character itemize string from raw item flags and file entry.
+///
+/// Produces the upstream `YXcstpoguax` string where:
+/// - Y = update type (`<` send, `>` receive, `c` local change, `h` hard link, `.` no transfer)
+/// - X = file type (`f` file, `d` directory, `L` symlink, `S` special, `D` device)
+/// - Positions 2-10 = attribute change indicators
+///
+/// The `is_sender` parameter controls direction: `true` for daemon sending
+/// files (Generator role), `false` for daemon receiving files.
+///
+/// The `ctx` parameter provides the transfer-option context needed to correctly
+/// distinguish `t` (time preserved from source) from `T` (time set to transfer
+/// time or symlink time-set failed).
+///
+/// # Upstream Reference
+///
+/// - `log.c:695-746` - itemize string construction in `log_formatted()`
+/// - `log.c:708-710` - symlink time: `T` when `!preserve_mtimes || !receiver_symlink_times || TIMEFAIL`
+/// - `log.c:716-717` - non-symlink time: `T` when `!preserve_mtimes`
+pub(crate) fn format_iflags(
+    iflags: &ItemFlags,
+    entry: &FileEntry,
+    is_sender: bool,
+    ctx: &ItemizeContext,
+) -> String {
+    // Delegates to the single buffer-based implementation so the string and
+    // buffer forms of the itemize row can never drift.
+    let mut buf = String::with_capacity(11);
+    write_iflags_into(&mut buf, iflags, entry, is_sender, ctx);
+    buf
+}
+
+/// Formats a complete itemize output line for MSG_INFO emission.
+///
+/// Produces `"{iflags_str} {filename}{L-suffix}\n"` matching upstream's default
+/// `stdout_format = "%i %n%L"` when `--itemize-changes` is active.
+///
+/// `xname` is the alternate-basis name read off the wire when the item carries
+/// `ITEM_XNAME_FOLLOWS` (the hard-link leader from `hlink.c:232-234`), or `None`
+/// otherwise. When present and non-empty it renders the `%L` ` => <xname>`
+/// suffix; upstream's `%L` gates purely on `hlink && *hlink` and takes priority
+/// over the symlink ` -> target` form (`log.c:643-655`).
+///
+/// Uses a single `String` buffer to avoid intermediate allocations from
+/// `format_iflags`, path display, and symlink target formatting.
+///
+/// # Upstream Reference
+///
+/// - `options.c:2354-2356` - `stdout_format = "%i %n%L"` for `-i`
+/// - `log.c:627-636` - `%n` expansion (filename with trailing `/` for dirs)
+/// - `log.c:643-655` - `%L` expansion: ` => hlink` when the xname is non-empty,
+///   else ` -> target` for symlinks
+/// - `hlink.c:232-234` - hard-link follower emits `ITEM_XNAME_FOLLOWS` with the
+///   leader name as the xname
+pub(crate) fn format_itemize_line(
+    iflags: &ItemFlags,
+    entry: &FileEntry,
+    is_sender: bool,
+    ctx: &ItemizeContext,
+    xname: Option<&[u8]>,
+) -> String {
+    // Pre-allocate: 11 (iflags) + 1 (space) + ~32 (path estimate) + 1 (newline)
+    let mut buf = String::with_capacity(48);
+    write_iflags_into(&mut buf, iflags, entry, is_sender, ctx);
+    buf.push(' ');
+    buf.push_str(&format_name_line(entry, xname, iflags));
+    buf
+}
+
+/// Renders the upstream `%n%L` name field for a file-list entry, terminated by
+/// a newline: the relative path, a trailing `/` for directories, and the `%L`
+/// suffix (` => <hlink>` for a hard-link leader, else ` -> <target>` for a
+/// symlink).
+///
+/// Shared by the `-i` itemize row (`%i %n%L`, [`format_itemize_line`]) and the
+/// plain-`-v` name line the client sender prints via `log_item(FCLIENT)` with
+/// the default `stdout_format = "%n%L"`.
+///
+/// # Upstream Reference
+///
+/// - `log.c:627-636` - `%n` expansion (path, trailing `/` for directories).
+/// - `log.c:643-655` - `%L` expansion (` => hlink` wins over ` -> target`).
+/// - `options.c:2372` - `stdout_format = "%n%L"` for plain `-v` (no `-i`).
+pub(crate) fn format_name_line(
+    entry: &FileEntry,
+    xname: Option<&[u8]>,
+    iflags: &ItemFlags,
+) -> String {
+    use std::fmt::Write;
+
+    let mut buf = String::with_capacity(40);
+
+    // upstream: log.c:627-636 - %n expansion
+    let path = entry.path();
+    let _ = write!(buf, "{}", path.display());
+
+    // upstream: log.c:633-634 - append '/' for directories
+    if entry.is_dir() {
+        buf.push('/');
+    }
+
+    // upstream: log.c:643-655 - %L expansion. The ` => <xname>` form wins
+    // whenever the item carries a non-empty alternate-basis name (the hard-link
+    // leader), mirroring the `if (hlink && *hlink)` branch that precedes the
+    // symlink case. Only when no xname trails does `%L` fall through to the
+    // symlink ` -> target` form.
+    let hlink =
+        xname.filter(|name| iflags.raw() & ItemFlags::ITEM_XNAME_FOLLOWS != 0 && !name.is_empty());
+    if let Some(name) = hlink {
+        let _ = write!(buf, " => {}", String::from_utf8_lossy(name));
+    } else if entry.is_symlink() {
+        if let Some(target) = entry.link_target() {
+            let _ = write!(buf, " -> {}", target.display());
+        }
+    }
+
+    buf.push('\n');
+    buf
+}
+
+/// Writes the 11-character itemize flags directly into a `String` buffer.
+///
+/// Avoids the intermediate `String` allocation of [`format_iflags`] by
+/// appending characters directly. The logic mirrors `format_iflags` exactly.
+fn write_iflags_into(
+    buf: &mut String,
+    iflags: &ItemFlags,
+    entry: &FileEntry,
+    is_sender: bool,
+    ctx: &ItemizeContext,
+) {
+    let raw = iflags.raw();
+
+    // upstream: log.c:696-698 - deleted items
+    if raw & ItemFlags::ITEM_DELETED != 0 {
+        buf.push_str("*deleting  ");
+        return;
+    }
+
+    let mut c = ['.'; 11];
+
+    c[0] = if raw & ItemFlags::ITEM_LOCAL_CHANGE != 0 {
+        if raw & ItemFlags::ITEM_XNAME_FOLLOWS != 0 {
+            'h'
+        } else {
+            'c'
+        }
+    } else if raw & ItemFlags::ITEM_TRANSFER == 0 {
+        '.'
+    } else if is_sender {
+        '<'
+    } else {
+        '>'
+    };
+
+    let is_symlink = entry.is_symlink();
+    c[1] = if is_symlink {
+        'L'
+    } else if entry.is_dir() {
+        'd'
+    } else if entry.is_special() {
+        'S'
+    } else if entry.is_device() {
+        'D'
+    } else {
+        'f'
+    };
+
+    c[2] = if raw & ItemFlags::ITEM_REPORT_CHANGE != 0 {
+        'c'
+    } else {
+        '.'
+    };
+
+    c[3] = if is_symlink {
+        '.'
+    } else if raw & ItemFlags::ITEM_REPORT_SIZE != 0 {
+        's'
+    } else {
+        '.'
+    };
+
+    c[4] = if raw & ItemFlags::ITEM_REPORT_TIME == 0 {
+        '.'
+    } else if is_symlink {
+        if !ctx.preserve_mtimes
+            || !ctx.receiver_symlink_times
+            || (raw & ItemFlags::ITEM_REPORT_TIMEFAIL != 0)
+        {
+            'T'
+        } else {
+            't'
+        }
+    } else if !ctx.preserve_mtimes {
+        'T'
+    } else {
+        't'
+    };
+
+    c[5] = if raw & ItemFlags::ITEM_REPORT_PERMS != 0 {
+        'p'
+    } else {
+        '.'
+    };
+    c[6] = if raw & ItemFlags::ITEM_REPORT_OWNER != 0 {
+        'o'
+    } else {
+        '.'
+    };
+    c[7] = if raw & ItemFlags::ITEM_REPORT_GROUP != 0 {
+        'g'
+    } else {
+        '.'
+    };
+
+    let has_atime = raw & ItemFlags::ITEM_REPORT_ATIME != 0;
+    let has_crtime = raw & ItemFlags::ITEM_REPORT_CRTIME != 0;
+    c[8] = match (has_atime, has_crtime) {
+        (true, true) => 'b',
+        (true, false) => 'u',
+        (false, true) => 'n',
+        (false, false) => '.',
+    };
+
+    c[9] = if raw & ItemFlags::ITEM_REPORT_ACL != 0 {
+        'a'
+    } else {
+        '.'
+    };
+    c[10] = if raw & ItemFlags::ITEM_REPORT_XATTR != 0 {
+        'x'
+    } else {
+        '.'
+    };
+
+    if raw & (ItemFlags::ITEM_IS_NEW | ItemFlags::ITEM_MISSING_DATA) != 0 {
+        let ch = if raw & ItemFlags::ITEM_IS_NEW != 0 {
+            '+'
+        } else {
+            '?'
+        };
+        for slot in c[2..].iter_mut() {
+            *slot = ch;
+        }
+    } else if matches!(c[0], '.' | 'h' | 'c') && c[2..].iter().all(|&ch| ch == '.') {
+        for slot in c[2..].iter_mut() {
+            *slot = ' ';
+        }
+    }
+
+    for &ch in &c {
+        buf.push(ch);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::path::PathBuf;
+
+    fn make_file_entry(name: &str) -> FileEntry {
+        FileEntry::new_file(PathBuf::from(name), 1024, 0o644)
+    }
+
+    fn make_dir_entry(name: &str) -> FileEntry {
+        FileEntry::new_directory(PathBuf::from(name), 0o755)
+    }
+
+    fn make_symlink_entry(name: &str) -> FileEntry {
+        FileEntry::new_symlink(PathBuf::from(name), PathBuf::from("target"))
+    }
+
+    /// Default context: preserve_mtimes=true, receiver_symlink_times=true.
+    fn default_ctx() -> ItemizeContext {
+        ItemizeContext::default()
+    }
+
+    /// Context with preserve_mtimes disabled (no --times).
+    fn no_times_ctx() -> ItemizeContext {
+        ItemizeContext {
+            preserve_mtimes: false,
+            receiver_symlink_times: true,
+        }
+    }
+
+    /// Context where receiver cannot set symlink timestamps.
+    fn no_symlink_times_ctx() -> ItemizeContext {
+        ItemizeContext {
+            preserve_mtimes: true,
+            receiver_symlink_times: false,
+        }
+    }
+
+    #[test]
+    fn format_new_file_transfer() {
+        let iflags = ItemFlags::from_raw(ItemFlags::ITEM_TRANSFER | ItemFlags::ITEM_IS_NEW);
+        let entry = make_file_entry("test.txt");
+        let result = format_iflags(&iflags, &entry, true, &default_ctx());
+        assert_eq!(result, "<f+++++++++");
+    }
+
+    #[test]
+    fn format_new_file_receiver() {
+        let iflags = ItemFlags::from_raw(ItemFlags::ITEM_TRANSFER | ItemFlags::ITEM_IS_NEW);
+        let entry = make_file_entry("test.txt");
+        let result = format_iflags(&iflags, &entry, false, &default_ctx());
+        assert_eq!(result, ">f+++++++++");
+    }
+
+    /// A pre-29 peer sends no iflags, so the row must read `?` ("the sender did
+    /// not say what changed"), never `.` ("nothing changed") - a claim no side
+    /// ever made.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `rsync.c:383-384` - synthesises `ITEM_TRANSFER | ITEM_MISSING_DATA`
+    /// - `log.c:736-737` - `ITEM_MISSING_DATA` fills columns 2..10 with `?`
+    #[test]
+    fn format_protocol_28_missing_data_is_unknown() {
+        let iflags = ItemFlags::read(&mut std::io::Cursor::new(&[][..]), 28).unwrap();
+        let entry = make_file_entry("test.txt");
+        assert_eq!(
+            format_iflags(&iflags, &entry, false, &default_ctx()),
+            ">f?????????"
+        );
+        assert_eq!(
+            format_iflags(&iflags, &entry, true, &default_ctx()),
+            "<f?????????"
+        );
+    }
+
+    /// `ITEM_IS_NEW` outranks `ITEM_MISSING_DATA`: a file the receiver is
+    /// creating is fully known to be new, so it stays `+++++++++` even on a
+    /// pre-29 link where the missing-data bit is also set.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `log.c:735-737` - `ch = iflags & ITEM_IS_NEW ? '+' : '?'`
+    #[test]
+    fn format_is_new_outranks_missing_data() {
+        let iflags = ItemFlags::from_raw(
+            ItemFlags::ITEM_TRANSFER | ItemFlags::ITEM_MISSING_DATA | ItemFlags::ITEM_IS_NEW,
+        );
+        let entry = make_file_entry("test.txt");
+        assert_eq!(
+            format_iflags(&iflags, &entry, false, &default_ctx()),
+            ">f+++++++++"
+        );
+    }
+
+    #[test]
+    fn format_metadata_only_no_changes() {
+        let iflags = ItemFlags::from_raw(0);
+        let entry = make_file_entry("test.txt");
+        let result = format_iflags(&iflags, &entry, true, &default_ctx());
+        // No transfer, no changes -> dots collapse to spaces
+        assert_eq!(result, ".f         ");
+    }
+
+    #[test]
+    fn format_time_and_perms_change() {
+        let iflags =
+            ItemFlags::from_raw(ItemFlags::ITEM_REPORT_TIME | ItemFlags::ITEM_REPORT_PERMS);
+        let entry = make_file_entry("test.txt");
+        let result = format_iflags(&iflags, &entry, true, &default_ctx());
+        assert_eq!(result, ".f..tp.....");
+    }
+
+    #[test]
+    fn format_size_change() {
+        let iflags = ItemFlags::from_raw(ItemFlags::ITEM_TRANSFER | ItemFlags::ITEM_REPORT_SIZE);
+        let entry = make_file_entry("test.txt");
+        let result = format_iflags(&iflags, &entry, true, &default_ctx());
+        assert_eq!(result, "<f.s.......");
+    }
+
+    #[test]
+    fn format_directory_new() {
+        let iflags = ItemFlags::from_raw(ItemFlags::ITEM_LOCAL_CHANGE | ItemFlags::ITEM_IS_NEW);
+        let entry = make_dir_entry("subdir");
+        let result = format_iflags(&iflags, &entry, true, &default_ctx());
+        assert_eq!(result, "cd+++++++++");
+    }
+
+    #[test]
+    fn format_deleted_item() {
+        let iflags = ItemFlags::from_raw(ItemFlags::ITEM_DELETED);
+        let entry = make_file_entry("gone.txt");
+        let result = format_iflags(&iflags, &entry, true, &default_ctx());
+        assert_eq!(result, "*deleting  ");
+    }
+
+    #[test]
+    fn format_missing_data() {
+        let iflags = ItemFlags::from_raw(ItemFlags::ITEM_MISSING_DATA);
+        let entry = make_file_entry("broken.txt");
+        let result = format_iflags(&iflags, &entry, true, &default_ctx());
+        assert_eq!(result, ".f?????????");
+    }
+
+    #[test]
+    fn format_hardlink() {
+        let iflags = ItemFlags::from_raw(
+            ItemFlags::ITEM_LOCAL_CHANGE | ItemFlags::ITEM_XNAME_FOLLOWS | ItemFlags::ITEM_IS_NEW,
+        );
+        let entry = make_file_entry("link.txt");
+        let result = format_iflags(&iflags, &entry, true, &default_ctx());
+        assert_eq!(result, "hf+++++++++");
+    }
+
+    #[test]
+    fn format_all_attribute_changes() {
+        let iflags = ItemFlags::from_raw(
+            ItemFlags::ITEM_TRANSFER
+                | ItemFlags::ITEM_REPORT_CHANGE
+                | ItemFlags::ITEM_REPORT_SIZE
+                | ItemFlags::ITEM_REPORT_TIME
+                | ItemFlags::ITEM_REPORT_PERMS
+                | ItemFlags::ITEM_REPORT_OWNER
+                | ItemFlags::ITEM_REPORT_GROUP
+                | ItemFlags::ITEM_REPORT_ATIME
+                | ItemFlags::ITEM_REPORT_CRTIME
+                | ItemFlags::ITEM_REPORT_ACL
+                | ItemFlags::ITEM_REPORT_XATTR,
+        );
+        let entry = make_file_entry("test.txt");
+        let result = format_iflags(&iflags, &entry, true, &default_ctx());
+        assert_eq!(result, "<fcstpogbax");
+    }
+
+    #[test]
+    fn format_atime_only() {
+        let iflags = ItemFlags::from_raw(ItemFlags::ITEM_REPORT_ATIME);
+        let entry = make_file_entry("test.txt");
+        let result = format_iflags(&iflags, &entry, true, &default_ctx());
+        assert_eq!(result, ".f......u..");
+    }
+
+    #[test]
+    fn format_crtime_only() {
+        let iflags = ItemFlags::from_raw(ItemFlags::ITEM_REPORT_CRTIME);
+        let entry = make_file_entry("test.txt");
+        let result = format_iflags(&iflags, &entry, true, &default_ctx());
+        assert_eq!(result, ".f......n..");
+    }
+
+    #[test]
+    fn format_itemize_line_file() {
+        let iflags = ItemFlags::from_raw(ItemFlags::ITEM_TRANSFER | ItemFlags::ITEM_IS_NEW);
+        let entry = make_file_entry("docs/readme.txt");
+        let line = format_itemize_line(&iflags, &entry, true, &default_ctx(), None);
+        assert_eq!(line, "<f+++++++++ docs/readme.txt\n");
+    }
+
+    #[test]
+    fn format_itemize_line_directory() {
+        let iflags = ItemFlags::from_raw(ItemFlags::ITEM_LOCAL_CHANGE | ItemFlags::ITEM_IS_NEW);
+        let entry = make_dir_entry("subdir");
+        let line = format_itemize_line(&iflags, &entry, true, &default_ctx(), None);
+        assert_eq!(line, "cd+++++++++ subdir/\n");
+    }
+
+    #[test]
+    fn format_symlink_no_size() {
+        // Symlinks never report size changes (position 3 stays '.').
+        // ITEM_REPORT_SIZE (bit 2) shares the same bit as ITEM_REPORT_TIMEFAIL,
+        // so for symlinks the time position shows 'T' (timefail) instead of 't'.
+        let iflags = ItemFlags::from_raw(
+            ItemFlags::ITEM_TRANSFER | ItemFlags::ITEM_REPORT_SIZE | ItemFlags::ITEM_REPORT_TIME,
+        );
+        let entry = make_symlink_entry("link");
+        let result = format_iflags(&iflags, &entry, false, &default_ctx());
+        assert_eq!(result, ">L..T......");
+    }
+
+    #[test]
+    fn format_itemize_line_symlink() {
+        let iflags = ItemFlags::from_raw(ItemFlags::ITEM_LOCAL_CHANGE | ItemFlags::ITEM_IS_NEW);
+        let entry = make_symlink_entry("mylink");
+        let line = format_itemize_line(&iflags, &entry, true, &default_ctx(), None);
+        assert_eq!(line, "cL+++++++++ mylink -> target\n");
+    }
+
+    /// A hard-link follower carries `ITEM_XNAME_FOLLOWS` with the leader name as
+    /// the wire xname (upstream `hlink.c:232-234`). The push sender renderer must
+    /// append the `%L` ` => <leader>` suffix so oc's own client renders
+    /// `hf+++++++++ follower => leader`, not a bare `hf+++++++++ follower`.
+    ///
+    /// upstream: log.c:643-646 - `%L` renders ` => hlink` for a non-empty xname.
+    #[test]
+    fn format_itemize_line_hardlink_follower_appends_leader() {
+        let iflags = ItemFlags::from_raw(
+            ItemFlags::ITEM_LOCAL_CHANGE | ItemFlags::ITEM_XNAME_FOLLOWS | ItemFlags::ITEM_IS_NEW,
+        );
+        let entry = make_file_entry("follower");
+        let line = format_itemize_line(&iflags, &entry, true, &default_ctx(), Some(b"leader"));
+        assert_eq!(line, "hf+++++++++ follower => leader\n");
+    }
+
+    /// The `%L` ` => ` suffix must not appear when the xname is empty - upstream's
+    /// alt-dest hard-link/copy-dest paths (e.g. `hlink.c:219-221`,
+    /// `generator.c:1011-1013`) set `ITEM_XNAME_FOLLOWS` with an empty string, and
+    /// `%L` gates on `hlink && *hlink` (log.c:644).
+    #[test]
+    fn format_itemize_line_empty_xname_renders_no_suffix() {
+        let iflags = ItemFlags::from_raw(
+            ItemFlags::ITEM_LOCAL_CHANGE | ItemFlags::ITEM_XNAME_FOLLOWS | ItemFlags::ITEM_IS_NEW,
+        );
+        let entry = make_file_entry("follower");
+        let line = format_itemize_line(&iflags, &entry, true, &default_ctx(), Some(b""));
+        assert_eq!(line, "hf+++++++++ follower\n");
+    }
+
+    /// HL-1 (#78): an UP-TO-DATE hardlink follower (destination already links to
+    /// its leader) itemizes with `ITEM_LOCAL_CHANGE | ITEM_XNAME_FOLLOWS` and an
+    /// EMPTY xname - exactly what upstream `hlink.c:218-222` passes. Column 0 must
+    /// render `h` (LOCAL_CHANGE + XNAME_FOLLOWS, `log.c:707-708`); with
+    /// `ITEM_IS_NEW` absent and no report flags, the all-dot attribute columns
+    /// collapse to blanks (`log.c:741-750`), and the empty xname suppresses the
+    /// ` => leader` suffix (`log.c:644`). This pins the flags the already-linked
+    /// branch now passes instead of a bare `0`, which rendered a spurious `.`.
+    #[test]
+    fn format_itemize_line_up_to_date_hardlink_follower_renders_h() {
+        let iflags =
+            ItemFlags::from_raw(ItemFlags::ITEM_LOCAL_CHANGE | ItemFlags::ITEM_XNAME_FOLLOWS);
+        let entry = make_file_entry("follower");
+        let line = format_itemize_line(&iflags, &entry, false, &default_ctx(), None);
+
+        // "hf" + 9 blanked attribute columns + " " (%i/%n separator) + name.
+        let mut expected = String::from("hf");
+        expected.push_str(&" ".repeat(9));
+        expected.push(' ');
+        expected.push_str("follower\n");
+        assert_eq!(line, expected);
+        assert_eq!(
+            line.as_bytes()[0],
+            b'h',
+            "column 0 renders the hardlink glyph"
+        );
+        assert!(
+            !line.contains("=>"),
+            "an empty xname suppresses the ` => ` suffix"
+        );
+    }
+
+    /// upstream: log.c:716-717 - non-symlink with preserve_mtimes shows lowercase 't'
+    #[test]
+    fn file_time_with_preserve_mtimes_shows_lowercase_t() {
+        let iflags = ItemFlags::from_raw(ItemFlags::ITEM_TRANSFER | ItemFlags::ITEM_REPORT_TIME);
+        let entry = make_file_entry("test.txt");
+        let result = format_iflags(&iflags, &entry, false, &default_ctx());
+        assert_eq!(result, ">f..t......");
+    }
+
+    /// upstream: log.c:716-717 - non-symlink without preserve_mtimes shows uppercase 'T'
+    #[test]
+    fn file_time_without_preserve_mtimes_shows_uppercase_t() {
+        let iflags = ItemFlags::from_raw(ItemFlags::ITEM_TRANSFER | ItemFlags::ITEM_REPORT_TIME);
+        let entry = make_file_entry("test.txt");
+        let result = format_iflags(&iflags, &entry, false, &no_times_ctx());
+        assert_eq!(result, ">f..T......");
+    }
+
+    /// upstream: log.c:708-710 - symlink with preserve_mtimes and receiver_symlink_times
+    /// shows lowercase 't'
+    #[test]
+    fn symlink_time_with_full_support_shows_lowercase_t() {
+        let iflags = ItemFlags::from_raw(ItemFlags::ITEM_TRANSFER | ItemFlags::ITEM_REPORT_TIME);
+        let entry = make_symlink_entry("link");
+        let result = format_iflags(&iflags, &entry, false, &default_ctx());
+        assert_eq!(result, ">L..t......");
+    }
+
+    /// upstream: log.c:709 - symlink without preserve_mtimes shows uppercase 'T'
+    #[test]
+    fn symlink_time_without_preserve_mtimes_shows_uppercase_t() {
+        let iflags = ItemFlags::from_raw(ItemFlags::ITEM_TRANSFER | ItemFlags::ITEM_REPORT_TIME);
+        let entry = make_symlink_entry("link");
+        let result = format_iflags(&iflags, &entry, false, &no_times_ctx());
+        assert_eq!(result, ">L..T......");
+    }
+
+    /// upstream: log.c:709 - symlink without receiver_symlink_times shows uppercase 'T'
+    #[test]
+    fn symlink_time_without_receiver_symlink_times_shows_uppercase_t() {
+        let iflags = ItemFlags::from_raw(ItemFlags::ITEM_TRANSFER | ItemFlags::ITEM_REPORT_TIME);
+        let entry = make_symlink_entry("link");
+        let result = format_iflags(&iflags, &entry, false, &no_symlink_times_ctx());
+        assert_eq!(result, ">L..T......");
+    }
+
+    /// upstream: log.c:710 - symlink with ITEM_REPORT_TIMEFAIL (bit 2) shows uppercase 'T'
+    /// even when preserve_mtimes and receiver_symlink_times are both true
+    #[test]
+    fn symlink_timefail_shows_uppercase_t() {
+        let iflags = ItemFlags::from_raw(
+            ItemFlags::ITEM_TRANSFER
+                | ItemFlags::ITEM_REPORT_TIME
+                | ItemFlags::ITEM_REPORT_TIMEFAIL,
+        );
+        let entry = make_symlink_entry("link");
+        let result = format_iflags(&iflags, &entry, false, &default_ctx());
+        // ITEM_REPORT_TIMEFAIL (bit 2) forces 'T' for symlinks
+        assert_eq!(result, ">L..T......");
+    }
+
+    /// Verify that ITEM_REPORT_TIMEFAIL (bit 2) on a regular file is interpreted
+    /// as ITEM_REPORT_SIZE, not as timefail - the bits share the same position.
+    #[test]
+    fn file_report_size_bit_not_confused_with_timefail() {
+        let iflags = ItemFlags::from_raw(
+            ItemFlags::ITEM_TRANSFER | ItemFlags::ITEM_REPORT_TIME | ItemFlags::ITEM_REPORT_SIZE, // same bit as TIMEFAIL
+        );
+        let entry = make_file_entry("test.txt");
+        let result = format_iflags(&iflags, &entry, false, &default_ctx());
+        // For files, bit 2 = size ('s'), time stays lowercase 't'
+        assert_eq!(result, ">f.st......");
+    }
+
+    /// upstream: log.c:716-717 - directory without preserve_mtimes shows uppercase 'T'
+    #[test]
+    fn directory_time_without_preserve_mtimes_shows_uppercase_t() {
+        let iflags =
+            ItemFlags::from_raw(ItemFlags::ITEM_LOCAL_CHANGE | ItemFlags::ITEM_REPORT_TIME);
+        let entry = make_dir_entry("subdir");
+        let result = format_iflags(&iflags, &entry, true, &no_times_ctx());
+        assert_eq!(result, "cd..T......");
+    }
+
+    /// No ITEM_REPORT_TIME means position 4 stays '.' regardless of context.
+    #[test]
+    fn no_time_flag_always_dot_regardless_of_context() {
+        let iflags = ItemFlags::from_raw(ItemFlags::ITEM_TRANSFER);
+        let entry = make_file_entry("test.txt");
+        let result = format_iflags(&iflags, &entry, false, &no_times_ctx());
+        assert_eq!(result, ">f.........");
+    }
+
+    /// The default ItemizeContext produces 't' (common case).
+    #[test]
+    fn default_context_produces_lowercase_t() {
+        let ctx = ItemizeContext::default();
+        assert!(ctx.preserve_mtimes);
+        assert!(ctx.receiver_symlink_times);
+    }
+
+    /// The plain-`-v` name line (`%n%L`): a bare path for a regular file, a
+    /// trailing `/` for a directory, and a ` -> target` arrow for a symlink -
+    /// matching what upstream's `log_item(FCLIENT)` prints on a push.
+    ///
+    /// upstream: log.c:627-636 (%n, dir slash), log.c:643-655 (%L arrow).
+    #[test]
+    fn name_line_renders_dir_slash_and_symlink_arrow() {
+        let none = ItemFlags::from_raw(0);
+        assert_eq!(
+            format_name_line(&make_file_entry("a.txt"), None, &none),
+            "a.txt\n"
+        );
+        assert_eq!(
+            format_name_line(&make_dir_entry("sub"), None, &none),
+            "sub/\n"
+        );
+        assert_eq!(
+            format_name_line(&make_symlink_entry("l1"), None, &none),
+            "l1 -> target\n"
+        );
+    }
+
+    /// `%L`'s ` => <hlink>` form wins over the symlink arrow when the entry
+    /// carries a non-empty alternate-basis name (`ITEM_XNAME_FOLLOWS`).
+    ///
+    /// upstream: log.c:676-688 - the `if (hlink && *hlink)` branch precedes the
+    /// symlink case.
+    #[test]
+    fn name_line_hardlink_suffix_wins() {
+        let hl = ItemFlags::from_raw(ItemFlags::ITEM_XNAME_FOLLOWS);
+        assert_eq!(
+            format_name_line(&make_file_entry("dup"), Some(b"leader"), &hl),
+            "dup => leader\n"
+        );
+    }
+}

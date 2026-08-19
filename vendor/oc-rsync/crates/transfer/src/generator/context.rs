@@ -1,0 +1,1519 @@
+//! `GeneratorContext` definition and inherent methods shared across the
+//! generator role's submodules.
+//!
+//! The context holds protocol state, configuration, the running file list,
+//! filter chain, accumulated statistics, and incremental-recursion state.
+//! Construction-time setup happens in [`GeneratorContext::new`]; the full send
+//! workflow is driven by the `transfer` submodule via `GeneratorContext::run`.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+
+use ::filters::FilterChain;
+use protocol::flist::{DualFileList, FileEntry};
+use protocol::idlist::IdList;
+use protocol::stats::DeleteStats;
+use protocol::{CompatibilityFlags, NegotiationResult, ProtocolVersion};
+
+use crate::role_trailer::error_location;
+
+use super::diagnostics::{NDX_CONVERT_CALLS, NDX_CONVERT_CMPS, partition_point_depth};
+use super::io_error_flags;
+use super::segments::IncrementalState;
+use super::timing::TransferTiming;
+use super::{itemize, open_source};
+use crate::config::ServerConfig;
+use crate::handshake::HandshakeResult;
+use crate::transfer_state::TransferPipeline;
+
+/// Concrete source-file descriptor surfaced by `open_source_unbuffered`.
+///
+/// NSV-1: `RawFd` on Unix so the daemon SERVE path can later engage a zero-copy
+/// file->socket sender. `!()` collapses to unit on non-unix where no fd exists;
+/// the value is always `None` there.
+#[cfg(unix)]
+pub(crate) type SourceFd = std::os::fd::RawFd;
+/// Non-unix placeholder for the source descriptor (never populated).
+#[cfg(not(unix))]
+pub(crate) type SourceFd = ();
+
+/// Context for the generator role during a transfer.
+///
+/// Holds protocol state, configuration, file list, and filter rules needed
+/// to drive the send loop. Created via [`GeneratorContext::new`] from a
+/// completed [`HandshakeResult`] and [`ServerConfig`], then executed with
+/// [`GeneratorContext::run`].
+///
+/// See the [module-level documentation](crate::generator) for the full send workflow.
+#[derive(Debug)]
+pub struct GeneratorContext {
+    /// Negotiated protocol version.
+    pub(crate) protocol: ProtocolVersion,
+    /// Server configuration.
+    pub(crate) config: ServerConfig,
+    /// List of files to send (contains relative paths for wire transmission).
+    ///
+    /// **Invariant**: `file_list` and `source_bases` must always have the same length.
+    /// Use [`Self::push_file_item`] to add entries and [`Self::clear_file_list`] to clear.
+    pub(crate) file_list: DualFileList,
+    /// Interned source-directory base for each file in `file_list` (parallel array).
+    ///
+    /// The on-disk path used to open a source file for delta generation is
+    /// `base.join(entry.name())` (see [`Self::reconstruct_source_path`]). Storing
+    /// only the base - which is identical for every entry produced by a single
+    /// source argument - lets all those entries share one `Arc<Path>` allocation
+    /// instead of each owning a full `PathBuf` that redundantly re-stores the
+    /// entry's relative name. At scale this removes the per-file path bytes (and
+    /// their allocator overhead) from the sender's resident set; the name bytes
+    /// already live in the `FileEntry`.
+    ///
+    /// **Invariant**: `file_list[i]` corresponds to `source_bases[i]` for all
+    /// valid indices, and `reconstruct_source_path(i)` reproduces the exact
+    /// on-disk path the walk recorded for entry `i`.
+    pub(crate) source_bases: Vec<Arc<Path>>,
+    /// One-entry interning cache for [`Self::push_file_item`].
+    ///
+    /// Consecutive entries from the same source argument derive the identical
+    /// base, so caching the last `Arc<Path>` collapses them onto a single shared
+    /// allocation without the overhead of a full interning map.
+    last_source_base: Option<Arc<Path>>,
+    /// Per-directory scoped filter chain for file list building and deletion.
+    ///
+    /// Combines global filter rules (from command-line or wire) with per-directory
+    /// merge files (`.rsync-filter`). During `walk_path()`, the chain pushes/pops
+    /// scoped rules as directories are entered and left.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `exclude.c:push_local_filters()` / `pop_local_filters()`
+    pub(crate) filter_chain: FilterChain,
+    /// Negotiated checksum and compression algorithms from Protocol 30+ capability negotiation.
+    /// None for protocols < 30 or when negotiation was skipped.
+    pub(crate) negotiated_algorithms: Option<NegotiationResult>,
+    /// Compatibility flags exchanged during protocol setup.
+    ///
+    /// Controls protocol-specific behaviors like incremental recursion (`INC_RECURSE`),
+    /// checksum seed ordering (`CHECKSUM_SEED_FIX`), and file list encoding (`VARINT_FLIST_FLAGS`).
+    /// None for protocols < 30 or when compat exchange was skipped.
+    pub(crate) compat_flags: Option<CompatibilityFlags>,
+    /// Checksum seed for XXHash algorithms.
+    pub(crate) checksum_seed: i32,
+    /// Timing and byte-count statistics for the transfer.
+    pub(crate) timing: TransferTiming,
+    /// Collected UID mappings for name-based ownership transfer.
+    pub(crate) uid_list: IdList,
+    /// Collected GID mappings for name-based ownership transfer.
+    pub(crate) gid_list: IdList,
+    /// I/O error flags accumulated during file list building and transfer.
+    /// Uses [`io_error_flags`] constants (IOERR_GENERAL, IOERR_VANISHED, etc.).
+    pub(crate) io_error: i32,
+    /// Set once any `FERROR_XFER` diagnostic has been raised by this side or
+    /// received from the peer.
+    ///
+    /// Distinct from [`Self::io_error`]: `io_error` is a wire field the sender
+    /// hands the receiver to inhibit deletions, whereas this flag never leaves
+    /// the process and only decides the final exit code.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `log.c:310-311` - `case FERROR_XFER: got_xfer_error = 1;`
+    /// - `cleanup.c:217-218` - `got_xfer_error` maps a zero exit to `RERR_PARTIAL`
+    pub(crate) got_xfer_error: bool,
+    /// Diagnostics raised by the file-list walk, paired with the upstream log
+    /// class that decides how a server frames them.
+    ///
+    /// The walk runs before any writer is in scope, so the text is held here
+    /// and drained by
+    /// [`flush_flist_diagnostics`](Self::flush_flist_diagnostics) once the
+    /// orchestrator can reach the wire. Each entry already carries its trailing
+    /// newline, matching upstream's `rwrite()` payload.
+    pub(crate) pending_flist_diagnostics: Vec<(super::protocol_io::SenderDiagnostic, String)>,
+    /// Flat file-list indices whose `--remove-source-files` unlink is deferred
+    /// until the peer confirms the commit via `MSG_SUCCESS`. Empty and unused
+    /// unless `--remove-source-files` is active.
+    ///
+    /// upstream: sender.c:131-182 `successful_send()` unlinks on confirmation,
+    /// never inline at send time (io.c:1623-1637 `MSG_SUCCESS` handler).
+    pub(crate) pending_source_removals: super::pending_removal::PendingSourceRemovals,
+    /// Incremental recursion (INC_RECURSE) state for segmented file list sending.
+    pub(crate) incremental: IncrementalState,
+    /// Accumulated deletion statistics received via NDX_DEL_STATS messages.
+    /// (upstream: main.c:238-247 `read_del_stats()`)
+    pub(crate) delete_stats: DeleteStats,
+    /// Per-type file-list tallies and `total_size`, accumulated as each entry
+    /// is written to the wire (upstream: `send_file_entry()`, flist.c:421-438,
+    /// 690-691). Feeds the `--stats` "Number of files" breakdown and the real
+    /// "Total file size" on a push; accumulated at send time because
+    /// INC_RECURSE drains sent segments from `file_list`.
+    pub(crate) flist_send_stats: super::FlistSendStats,
+    /// Per-operation thresholds for switching between sequential and parallel execution.
+    ///
+    /// Different operations have different overhead profiles: CPU-bound signature
+    /// computation benefits from parallelism at lower counts than I/O-bound stat calls.
+    pub(crate) parallel_thresholds: crate::parallel_io::ParallelThresholds,
+    /// Directory the sender is serving from, i.e. upstream's `curr_dir`.
+    ///
+    /// Upstream's sender `push_dir()`s into the `dir` half of each positional's
+    /// `dir`/`fn` split (flist.c:2338-2349) before walking it, and
+    /// `full_fname()` renders every diagnostic path relative to that directory.
+    /// oc-rsync never `chdir()`s, so the same directory - the walk `base` - is
+    /// recorded here as each source entry is walked and consumed by
+    /// [`daemon_paths`](Self::daemon_paths).
+    pub(crate) curr_dir: Option<PathBuf>,
+    /// Transfer pipeline FSM tracking the current protocol phase.
+    ///
+    /// Enforces the linear phase progression through the transfer lifecycle.
+    /// Initialized at `FilterExchange` by `run_server_with_handshake` and
+    /// advanced through `FileListTransfer`, `DeltaTransfer`, `Finalization`,
+    /// and `Complete` as the generator progresses.
+    pub(crate) pipeline: TransferPipeline,
+    /// Batch file to receive the `--write-batch` stats trailer, set only when
+    /// this process is a client SENDER recording a batch.
+    ///
+    /// This is upstream's `batch_fd`, deliberately distinct from the wire
+    /// writer: a client sender never puts its stats on the wire, it writes
+    /// them straight into the batch between the last transfer write and the
+    /// goodbye `NDX_DONE` (which does ride the wire, and so is teed).
+    /// Ordering is what makes the batch replayable, so the write has to happen
+    /// here rather than after the transfer returns.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `main.c:374-383` - `handle_stats()` `else if (write_batch)` arm,
+    ///   reached only when `am_sender` and `!am_server`.
+    pub(crate) batch_stats_sink: Option<BatchStatsSink>,
+    /// Shared handle on the raw wire byte counter for bytes written to the
+    /// transport, below multiplex framing (upstream `stats.total_written`,
+    /// io.c:859). Sampled at the `handle_stats` point (main.c:979-980) so the
+    /// sender reports raw wire bytes - the count the client sender prints and the
+    /// server sender transmits over the wire - instead of a logical token tally.
+    /// `None` in unit tests, where the logical fallback is used.
+    pub(crate) wire_write_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Shared handle on the raw wire byte counter for bytes read from the
+    /// transport (upstream `stats.total_read`, io.c:820). Sampled alongside
+    /// [`Self::wire_write_counter`] at the `handle_stats` point. `None` in unit
+    /// tests, where the logical fallback is used.
+    pub(crate) wire_read_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Whether the RECEIVING peer can set symlink timestamps (upstream's
+    /// `receiver_symlink_times`, compat.c:92). Computed once at construction from
+    /// the receiver's advertised capability - the client's `'L'` letter when we
+    /// are the server, else the negotiated `CF_SYMLINK_TIMES` flag - and consulted
+    /// only by [`Self::itemize_context`] to pick the position-4 `t`/`T` glyph for
+    /// a symlink. Distinct from this process's own platform capability: a Unix
+    /// server-sender must not itemize a symlink time a non-Unix receiver cannot
+    /// apply (upstream compat.c:755-759).
+    pub(crate) receiver_symlink_times: bool,
+}
+
+/// Handle on the `--write-batch` file, held by a client sender so it can write
+/// the stats trailer without routing it through the wire writer.
+///
+/// A newtype only so the enclosing [`GeneratorContext`] can keep deriving
+/// `Debug`, which a bare `dyn Write` cannot.
+#[derive(Clone)]
+pub(crate) struct BatchStatsSink(pub(crate) Arc<Mutex<dyn std::io::Write + Send>>);
+
+impl std::fmt::Debug for BatchStatsSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BatchStatsSink")
+    }
+}
+
+impl GeneratorContext {
+    /// Returns the daemon path context that makes
+    /// [`crate::full_fname::full_fname`] render a quoted path the way upstream
+    /// does - module-relative, with the ` (in MODULE)` suffix - or `None`
+    /// outside a daemon server process.
+    ///
+    /// The module root falls back to the module itself as `curr_dir` until the
+    /// walk records one, matching a server that has only `chdir()`ed into the
+    /// module root (`clientserver.c:993`) and not yet into a source argument.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `util1.c:1285-1290` - `p1 = curr_dir + module_dirlen` and
+    ///   `if (module_id >= 0)` in `full_fname()`.
+    pub(crate) fn daemon_paths(&self) -> Option<crate::full_fname::DaemonPaths<'_>> {
+        let module = self.config.connection.daemon_module.as_deref()?;
+        let module_root = self.config.connection.daemon_module_root.as_deref()?;
+        Some(crate::full_fname::DaemonPaths {
+            module,
+            module_root,
+            curr_dir: self.curr_dir.as_deref().unwrap_or(module_root),
+        })
+    }
+
+    /// Creates a new generator context from a completed handshake and server config.
+    ///
+    /// Initializes protocol state, INC_RECURSE NDX offset, and empty file list.
+    /// Call [`build_file_list`](Self::build_file_list) to populate entries, then
+    /// [`run`](Self::run) to execute the transfer.
+    /// The `pipeline` parameter carries the transfer FSM state from the
+    /// orchestration layer. It should be at `FilterExchange` when the
+    /// generator is created.
+    #[must_use]
+    pub fn new(
+        handshake: &HandshakeResult,
+        config: ServerConfig,
+        pipeline: TransferPipeline,
+    ) -> Self {
+        // upstream: flist.c:2958 - ndx_start = inc_recurse ? 1 : 0
+        let inc_recurse = handshake
+            .compat_flags
+            .is_some_and(|f| f.contains(CompatibilityFlags::INC_RECURSE));
+        let initial_ndx_start = if inc_recurse { 1 } else { 0 };
+
+        // upstream: compat.c:653-655 - legacy (protocol < 30) peers verify the
+        // append prefix, so promote plain `--append` to `--append-verify`.
+        let mut config = config;
+        config.promote_append_mode_for_protocol(handshake.protocol);
+
+        // upstream: compat.c:755-759 - on the sender, `receiver_symlink_times`
+        // reflects the RECEIVER's capability, not our own platform. When we are
+        // the server the receiver is the client, whose `'L'` letter rides
+        // `client_info` (the `-e` string in `client_args` for daemon mode, or the
+        // compact `flag_string` for SSH mode). When we are a client sender it is
+        // the negotiated `CF_SYMLINK_TIMES` flag. Computed once here so
+        // `itemize_context` renders the position-4 `t`/`T` symlink glyph
+        // correctly even when a non-Unix receiver pulls from this Unix server.
+        let am_server = !config.connection.client_mode;
+        let client_info = if am_server {
+            crate::setup::resolve_server_client_info(
+                handshake.client_args.as_deref(),
+                &config.flag_string,
+            )
+        } else {
+            std::borrow::Cow::Borrowed("")
+        };
+        let receiver_symlink_times = crate::setup::sender_receiver_symlink_times(
+            am_server,
+            &client_info,
+            handshake.compat_flags,
+        );
+
+        Self {
+            protocol: handshake.protocol,
+            config,
+            file_list: DualFileList::new(),
+            source_bases: Vec::new(),
+            last_source_base: None,
+            filter_chain: FilterChain::empty(),
+            negotiated_algorithms: handshake.negotiated_algorithms,
+            compat_flags: handshake.compat_flags,
+            checksum_seed: handshake.checksum_seed,
+            timing: TransferTiming::new(),
+            uid_list: IdList::new(),
+            gid_list: IdList::new(),
+            io_error: 0,
+            got_xfer_error: false,
+            pending_flist_diagnostics: Vec::new(),
+            pending_source_removals: super::pending_removal::PendingSourceRemovals::default(),
+            incremental: IncrementalState::new(initial_ndx_start),
+            delete_stats: DeleteStats::new(),
+            flist_send_stats: super::FlistSendStats::default(),
+            parallel_thresholds: crate::parallel_io::ParallelThresholds::default(),
+            curr_dir: None,
+            pipeline,
+            batch_stats_sink: None,
+            wire_write_counter: None,
+            wire_read_counter: None,
+            receiver_symlink_times,
+        }
+    }
+
+    /// Attaches the raw wire byte counters used for `handle_stats()` reporting.
+    ///
+    /// Both counters must wrap the raw transport (below multiplex framing),
+    /// matching upstream's descriptor counters `stats.total_written` (io.c:859)
+    /// and `stats.total_read` (io.c:820). Must be set before [`run`](Self::run)
+    /// for the sender to report raw wire byte totals.
+    pub fn set_wire_counters(
+        &mut self,
+        write_counter: Arc<std::sync::atomic::AtomicU64>,
+        read_counter: Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        self.wire_write_counter = Some(write_counter);
+        self.wire_read_counter = Some(read_counter);
+    }
+
+    /// Creates a generator context for unit testing with a default pipeline.
+    ///
+    /// The pipeline is initialized at `FilterExchange`, matching the state
+    /// when a real `run_server_with_handshake` dispatches to the generator.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn new_for_test(handshake: &HandshakeResult, config: ServerConfig) -> Self {
+        let mut pipeline = TransferPipeline::new(crate::role::ServerRole::Generator);
+        pipeline
+            .advance_to(crate::transfer_state::TransferPhase::FilterExchange)
+            .expect("test pipeline advance");
+        Self::new(handshake, config, pipeline)
+    }
+
+    /// Converts a wire NDX value to a flat file list array index.
+    ///
+    /// Uses `partition_point` for O(log n) lookup, matching `flat_to_wire_ndx`.
+    ///
+    /// Updates the `NDX_CONVERT_CALLS` / `NDX_CONVERT_CMPS` counters used
+    /// for INC_RECURSE diagnostic I4 (#2199).
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `rsync.c:424` - `i = ndx - cur_flist->ndx_start`
+    pub(crate) fn wire_to_flat_ndx(&self, wire_ndx: i32) -> usize {
+        let segments = &self.incremental.ndx_segments;
+        NDX_CONVERT_CALLS.fetch_add(1, Ordering::Relaxed);
+        NDX_CONVERT_CMPS.fetch_add(partition_point_depth(segments.len()), Ordering::Relaxed);
+        let seg_idx = segments
+            .partition_point(|&(_, ndx_start)| ndx_start <= wire_ndx)
+            .saturating_sub(1);
+        let (flat_start, ndx_start) = segments[seg_idx];
+        flat_start + (wire_ndx - ndx_start) as usize
+    }
+
+    /// Resolves a wire NDX read back from the receiver to the flat `file_list`
+    /// index whose entry drives itemize formatting and xattr responses.
+    ///
+    /// This is [`Self::wire_to_flat_ndx`] for every regular entry. Under
+    /// INC_RECURSE, however, the remote generator itemizes a directory by
+    /// sending the "gap NDX" `ndx_start - 1` of that directory's sub-list
+    /// (generator.c:2313 `ndx = cur_flist->ndx_start - 1`) instead of the
+    /// directory's own NDX. Feeding that gap through the plain segment map lands
+    /// on the trailing file of the previous segment, so a directory row would
+    /// print with a file type char and the wrong path. Upstream recovers the
+    /// directory via `file = dir_flist->files[cur_flist->parent_ndx]`
+    /// (sender.c:269-272); oc mirrors that by mapping the gap to its sub-list's
+    /// recorded owning-directory flat index. Each sub-list resolves to its own
+    /// owning directory - the initial list's gap to the `.` root, a
+    /// subdirectory's gap to that subdirectory - so every directory is itemized
+    /// once, exactly as upstream emits one row per directory.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `sender.c:267-272` - gap NDX (`ndx < cur_flist->ndx_start`) resolves to
+    ///   the owning directory entry in `dir_flist`.
+    /// - `generator.c:2306-2313` - each sub-list (including the initial list
+    ///   whose `parent_ndx >= 0`) itemizes its owning directory at `ndx_start - 1`.
+    pub(crate) fn resolve_itemize_ndx(&self, wire_ndx: i32) -> usize {
+        let segments = &self.incremental.ndx_segments;
+        // A gap NDX `g` satisfies `g + 1 == ndx_start` for exactly one sub-list;
+        // no regular entry's NDX can equal a sub-list start minus one (the +1
+        // gap is reserved, flist.c:2966). Binary search is valid because
+        // `ndx_start` values are strictly increasing.
+        if let Ok(seg_idx) =
+            segments.binary_search_by(|&(_, ndx_start)| ndx_start.cmp(&(wire_ndx + 1)))
+        {
+            let parent_flat = self.incremental.segment_parent_flat[seg_idx];
+            if parent_flat >= 0 {
+                return parent_flat as usize;
+            }
+        }
+        self.wire_to_flat_ndx(wire_ndx)
+    }
+
+    /// Converts a flat file list array index to a wire NDX value.
+    ///
+    /// Updates the `NDX_CONVERT_CALLS` / `NDX_CONVERT_CMPS` counters used
+    /// for INC_RECURSE diagnostic I4 (#2199).
+    ///
+    /// Only used in tests after the NDX echo-back fix - the transfer loop now
+    /// preserves the original wire NDX instead of round-tripping through this
+    /// function, which avoids corrupting INC_RECURSE gap NDX values.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `generator.c:2338` - `ndx = i + cur_flist->ndx_start`
+    #[cfg(test)]
+    pub(crate) fn flat_to_wire_ndx(&self, flat_idx: usize) -> i32 {
+        let segments = &self.incremental.ndx_segments;
+        NDX_CONVERT_CALLS.fetch_add(1, Ordering::Relaxed);
+        NDX_CONVERT_CMPS.fetch_add(partition_point_depth(segments.len()), Ordering::Relaxed);
+        let seg_idx = segments.partition_point(|&(start, _)| start <= flat_idx) - 1;
+        let (flat_start, ndx_start) = segments[seg_idx];
+        ndx_start + (flat_idx - flat_start) as i32
+    }
+
+    /// Returns the negotiated protocol version.
+    #[must_use]
+    pub const fn protocol(&self) -> ProtocolVersion {
+        self.protocol
+    }
+
+    /// Returns a reference to the server configuration.
+    #[must_use]
+    pub const fn config(&self) -> &ServerConfig {
+        &self.config
+    }
+
+    /// Returns the negotiated compatibility flags.
+    ///
+    /// Returns `None` for protocols < 30 or when compat exchange was skipped.
+    /// The flags control protocol-specific behaviors like incremental recursion,
+    /// checksum seed ordering, and file list encoding.
+    pub const fn compat_flags(&self) -> Option<protocol::CompatibilityFlags> {
+        self.compat_flags
+    }
+
+    /// Returns `true` when `INC_RECURSE` compat flag is negotiated.
+    pub(crate) fn inc_recurse(&self) -> bool {
+        self.compat_flags
+            .is_some_and(|f| f.contains(CompatibilityFlags::INC_RECURSE))
+    }
+
+    /// Builds the display context for itemize time-position rendering.
+    ///
+    /// Captures `preserve_mtimes` (from `--times` flag) and `receiver_symlink_times`
+    /// (the RECEIVER's advertised symlink-time capability, resolved once in
+    /// [`Self::new`] per upstream compat.c:755-759) so `format_iflags` can
+    /// correctly distinguish `t` from `T` at position 4.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `log.c:708-710` - symlink time: `T` when `!preserve_mtimes || !receiver_symlink_times`
+    /// - `log.c:716-717` - non-symlink time: `T` when `!preserve_mtimes`
+    pub(crate) fn itemize_context(&self) -> itemize::ItemizeContext {
+        itemize::ItemizeContext {
+            preserve_mtimes: self.config.flags.times,
+            receiver_symlink_times: self.receiver_symlink_times,
+        }
+    }
+
+    /// Creates a configured `FileListWriter` matching the current protocol and flags.
+    /// Returns the `x`-modifier xattr-name filter that screens which of a
+    /// source file's extended attributes are collected for the wire, or `None`
+    /// when the transfer carries no such rules.
+    ///
+    /// # Upstream Reference
+    ///
+    /// Mirrors upstream's `saw_xattr_filter` gate in `rsync_xal_get()`
+    /// (xattrs.c:250-252), which consults
+    /// `name_is_excluded(name, NAME_IS_XATTR, ALL_FILTERS)`. Note that when
+    /// this returns `Some`, upstream skips the namespace test entirely: the
+    /// two branches at xattrs.c:250-257 are mutually exclusive.
+    /// Only the unix xattr-collection path consults this; gating the
+    /// definition to match its sole caller keeps Windows free of dead code.
+    #[cfg(unix)]
+    pub(crate) fn xattr_name_filter(&self) -> Option<&::filters::FilterSet> {
+        let global = self.filter_chain.global();
+        global.has_xattr_rules().then_some(global)
+    }
+
+    pub(crate) fn build_flist_writer(&self) -> protocol::flist::FileListWriter {
+        use crate::shared::ChecksumFactory;
+
+        // upstream: acls.c:597 - ACL entry names are written only under
+        // incremental recursion and when names (not numeric ids) are used.
+        // Without inc_recurse the receiver remaps ACL ids through the id-list
+        // (match_acl_ids), so no per-entry name is needed on the wire.
+        let inc_recurse = self
+            .compat_flags
+            .is_some_and(|f| f.contains(protocol::CompatibilityFlags::INC_RECURSE));
+        // upstream: acls.c:946 - `if (inc_recurse && !numeric_ids)`; per-entry
+        // ACL names travel only when names are active (`numeric_ids == 0`).
+        let acl_send_names = inc_recurse && self.config.flags.numeric_ids.is_off();
+
+        let mut writer = if let Some(flags) = self.compat_flags {
+            protocol::flist::FileListWriter::with_compat_flags(self.protocol, flags)
+        } else {
+            protocol::flist::FileListWriter::new(self.protocol)
+        }
+        .with_preserve_uid(self.config.flags.owner)
+        .with_preserve_gid(self.config.flags.group)
+        .with_preserve_links(self.config.flags.links)
+        .with_preserve_devices(self.config.flags.devices)
+        .with_preserve_specials(self.config.flags.specials)
+        .with_preserve_hard_links(self.config.flags.hard_links)
+        .with_preserve_atimes(self.config.flags.atimes)
+        .with_preserve_crtimes(self.config.flags.crtimes)
+        .with_preserve_acls(self.config.flags.acls)
+        .with_acl_send_names(acl_send_names)
+        // upstream: flist.c:481-482,491-492 - inline XMIT_*_NAME_FOLLOWS owner
+        // names are emitted only under incremental recursion. Without it the
+        // names travel solely in the trailing id-list (send_id_lists), so
+        // gating inline emission on inc_recurse keeps the flist bytes identical
+        // to upstream for non-incremental transfers.
+        .with_name_follows(inc_recurse)
+        .with_preserve_xattrs(self.config.flags.xattrs)
+        .with_checksum_seed(self.checksum_seed);
+
+        // upstream: flist.c - always_checksum includes per-file checksums in the file list
+        if self.config.flags.checksum {
+            let factory = ChecksumFactory::from_negotiation(
+                self.negotiated_algorithms.as_ref(),
+                self.protocol,
+                self.checksum_seed,
+                self.compat_flags.as_ref(),
+            );
+            writer = writer.with_always_checksum(factory.digest_length());
+        }
+
+        if let Some(ref converter) = self.config.connection.iconv {
+            // upstream: compat.c:765-767 `sender_symlink_iconv = iconv_opt &&
+            // (... CF_SYMLINK_ICONV)`. Symlink-target iconv is gated separately
+            // from filename iconv: only transcode targets when the peer
+            // negotiated CF_SYMLINK_ICONV. A proto-30 / pre-3.1 peer receives
+            // raw local target bytes.
+            let symlink_iconv = self
+                .compat_flags
+                .is_some_and(|f| f.contains(CompatibilityFlags::SYMLINK_ICONV));
+            writer = writer
+                .with_iconv(converter.clone())
+                .with_symlink_iconv(symlink_iconv);
+        }
+        writer
+    }
+
+    /// Returns a reference to the filter chain for external use.
+    ///
+    /// The receiver may need the filter chain for deletion filtering.
+    #[must_use]
+    pub fn filter_chain(&self) -> &FilterChain {
+        &self.filter_chain
+    }
+
+    /// Returns the generated file list.
+    #[must_use]
+    pub fn file_list(&self) -> &[FileEntry] {
+        debug_assert_eq!(
+            self.file_list.len(),
+            self.source_bases.len(),
+            "file_list and source_bases must be kept in sync"
+        );
+        self.file_list.as_slice()
+    }
+
+    /// Adds a file entry and its corresponding on-disk source path to the list.
+    ///
+    /// `full_path` is the exact path the walk recorded for the entry (used to
+    /// open the source for delta generation). Rather than storing it verbatim,
+    /// this derives and interns the source-directory base so that
+    /// `base.join(entry.name())` reproduces `full_path` byte-for-byte (see
+    /// [`reconstruct_source_path`](Self::reconstruct_source_path)). Entries from
+    /// one source argument share a single base allocation.
+    ///
+    /// This method maintains the invariant that `file_list` and `source_bases`
+    /// have the same length and corresponding entries at each index.
+    pub(crate) fn push_file_item(&mut self, entry: FileEntry, full_path: PathBuf) {
+        debug_assert_eq!(
+            self.file_list.len(),
+            self.source_bases.len(),
+            "file_list and source_bases must be kept in sync before push"
+        );
+        let base = self.intern_source_base(&full_path, entry.path());
+        self.file_list.push(entry);
+        self.source_bases.push(base);
+    }
+
+    /// Derives the source base for `full_path`/`name` and interns it against the
+    /// one-entry cache, returning a shared `Arc<Path>`.
+    fn intern_source_base(&mut self, full_path: &Path, name: &Path) -> Arc<Path> {
+        let base = derive_source_base(full_path, name);
+        match &self.last_source_base {
+            Some(cached) if cached.as_ref() == base.as_path() => Arc::clone(cached),
+            _ => {
+                let arc: Arc<Path> = Arc::from(base.as_path());
+                self.last_source_base = Some(Arc::clone(&arc));
+                arc
+            }
+        }
+    }
+
+    /// Reconstructs the on-disk source path recorded for entry `ndx`.
+    ///
+    /// Inverts [`push_file_item`](Self::push_file_item): the returned path equals
+    /// the `full_path` originally passed in, byte-for-byte, for every non-
+    /// degenerate source (single or multiple positional args, `--files-from`
+    /// `/./` anchors, daemon module roots, and arbitrarily nested names).
+    pub(crate) fn reconstruct_source_path(&self, ndx: usize) -> PathBuf {
+        join_source_path(&self.source_bases[ndx], self.file_list[ndx].path())
+    }
+
+    /// Builds the per-connection source-open policy the sender applies to
+    /// every source file.
+    ///
+    /// Mirrors the branch upstream `sender.c` takes before reading a file:
+    /// when `use_secure_symlinks` holds, confine the open beneath the module
+    /// root; otherwise `do_open_checklinks` opens with `O_NOFOLLOW` unless
+    /// `--copy-links` / `--copy-unsafe-links` follows the symlink.
+    ///
+    /// # Why the gate is `is_daemon_connection` alone
+    ///
+    /// Upstream's condition is `am_daemon && !am_chrooted`, and `am_chrooted`
+    /// is assigned in exactly ONE place: `clientserver.c:988`, inside
+    /// `rsync_module()`'s PER-MODULE `use chroot` handling. The daemon-level
+    /// `daemon chroot` deliberately leaves it 0 - `clientserver.c:1345-1357`
+    /// spells out why, since that chroot confines resolution to the daemon
+    /// root, not to a module boundary, so modules sharing it stay
+    /// distinguishable subtrees and the per-module defenses must keep firing.
+    ///
+    /// So for a daemon-chrooted oc (`accept_loop.rs` applies the global
+    /// `daemon chroot`) this gate is exactly right: upstream is also still
+    /// gated on. It diverges only when a per-module `use chroot` succeeds
+    /// (`privilege.rs` `chroot_or_fallback`, reachable on the sync daemon
+    /// path), where upstream sets `am_chrooted = 1` and stops confining while
+    /// oc keeps confining. That is fail-safe - strictly more confinement,
+    /// never less - and is tracked rather than silently relied on. Do NOT
+    /// restate this as "oc never chroots": oc does chroot, by both routes.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `clientserver.c:1018` - `use_secure_symlinks = am_daemon && !am_chrooted`
+    /// - `clientserver.c:988` - the only assignment of `am_chrooted`
+    /// - `clientserver.c:1345-1357` - why the daemon chroot does not set it
+    /// - `sender.c:359-383` - `secure_relative_open` vs `do_open_checklinks`
+    pub(crate) fn source_open(&self) -> open_source::SourceOpen {
+        let confine_root = if self.config.connection.is_daemon_connection {
+            self.config.connection.daemon_module_root.clone()
+        } else {
+            None
+        };
+        let follow_symlinks = self.config.flags.copy_links || self.config.flags.copy_unsafe_links;
+        open_source::SourceOpen::new(
+            confine_root,
+            follow_symlinks,
+            self.config.write.open_noatime,
+        )
+    }
+
+    /// Whether the source open must apply confinement or `O_NOFOLLOW`, which
+    /// the path-based io_uring / IOCP fast readers cannot express (they follow
+    /// symlinks). Only a non-daemon transfer that already follows symlinks
+    /// (`--copy-links` / `--copy-unsafe-links`) may take the fast path.
+    ///
+    /// Non-Unix targets apply no symlink-race defence here (`O_NOFOLLOW` is a
+    /// Unix concept), so the fast path is always available.
+    pub(crate) fn requires_protected_source_open(&self) -> bool {
+        #[cfg(unix)]
+        {
+            let follows = !self.config.connection.is_daemon_connection
+                && (self.config.flags.copy_links || self.config.flags.copy_unsafe_links);
+            !follows
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    /// Returns the full source path for entry `ndx` for the `%f` out-format
+    /// placeholder, mirroring upstream `log.c` `pathjoin(F_PATHNAME(file),
+    /// f_name(file))`.
+    ///
+    /// `source_bases` is populated only by the sender's local walk
+    /// ([`push_file_item`](Self::push_file_item)); on a pull the flist arrives over
+    /// the wire and the array is empty, so this returns `None` and `%f` falls back
+    /// to the transfer-relative name - matching upstream, where `%f` only joins
+    /// `F_PATHNAME(file)` when `am_sender`.
+    ///
+    /// This is a literal component join, distinct from
+    /// [`reconstruct_source_path`](Self::reconstruct_source_path): the latter
+    /// collapses a `.` transfer-root name to the bare base so it opens the same
+    /// inode, whereas upstream `%f` keeps the `.` (rendering `<base>/.`), so the
+    /// join here must not special-case it.
+    pub(crate) fn source_prefix_for(&self, ndx: usize) -> Option<PathBuf> {
+        if ndx >= self.source_bases.len() {
+            return None;
+        }
+        let mut path = self.source_bases[ndx].to_path_buf();
+        path.extend(self.file_list[ndx].path().components());
+        Some(path)
+    }
+
+    /// Clears both the file list and the source-base array.
+    ///
+    /// This method maintains the invariant that both arrays are cleared together
+    /// and resets the interning cache so a fresh build starts clean.
+    pub(crate) fn clear_file_list(&mut self) {
+        self.file_list = DualFileList::new();
+        self.source_bases.clear();
+        self.last_source_base = None;
+    }
+
+    /// Determines if input multiplex should be activated based on mode and protocol.
+    ///
+    /// The activation threshold differs by mode:
+    ///
+    /// **Server mode** (daemon sender - `main.c:1270-1275` `start_server am_sender`):
+    /// - For protocol >= 30, `need_messages_from_generator = 1` (compat.c:776)
+    /// - `if (need_messages_from_generator) io_start_multiplex_in(f_in);`
+    ///
+    /// **Client mode** (client pushing to daemon - `main.c:1322-1323` `client_run am_sender`):
+    /// - `if (protocol_version >= 31 || (!filesfrom_host && protocol_version >= 23))`
+    /// - We don't support filesfrom, so this simplifies to >= 23
+    ///
+    /// **`--remove-source-files`** (`options.c:2243-2251`): the sender must
+    /// receive `MSG_SUCCESS` before it may unlink a source, so upstream sets
+    /// `need_messages_from_generator = 1` unconditionally when the flag is
+    /// active, forcing input multiplex regardless of protocol version. Both
+    /// peers share the option, so both force it and the stream stays in sync.
+    #[must_use]
+    pub(crate) const fn should_activate_input_multiplex(&self) -> bool {
+        // upstream: options.c:2243-2251 - --remove-source-files always needs the
+        // generator->sender message channel so MSG_SUCCESS can drive the
+        // deferred unlink, independent of protocol version.
+        if self.config.flags.remove_source_files {
+            return true;
+        }
+        if self.config.connection.client_mode {
+            // Client mode: >= 23 (upstream main.c:1304-1305, no filesfrom)
+            self.protocol.supports_multiplex_io()
+        } else {
+            // Server mode: >= 30 (need_messages_from_generator)
+            self.protocol.supports_generator_messages()
+        }
+    }
+
+    /// Adds an I/O error flag to the accumulated error state.
+    ///
+    /// Use constants from [`io_error_flags`] module (IOERR_GENERAL, IOERR_VANISHED, etc.).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// ctx.add_io_error(io_error_flags::IOERR_GENERAL);
+    /// ```
+    pub fn add_io_error(&mut self, flag: i32) {
+        self.io_error |= flag;
+    }
+
+    /// Records an I/O error, distinguishing between vanished files and general errors.
+    ///
+    /// This is a convenience wrapper around [`Self::add_io_error`] that maps
+    /// `NotFound` errors to `IOERR_VANISHED` and all other errors to `IOERR_GENERAL`.
+    ///
+    /// # Upstream Reference
+    ///
+    /// Mirrors upstream rsync's error handling where ENOENT indicates a vanished
+    /// file (race condition during scan) vs other I/O errors.
+    pub(crate) fn record_io_error(&mut self, error: &std::io::Error) {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            self.add_io_error(io_error_flags::IOERR_VANISHED);
+        } else {
+            self.add_io_error(io_error_flags::IOERR_GENERAL);
+        }
+    }
+
+    /// Queues a file-list-walk diagnostic for delivery by
+    /// [`flush_flist_diagnostics`](Self::flush_flist_diagnostics).
+    ///
+    /// The walk cannot reach the transfer writer, so writing here instead of to
+    /// stderr is what lets a daemon or SSH server forward the line to the
+    /// client the way upstream's `rwrite()` does. `text` must carry its
+    /// trailing newline.
+    pub(crate) fn queue_flist_diagnostic(
+        &mut self,
+        kind: super::protocol_io::SenderDiagnostic,
+        text: String,
+    ) {
+        self.pending_flist_diagnostics.push((kind, text));
+    }
+
+    /// Returns the current I/O error flags.
+    #[must_use]
+    pub const fn io_error(&self) -> i32 {
+        self.io_error
+    }
+
+    /// Returns whether any `FERROR_XFER` diagnostic has been seen.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `log.c:310-311` - `case FERROR_XFER: got_xfer_error = 1;`
+    #[must_use]
+    pub const fn got_xfer_error(&self) -> bool {
+        self.got_xfer_error
+    }
+
+    /// Returns the checksum algorithm to use for file transfer checksums.
+    ///
+    /// The algorithm depends on negotiation and protocol version:
+    /// - Protocol 30+ with negotiation: uses negotiated algorithm
+    /// - Protocol 30+ without negotiation: MD5 (16 bytes)
+    /// - Protocol < 30: MD4 (16 bytes)
+    #[must_use]
+    pub(crate) const fn get_checksum_algorithm(&self) -> protocol::ChecksumAlgorithm {
+        if let Some(negotiated) = &self.negotiated_algorithms {
+            negotiated.checksum
+        } else if self.protocol.uses_varint_encoding() {
+            protocol::ChecksumAlgorithm::MD5
+        } else {
+            protocol::ChecksumAlgorithm::MD4
+        }
+    }
+
+    /// Opens a source file for reading with `BufReader` buffering.
+    ///
+    /// Suitable for callers that perform many small or random reads (e.g., the
+    /// delta generator's rolling-checksum scan). For callers that manage their
+    /// own large read buffer, use [`open_source_unbuffered`](Self::open_source_unbuffered)
+    /// to avoid an extra copy layer.
+    ///
+    /// Files at or above the io_uring read threshold (1 MB) use `reader_from_path`,
+    /// which creates an io_uring-backed reader on Linux 5.6+ (respecting the
+    /// `--no-io-uring` flag) or an IOCP overlapped reader on Windows, each with
+    /// transparent std fallback. Smaller files use a standard `BufReader` to
+    /// avoid the overhead of creating a ring/completion port per file.
+    ///
+    /// When `--open-noatime` is in effect the io_uring fast path is bypassed
+    /// because `IoUringReader::open` does not accept custom open flags;
+    /// matching upstream `do_open` semantics is the user-requested invariant.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `syscall.c:228 do_open` / `syscall.c:687 do_open_nofollow` (3.4.2
+    ///   propagates `O_NOATIME` through both paths).
+    pub(crate) fn open_source_reader(
+        &self,
+        path: &std::path::Path,
+        file_size: u64,
+    ) -> std::io::Result<Box<dyn std::io::Read>> {
+        use crate::adaptive_buffer::adaptive_buffer_size;
+
+        // 1 MB threshold: io_uring ring creation has fixed overhead that only
+        // pays off for larger reads where batched syscalls reduce total cost.
+        const IO_URING_READ_THRESHOLD: u64 = 1024 * 1024;
+
+        let use_noatime = self.config.write.open_noatime;
+
+        // upstream: sender.c streams a `--copy-devices` device through the plain
+        // read path. Block/char devices report `st_size == 0`, so the io_uring
+        // fast path (which sizes reads from the fd's stat length) yields EOF at 0
+        // bytes and short-reads the stream. Force buffered I/O for devices so the
+        // full `file_size` bytes reach the wire.
+        if !use_noatime
+            && file_size >= IO_URING_READ_THRESHOLD
+            && self.config.write.io_uring_policy != fast_io::IoUringPolicy::Disabled
+            && !self.source_is_copy_device(path)
+            && !self.requires_protected_source_open()
+        {
+            // Windows gets IOCP where Linux gets io_uring, std elsewhere. The
+            // IOCP reader mirrors the disk-commit writer's dispatch: runtime
+            // `is_iocp_available()` detection with transparent std buffered
+            // fallback (see fast_io iocp::file_factory::reader_from_path and
+            // disk_commit/config.rs iocp_policy).
+            #[cfg(target_os = "windows")]
+            {
+                if let Ok(r) = fast_io::iocp_reader_from_path(path, fast_io::IocpPolicy::Auto) {
+                    return Ok(Box::new(r));
+                }
+                // Fall through to standard BufReader on IOCP failure.
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                match fast_io::reader_from_path_with_depth(
+                    path,
+                    self.config.write.io_uring_policy,
+                    self.config.write.io_uring_depth,
+                ) {
+                    Ok(r) => return Ok(Box::new(r)),
+                    Err(_) => {
+                        // Fall through to standard BufReader on io_uring failure
+                    }
+                }
+            }
+        }
+
+        let f = self.source_open().open(path)?;
+        Ok(Box::new(std::io::BufReader::with_capacity(
+            adaptive_buffer_size(file_size),
+            f,
+        )))
+    }
+
+    /// Returns whether `--copy-devices` is active and `path` is a block/char
+    /// device, i.e. a source that must be read through the plain buffered path
+    /// rather than the size-from-stat io_uring/mmap fast paths.
+    ///
+    /// The `symlink_metadata` probe runs only when `--copy-devices` is set, so
+    /// regular transfers pay no extra stat.
+    #[cfg(unix)]
+    pub(crate) fn source_is_copy_device(&self, path: &std::path::Path) -> bool {
+        use std::os::unix::fs::FileTypeExt;
+        self.config.flags.copy_devices
+            && std::fs::symlink_metadata(path).is_ok_and(|m| {
+                let ft = m.file_type();
+                ft.is_block_device() || ft.is_char_device()
+            })
+    }
+
+    /// Non-Unix stub: devices are not a distinct source kind, so nothing forces
+    /// the buffered path.
+    #[cfg(not(unix))]
+    pub(crate) fn source_is_copy_device(&self, _path: &std::path::Path) -> bool {
+        false
+    }
+
+    /// Opens a source file without intermediate buffering.
+    ///
+    /// Identical to [`open_source_reader`](Self::open_source_reader) except the
+    /// fallback path returns the raw `File` instead of wrapping it in a
+    /// `BufReader`. Callers that manage their own read buffer (e.g.,
+    /// `stream_whole_file_transfer` with its 256 KB staging buffer and
+    /// `read_exact` calls) should use this to avoid an extra memcpy per byte
+    /// through the `BufReader`'s internal buffer.
+    ///
+    /// The io_uring fast path is unchanged - it already returns a reader with
+    /// its own internal buffering strategy.
+    ///
+    /// # NSV-1
+    ///
+    /// Returns the reader together with the concrete source `RawFd` when the
+    /// fallback path opens a plain `File` (Unix only). The io_uring fast path
+    /// yields `None` for the fd because its reader owns the descriptor behind an
+    /// abstraction; a later zero-copy SERVE gate applies only to the plain-file
+    /// case. The fd is purely informational here - the byte stream is identical.
+    ///
+    /// The third tuple element is the effective source length: on the plain-file
+    /// path it is the fstat'd size (with a 0-length device resolved via
+    /// `get_device_size`), preferred over the flist scan-time length exactly as
+    /// upstream `sender.c:404-419` prefers `st.st_size`. The fast path, taken
+    /// only for a non-device regular file that follows symlinks, reports the
+    /// flist length. A device source opened without `--copy-devices` aborts the
+    /// transfer with `RERR_PROTOCOL` (a tagged `ProtocolViolation` error).
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `sender.c:404-419` - `do_fstat` + `IS_DEVICE` guard + `get_device_size`.
+    pub(crate) fn open_source_unbuffered(
+        &self,
+        path: &std::path::Path,
+        file_size: u64,
+    ) -> std::io::Result<(Box<dyn std::io::Read>, Option<SourceFd>, u64)> {
+        // 1 MB threshold: io_uring ring creation has fixed overhead that only
+        // pays off for larger reads where batched syscalls reduce total cost.
+        const IO_URING_READ_THRESHOLD: u64 = 1024 * 1024;
+
+        let use_noatime = self.config.write.open_noatime;
+
+        // upstream: `--copy-devices` streams through the plain read path; a
+        // device's stat size is 0, so the io_uring fast path would short-read.
+        // See `source_is_copy_device` / `open_source_reader`.
+        if !use_noatime
+            && file_size >= IO_URING_READ_THRESHOLD
+            && self.config.write.io_uring_policy != fast_io::IoUringPolicy::Disabled
+            && !self.source_is_copy_device(path)
+            && !self.requires_protected_source_open()
+        {
+            // Windows gets IOCP where Linux gets io_uring, std elsewhere. The
+            // IOCP reader mirrors the disk-commit writer's dispatch: runtime
+            // `is_iocp_available()` detection with transparent std buffered
+            // fallback (see fast_io iocp::file_factory::reader_from_path and
+            // disk_commit/config.rs iocp_policy).
+            #[cfg(target_os = "windows")]
+            {
+                if let Ok(r) = fast_io::iocp_reader_from_path(path, fast_io::IocpPolicy::Auto) {
+                    return Ok((Box::new(r), None, file_size));
+                }
+                // Fall through to raw File on IOCP failure.
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                match fast_io::reader_from_path_with_depth(
+                    path,
+                    self.config.write.io_uring_policy,
+                    self.config.write.io_uring_depth,
+                ) {
+                    Ok(r) => return Ok((Box::new(r), None, file_size)),
+                    Err(_) => {
+                        // Fall through to raw File on io_uring failure
+                    }
+                }
+            }
+        }
+
+        let mut f = self.source_open().open(path)?;
+        // upstream: sender.c:404-419 - fstat the opened fd, reject a device
+        // without --copy-devices, and prefer the fstat'd size (resolving a
+        // 0-length device via get_device_size) over the flist scan-time size.
+        let effective_size = self.fstat_source_guard(&mut f)?;
+        #[cfg(unix)]
+        let src_fd = Some(std::os::fd::AsRawFd::as_raw_fd(&f));
+        #[cfg(not(unix))]
+        let src_fd = None;
+        Ok((Box::new(f), src_fd, effective_size))
+    }
+
+    /// Fstats the opened source fd, enforces the sender's device guard, and
+    /// resolves the effective source length.
+    ///
+    /// `File::metadata` performs the `fstat(2)` on the already-open fd using a
+    /// safe std API (no `unsafe` in this crate). A block/char device opened
+    /// without `--copy-devices` aborts the transfer with `RERR_PROTOCOL`; a
+    /// 0-length device with `--copy-devices` has its real size resolved by
+    /// seeking to the end. Every other source reports its fstat length.
+    ///
+    /// A failed `File::metadata` (the `fstat(2)` on the just-opened fd) is fatal
+    /// and tagged as a [`SenderFstatError`]: upstream aborts the whole transfer
+    /// with `exit_cleanup(RERR_FILEIO)`, never the per-file `MSG_NO_SEND` skip
+    /// used for an *open* failure. The transfer loop routes a tagged error to a
+    /// fatal return, and its [`std::io::ErrorKind::Other`] maps to `RERR_FILEIO`
+    /// (11) via the core exit-code mapper's catch-all.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `sender.c:404-419` - `do_fstat` (exit `RERR_FILEIO` on failure),
+    ///   `IS_DEVICE(st.st_mode)` guard (`RERR_PROTOCOL`), and
+    ///   `st.st_size = get_device_size(fd, fname)` for a 0-length device.
+    fn fstat_source_guard(&self, file: &mut std::fs::File) -> std::io::Result<u64> {
+        // upstream: sender.c do_fstat - `if (do_fstat(fd, &st) != 0) { io_error
+        // |= IOERR_GENERAL; rsyserr(FERROR_XFER, errno, "fstat failed"); ...
+        // exit_cleanup(RERR_FILEIO); }`. A do_fstat failure aborts fatally, so
+        // the metadata() error is tagged rather than propagated as a plain open
+        // failure the sender would skip with MSG_NO_SEND.
+        let metadata = file.metadata().map_err(|e| sender_fstat_error(&e))?;
+        #[cfg(unix)]
+        let size = match source_device_guard(&metadata, self.config.flags.copy_devices)? {
+            Some(size) => size,
+            // upstream: sender.c:418 - st.st_size = get_device_size(fd, fname).
+            None => get_device_size(file)?,
+        };
+        #[cfg(not(unix))]
+        let size = metadata.len();
+        Ok(size)
+    }
+
+    /// Returns the upstream `missing_args` mode for ENOENT handling.
+    ///
+    /// Maps the two boolean flags to the upstream integer convention:
+    /// - `0` (default): emit `link_stat ... failed` warning, set IOERR_GENERAL
+    /// - `1` (`--ignore-missing-args`): silently skip the entry
+    /// - `2` (`--delete-missing-args`): emit mode-0 sentinel for receiver deletion
+    ///
+    /// `delete_missing_args` takes precedence when both are set.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `flist.c:send_file_list()` - `missing_args` variable (0/1/2)
+    pub(crate) fn missing_args_mode(&self) -> u8 {
+        if self.config.file_selection.delete_missing_args {
+            2
+        } else if self.config.file_selection.ignore_missing_args {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Validates that a file index is within bounds of the file list.
+    ///
+    /// upstream: sender.c:144 `flist_for_ndx()` / rsync.c:352 - an out-of-range
+    /// wire file index aborts with `exit_cleanup(RERR_PROTOCOL)` (exit 2). The
+    /// error is tagged so the core exit-code mapper yields RERR_PROTOCOL(2)
+    /// rather than RERR_STREAMIO(12).
+    pub(crate) fn validate_file_index(&self, ndx: usize) -> std::io::Result<()> {
+        if ndx >= self.file_list.len() {
+            return Err(protocol::protocol_violation(format!(
+                "invalid file index {}, file list has {} entries {}{}",
+                ndx,
+                self.file_list.len(),
+                error_location!(),
+                crate::role_trailer::sender()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Reclaims heap data from the oldest unreclaimed INC_RECURSE segment.
+    ///
+    /// Frees PathBuf, dirname Arc, and extras Box allocations for all entries
+    /// in the segment while keeping entries in place so NDX-based indexing
+    /// remains valid. Advances `first_segment_idx` to the next segment.
+    ///
+    /// No-op when there is only one segment remaining (the current segment
+    /// must not be reclaimed while the transfer loop may still access it)
+    /// or when all segments have already been reclaimed.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `flist.c:2980 flist_free()` - frees completed file list segments
+    /// - `sender.c:248` - `flist_free(first_flist)` in sender transfer loop
+    pub(crate) fn reclaim_oldest_segment(&mut self) {
+        let segments = &self.incremental.ndx_segments;
+        let first = self.incremental.first_segment_idx;
+
+        // Must have at least 2 segments to reclaim (keep the current one).
+        if first + 1 >= segments.len() {
+            return;
+        }
+
+        let start = segments[first].0;
+        let end = segments[first + 1].0;
+
+        logging::debug_log!(
+            Flist,
+            2,
+            "reclaiming segment {} entries [{start}..{end})",
+            first
+        );
+
+        self.file_list.reclaim_segment(start, end);
+        // Also reclaim the parallel source_bases entries. Point them at a single
+        // shared empty Arc so dropping the reclaimed slots releases the last
+        // reference to the segment's source base(s).
+        let empty: Arc<Path> = Arc::from(Path::new(""));
+        for base in &mut self.source_bases[start..end] {
+            *base = Arc::clone(&empty);
+        }
+        self.incremental.first_segment_idx += 1;
+    }
+}
+
+/// Joins an interned source base with an entry's relative name to reproduce the
+/// on-disk path the walk recorded.
+///
+/// The `.` transfer-root entry stores its full directory path as the base (its
+/// relative name is `.`), so it is returned unchanged rather than gaining a
+/// trailing `/.`. Every other entry pushes the name's *components* onto the
+/// base, so the platform separator is used uniformly: the wire name is
+/// `/`-separated even on Windows (the flist sorts on `/`), while the base
+/// carries native separators. Extending by component - never concatenating raw
+/// path strings - keeps the result natively separated on every platform and
+/// avoids any `/`-vs-`\` byte surgery.
+fn join_source_path(base: &Path, name: &Path) -> PathBuf {
+    if name == Path::new(".") {
+        return base.to_path_buf();
+    }
+    let mut path = base.to_path_buf();
+    path.extend(name.components());
+    path
+}
+
+/// Inner marker identifying an [`std::io::Error`] as a fatal sender fstat
+/// failure - the `fstat(2)` on the just-opened source fd itself failing.
+///
+/// Upstream's `send_files` fstats the fd and, on failure, calls
+/// `exit_cleanup(RERR_FILEIO)`: a fatal abort (exit 11), not the per-file
+/// `MSG_NO_SEND` skip used for an *open* failure. oc reaches the same
+/// classification by tagging the `File::metadata` error with this marker so the
+/// transfer loop routes it to a fatal return instead of
+/// [`GeneratorContext::record_open_failure`], while its
+/// [`std::io::ErrorKind::Other`] maps to `RERR_FILEIO` via the core exit-code
+/// mapper's catch-all arm (an untagged errno such as `EACCES` would otherwise
+/// mis-map to `RERR_FILESELECT`).
+///
+/// # Upstream Reference
+///
+/// - `sender.c` `do_fstat` - `if (do_fstat(fd, &st) != 0) { io_error |=
+///   IOERR_GENERAL; rsyserr(FERROR_XFER, errno, "fstat failed"); free_sums(s);
+///   close(fd); exit_cleanup(RERR_FILEIO); }`.
+#[derive(Debug)]
+pub(crate) struct SenderFstatError(String);
+
+impl std::fmt::Display for SenderFstatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SenderFstatError {}
+
+/// Wraps a failed source-fd `fstat` (`File::metadata`) as a fatal `RERR_FILEIO`
+/// abort tagged with [`SenderFstatError`].
+///
+/// The message mirrors upstream's `rsyserr(FERROR_XFER, errno, "fstat failed")`
+/// and carries oc's location + `[sender]` role trailer. The error's
+/// [`std::io::ErrorKind::Other`] pins the exit-code mapping to `RERR_FILEIO`
+/// regardless of the underlying errno.
+///
+/// # Upstream Reference
+///
+/// - `sender.c` `do_fstat` - `exit_cleanup(RERR_FILEIO)` on `do_fstat` failure.
+pub(crate) fn sender_fstat_error(source: &std::io::Error) -> std::io::Error {
+    std::io::Error::other(SenderFstatError(format!(
+        "fstat failed: {source} {}{}",
+        crate::role_trailer::error_location!(),
+        crate::role_trailer::sender()
+    )))
+}
+
+/// Applies the sender's device guard to an fstat'd source and reports the
+/// size to use.
+///
+/// Returns `Ok(Some(len))` for a normal source or a non-empty device (use the
+/// fstat length), `Ok(None)` for a 0-length device whose real size must be
+/// resolved with [`get_device_size`], and `Err(_)` (a tagged
+/// [`protocol::ProtocolViolation`]) when a device is opened without
+/// `--copy-devices`.
+///
+/// # Upstream Reference
+///
+/// - `sender.c:405-419` - `if (IS_DEVICE(st.st_mode)) { if (!copy_devices) ...
+///   exit_cleanup(RERR_PROTOCOL); if (st.st_size == 0) st.st_size =
+///   get_device_size(fd, fname); }`.
+#[cfg(unix)]
+fn source_device_guard(
+    metadata: &std::fs::Metadata,
+    copy_devices: bool,
+) -> std::io::Result<Option<u64>> {
+    use std::os::unix::fs::FileTypeExt;
+    let file_type = metadata.file_type();
+    if file_type.is_block_device() || file_type.is_char_device() {
+        if !copy_devices {
+            // upstream: sender.c:407-409 - rprintf(FERROR, "attempt to copy
+            // device contents without --copy-devices\n") + exit_cleanup(RERR_PROTOCOL).
+            return Err(protocol::protocol_violation(format!(
+                "attempt to copy device contents without --copy-devices {}{}",
+                crate::role_trailer::error_location!(),
+                crate::role_trailer::sender()
+            )));
+        }
+        if metadata.len() == 0 {
+            return Ok(None);
+        }
+    }
+    Ok(Some(metadata.len()))
+}
+
+/// Resolves a device's readable size by seeking to its end, then rewinds the
+/// fd so the subsequent read streams from offset 0.
+///
+/// # Upstream Reference
+///
+/// - `flist.c:1550 get_device_size` - `lseek(fd, 0, SEEK_END)` yields the
+///   size; `lseek(fd, 0, SEEK_SET)` rewinds. A seek failure logs and returns
+///   `0` upstream, so the transfer degrades to an empty stream rather than
+///   aborting; the rewind failure is likewise non-fatal.
+#[cfg(unix)]
+fn get_device_size(file: &mut std::fs::File) -> std::io::Result<u64> {
+    use std::io::{Seek, SeekFrom};
+    let size = file.seek(SeekFrom::End(0)).unwrap_or(0);
+    let _ = file.seek(SeekFrom::Start(0));
+    Ok(size)
+}
+
+/// Derives the interned base for a `(full_path, name)` pair such that
+/// [`join_source_path`]`(base, name)` reproduces `full_path`.
+///
+/// The base is `full_path` with the `name`'s components stripped from its tail -
+/// the constant source-argument directory shared by every entry of a source.
+/// [`Path::ends_with`] compares whole path components, so a `/`-separated wire
+/// name matches a natively separated on-disk path on any platform; the strip is
+/// done entirely through [`std::path::Components`], never through byte or string
+/// suffix operations (which would mis-handle `/` vs `\` on Windows). For a
+/// degenerate operand whose recorded name is not a component suffix of the
+/// on-disk path (e.g. a trailing-slash source that resolved to a non-directory),
+/// the parent directory is used instead - reconstruction then opens the same
+/// inode, matching the pre-existing behaviour for such malformed operands.
+fn derive_source_base(full: &Path, name: &Path) -> PathBuf {
+    if name == Path::new(".") {
+        return full.to_path_buf();
+    }
+    if full.ends_with(name) {
+        let keep = full.components().count() - name.components().count();
+        return full.components().take(keep).collect();
+    }
+    full.parent()
+        .map_or_else(|| full.to_path_buf(), Path::to_path_buf)
+}
+
+#[cfg(all(test, unix))]
+mod source_base_tests {
+    //! Round-trip proof that interning a source base and reconstructing
+    //! `base.join(name)` reproduces the exact on-disk path the walk recorded,
+    //! for every case that made naive "reconstruct from entry alone" fail:
+    //! multiple positional sources with distinct bases, `--files-from` `/./`
+    //! anchors, daemon module roots, and arbitrarily nested names. Unix-gated
+    //! so the byte-for-byte assertions use forward-slash literals; the derive
+    //! itself is separator-agnostic (it strips/re-joins native components).
+    use super::{derive_source_base, join_source_path};
+    use std::path::Path;
+
+    fn round_trips(full: &str, name: &str) {
+        let full_p = Path::new(full);
+        let base = derive_source_base(full_p, Path::new(name));
+        let rebuilt = join_source_path(&base, Path::new(name));
+        assert_eq!(
+            rebuilt.as_os_str().as_encoded_bytes(),
+            full_p.as_os_str().as_encoded_bytes(),
+            "reconstructed path for name {name:?} under {full:?} diverged: got {rebuilt:?}"
+        );
+    }
+
+    #[test]
+    fn single_source_nested_names_round_trip() {
+        // rsync /srv/data/ dst : one base, arbitrarily nested wire names.
+        round_trips("/srv/data/file.txt", "file.txt");
+        round_trips("/srv/data/sub/file.txt", "sub/file.txt");
+        round_trips("/srv/data/a/b/c/d/e.bin", "a/b/c/d/e.bin");
+    }
+
+    #[test]
+    fn multi_source_distinct_bases_round_trip() {
+        // rsync /a/foo /b/bar dst : each positional keeps its own base, and the
+        // wire name (basename) alone cannot recover it - the stored base must.
+        round_trips("/a/foo", "foo");
+        round_trips("/b/bar", "bar");
+        // Two sources whose basenames collide but live under different bases.
+        round_trips("/one/data/x/y", "x/y");
+        round_trips("/two/data/x/y", "x/y");
+    }
+
+    #[test]
+    fn files_from_dot_anchor_round_trip() {
+        // --files-from with `from/./dir/sub` : base is everything before /./,
+        // the wire name is everything after.
+        round_trips("/export/from/dir/sub", "dir/sub");
+        round_trips("/export/from/dir/sub/leaf.dat", "dir/sub/leaf.dat");
+    }
+
+    #[test]
+    fn absolute_and_bare_bases_round_trip() {
+        // Absolute source with `/` base (receiver strips the leading slash).
+        round_trips("/foo/bar", "foo/bar");
+        // Bare relative basename: empty base, name == full.
+        round_trips("file", "file");
+        round_trips("rel/dir/file", "rel/dir/file");
+    }
+
+    #[test]
+    fn dot_transfer_root_entry_round_trips() {
+        // The "." transfer-root entry stores its full directory as the base and
+        // must not gain a trailing "/.".
+        let base = derive_source_base(Path::new("/srv/data"), Path::new("."));
+        assert_eq!(base, Path::new("/srv/data"));
+        assert_eq!(
+            join_source_path(&base, Path::new(".")),
+            Path::new("/srv/data")
+        );
+    }
+
+    #[test]
+    fn same_base_derives_identical_value_for_sharing() {
+        // Every entry of one source derives the identical base value, which is
+        // what lets the one-entry interning cache collapse them onto a single
+        // Arc allocation.
+        let a = derive_source_base(Path::new("/srv/data/x/y"), Path::new("x/y"));
+        let b = derive_source_base(Path::new("/srv/data/z"), Path::new("z"));
+        let c = derive_source_base(
+            Path::new("/srv/data/deep/nested/f"),
+            Path::new("deep/nested/f"),
+        );
+        assert_eq!(a, Path::new("/srv/data"));
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+    }
+
+    #[test]
+    fn degenerate_trailing_slash_file_reconstructs_same_inode() {
+        // A trailing-slash source that resolved to a non-directory: the trailing
+        // slash sits after the name and is dropped by component handling, so the
+        // reconstruction loses it but opens the same inode.
+        let base = derive_source_base(Path::new("/srv/mod/file/"), Path::new("file"));
+        assert_eq!(base, Path::new("/srv/mod"));
+        assert_eq!(
+            join_source_path(&base, Path::new("file")),
+            Path::new("/srv/mod/file")
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod source_base_windows_tests {
+    //! Windows regression coverage: the wire name is `/`-separated (the flist
+    //! sorts on `/`) while the on-disk path uses `\`. A byte- or string-based
+    //! suffix strip mis-derives the base here, so this must run in Windows CI.
+    use super::{derive_source_base, join_source_path};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn forward_slash_wire_name_over_backslash_path_round_trips() {
+        // Exact shape of the failing push: name `dir/file`, on-disk `C:\src\dir\file`.
+        let full = Path::new(r"C:\src\dir\file");
+        let name = Path::new("dir/file");
+        let base = derive_source_base(full, name);
+        assert_eq!(base, Path::new(r"C:\src"));
+        let rebuilt = join_source_path(&base, name);
+        // Reconstructed natively and byte-for-byte equal to the original path.
+        assert_eq!(rebuilt, PathBuf::from(r"C:\src\dir\file"));
+        assert_eq!(
+            rebuilt.as_os_str().as_encoded_bytes(),
+            full.as_os_str().as_encoded_bytes(),
+        );
+    }
+
+    #[test]
+    fn deep_forward_slash_name_round_trips() {
+        let full = Path::new(r"C:\a\b\c\d\e.bin");
+        let name = Path::new("b/c/d/e.bin");
+        let base = derive_source_base(full, name);
+        assert_eq!(base, Path::new(r"C:\a"));
+        assert_eq!(
+            join_source_path(&base, name),
+            PathBuf::from(r"C:\a\b\c\d\e.bin"),
+        );
+    }
+
+    #[test]
+    fn top_level_backslash_name_round_trips() {
+        // A top-level entry: on-disk `\` name, wire `/` (single component here).
+        let full = Path::new(r"C:\srv\module\foo");
+        let name = Path::new("foo");
+        let base = derive_source_base(full, name);
+        assert_eq!(base, Path::new(r"C:\srv\module"));
+        assert_eq!(
+            join_source_path(&base, name),
+            PathBuf::from(r"C:\srv\module\foo"),
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod device_guard_tests {
+    //! Sender device guard (`sender.c:405-419`): a device source without
+    //! `--copy-devices` must abort with `RERR_PROTOCOL`, a device with
+    //! `--copy-devices` defers to `get_device_size`, and a regular file
+    //! reports its fstat length.
+    use super::source_device_guard;
+
+    /// WHY: without `--copy-devices` upstream refuses to stream device
+    /// contents and `exit_cleanup(RERR_PROTOCOL)`. The guard must surface a
+    /// `ProtocolViolation` so the core mapper returns exit 2, not a silent
+    /// device read.
+    #[test]
+    fn char_device_without_copy_devices_is_refused() {
+        let metadata = std::fs::metadata("/dev/null").expect("/dev/null present");
+        assert!(
+            metadata.file_type_is_device(),
+            "/dev/null must be a character device for this test to mean anything"
+        );
+        let err = source_device_guard(&metadata, false)
+            .expect_err("a device without --copy-devices must abort");
+        assert!(
+            err.get_ref()
+                .is_some_and(|inner| inner.is::<protocol::ProtocolViolation>()),
+            "the device guard must raise a ProtocolViolation (RERR_PROTOCOL), got: {err}"
+        );
+    }
+
+    /// With `--copy-devices` a 0-length device defers size resolution to
+    /// `get_device_size` (upstream `sender.c:418`), signalled by `Ok(None)`.
+    #[test]
+    fn char_device_with_copy_devices_defers_size_resolution() {
+        let metadata = std::fs::metadata("/dev/null").expect("/dev/null present");
+        assert_eq!(source_device_guard(&metadata, true).unwrap(), None);
+    }
+
+    /// A regular file reports its fstat length regardless of `--copy-devices`.
+    #[test]
+    fn regular_file_reports_fstat_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"12345").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(source_device_guard(&metadata, false).unwrap(), Some(5));
+    }
+
+    /// Local extension trait so the test can assert `/dev/null` really is a
+    /// device without importing `FileTypeExt` at module scope.
+    trait FileTypeIsDevice {
+        fn file_type_is_device(&self) -> bool;
+    }
+    impl FileTypeIsDevice for std::fs::Metadata {
+        fn file_type_is_device(&self) -> bool {
+            use std::os::unix::fs::FileTypeExt;
+            let ft = self.file_type();
+            ft.is_block_device() || ft.is_char_device()
+        }
+    }
+}

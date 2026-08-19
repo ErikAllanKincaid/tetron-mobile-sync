@@ -1,0 +1,768 @@
+#![deny(unsafe_code)]
+
+use std::ffi::OsString;
+use std::io::Write;
+use std::num::{NonZeroU8, NonZeroU32};
+
+use compress::algorithm::CompressionAlgorithm;
+use compress::zlib::CompressionLevel;
+use core::client::{
+    BandwidthLimit, CompressionSetting, SkipCompressList, parse_skip_compress_list,
+    skip_compress_from_env,
+};
+use logging_sink::MessageSink;
+
+use super::super::{
+    empty_size_means_zero, parse_bandwidth_limit, parse_block_size_argument, parse_compress_choice,
+    parse_compress_level, parse_compress_threads, parse_debug_flags, parse_info_flags,
+    parse_max_alloc_argument, parse_max_delete_argument, parse_modify_window_argument,
+    parse_size_limit_argument,
+};
+use super::messages::fail_with_message;
+use crate::frontend::{
+    arguments::BandwidthArgument,
+    defaults::ITEMIZE_CHANGES_FORMAT,
+    execution::{CompressChoice, CompressLevelArg, DEBUG_HELP_TEXT, INFO_HELP_TEXT},
+    out_format::{OutFormat, parse_out_format},
+    progress::{NameOutputLevel, ProgressMode, ProgressSetting},
+};
+
+/// Inputs used to derive execution settings that require additional parsing.
+pub(crate) struct SettingsInputs<'a> {
+    pub(crate) info: &'a [OsString],
+    pub(crate) debug: &'a [OsString],
+    pub(crate) itemize_changes: bool,
+    pub(crate) out_format: Option<&'a OsString>,
+    pub(crate) initial_progress: ProgressSetting,
+    pub(crate) initial_stats_level: u8,
+    pub(crate) initial_name_level: NameOutputLevel,
+    pub(crate) initial_name_overridden: bool,
+    pub(crate) bwlimit: &'a Option<BandwidthArgument>,
+    pub(crate) max_delete: &'a Option<OsString>,
+    pub(crate) min_size: &'a Option<OsString>,
+    pub(crate) max_size: &'a Option<OsString>,
+    pub(crate) block_size: &'a Option<OsString>,
+    pub(crate) max_alloc: &'a Option<OsString>,
+    pub(crate) modify_window: &'a Option<OsString>,
+    pub(crate) compress_flag: bool,
+    pub(crate) no_compress: bool,
+    pub(crate) compress_level: &'a Option<OsString>,
+    pub(crate) compress_choice: &'a Option<OsString>,
+    pub(crate) compress_threads: &'a Option<OsString>,
+    pub(crate) skip_compress: &'a Option<OsString>,
+    pub(crate) log_file: Option<&'a OsString>,
+    pub(crate) log_file_format: Option<&'a OsString>,
+}
+
+/// Derived execution settings gathered from [`derive_settings`].
+pub(crate) struct DerivedSettings {
+    pub(crate) out_format_template: Option<OutFormat>,
+    pub(crate) progress_mode: Option<ProgressMode>,
+    pub(crate) stats_level: u8,
+    pub(crate) name_level: NameOutputLevel,
+    pub(crate) name_overridden: bool,
+    /// `--info=copy`: opt-in to the oc-rsync `Copy method` stats line.
+    pub(crate) show_copy_method: bool,
+    pub(crate) debug_flags_list: Vec<OsString>,
+    /// Explicitly-set `--info` categories as normalized `name{level}` tokens,
+    /// forwarded to a remote peer (upstream `make_output_option`).
+    pub(crate) info_flags_list: Vec<OsString>,
+    pub(crate) bandwidth_limit: Option<BandwidthLimit>,
+    pub(crate) max_delete_limit: Option<u64>,
+    pub(crate) min_size_limit: Option<u64>,
+    pub(crate) max_size_limit: Option<u64>,
+    pub(crate) block_size_override: Option<NonZeroU32>,
+    pub(crate) max_alloc_limit: Option<u64>,
+    pub(crate) modify_window_setting: Option<i64>,
+    pub(crate) compress: bool,
+    pub(crate) compression_level_override: Option<CompressionLevel>,
+    pub(crate) skip_compress_list: Option<SkipCompressList>,
+    /// Raw `--skip-compress` spec forwarded to the remote sender; `Some` only
+    /// when explicitly set (CLI or `RSYNC_SKIP_COMPRESS`).
+    pub(crate) skip_compress_spec: Option<String>,
+    pub(crate) compression_setting: CompressionSetting,
+    pub(crate) compression_algorithm: Option<CompressionAlgorithm>,
+    /// Raw `--compress-choice` name preserved for the `--debug=NSTR` summary
+    /// (e.g. `"zlibx"`, which the algorithm enum folds onto `Zlib`).
+    pub(crate) compress_choice_name: Option<String>,
+    pub(crate) compression_threads: Option<NonZeroU8>,
+    pub(crate) log_file_path: Option<OsString>,
+    pub(crate) log_file_template: Option<OutFormat>,
+}
+
+/// Outcome of parsing additional execution settings.
+pub(crate) enum SettingsOutcome {
+    /// Parsing produced fully-resolved settings.
+    Proceed(Box<DerivedSettings>),
+    /// Parsing requested an early exit with the supplied exit code.
+    Exit(i32),
+}
+
+/// Result of parsing info flags.
+struct InfoFlagsResult {
+    progress_setting: ProgressSetting,
+    stats_level: u8,
+    name_level: NameOutputLevel,
+    name_overridden: bool,
+    /// `--info=copy`: opt-in to the oc-rsync `Copy method` stats line.
+    show_copy_method: bool,
+    /// Explicitly-set `--info` categories as normalized `name{level}` tokens,
+    /// forwarded to a remote peer (upstream `make_output_option`).
+    info_flags_list: Vec<OsString>,
+}
+
+/// Applies upstream's `--progress` ⇒ `--info=name` implication.
+///
+/// upstream: options.c:2351-2355 - when the `--progress`/`-P` flag set
+/// `do_progress` (and the run is not a server), an unset NAME level is bumped to
+/// 1 via `parse_output_words("name", DEFAULT_PRIORITY)`. That `DEFAULT_PRIORITY`
+/// assignment cannot override a USER_PRIORITY one, so an explicit `--info=name0`
+/// / `--info=none` (tracked here by `name_overridden`) blocks the bump.
+///
+/// `initial_progress` is the faithful `do_progress` proxy: it reflects the
+/// `--progress`/`-P` flag only, NOT `--info=progress2` (Overall), which sets the
+/// progress info level without setting `do_progress` - upstream prints no names
+/// for `--info=progress2`.
+fn imply_name_from_progress(
+    initial_progress: ProgressSetting,
+    name_level: NameOutputLevel,
+    name_overridden: bool,
+) -> NameOutputLevel {
+    if !matches!(
+        initial_progress,
+        ProgressSetting::Disabled | ProgressSetting::Unspecified
+    ) && matches!(name_level, NameOutputLevel::Disabled)
+        && !name_overridden
+    {
+        NameOutputLevel::UpdatedOnly
+    } else {
+        name_level
+    }
+}
+
+/// Parses --info flags and returns display settings.
+fn parse_info_settings<Out, Err>(
+    stdout: &mut Out,
+    stderr: &mut MessageSink<Err>,
+    info_args: &[OsString],
+    initial_progress: ProgressSetting,
+    initial_stats_level: u8,
+    initial_name_level: NameOutputLevel,
+    initial_name_overridden: bool,
+) -> Result<InfoFlagsResult, i32>
+where
+    Out: Write,
+    Err: Write,
+{
+    let mut progress_setting = initial_progress;
+    let mut stats_level = initial_stats_level;
+    let mut name_level = initial_name_level;
+    let mut name_overridden = initial_name_overridden;
+
+    if info_args.is_empty() {
+        let name_level = imply_name_from_progress(initial_progress, name_level, name_overridden);
+        return Ok(InfoFlagsResult {
+            progress_setting,
+            stats_level,
+            name_level,
+            name_overridden,
+            show_copy_method: false,
+            info_flags_list: Vec::new(),
+        });
+    }
+
+    match parse_info_flags(info_args) {
+        Ok(settings) => {
+            if settings.help_requested {
+                if stdout.write_all(INFO_HELP_TEXT.as_bytes()).is_err() {
+                    let _ = write!(stderr.writer_mut(), "{INFO_HELP_TEXT}");
+                    return Err(1);
+                }
+                return Err(0);
+            }
+
+            match settings.progress {
+                ProgressSetting::Unspecified => {}
+                value => progress_setting = value,
+            }
+            // upstream: options.c parse_output_words assigns the level verbatim
+            // (clamped to MAX_OUT_LEVEL). `--info=statsN` therefore overrides
+            // the legacy `--stats` flag's default level instead of OR-ing with it.
+            if let Some(level) = settings.stats {
+                stats_level = level;
+            }
+            if let Some(level) = settings.name {
+                name_level = level;
+                name_overridden = true;
+            }
+
+            // Apply the fully-resolved per-flag levels to the thread-local
+            // VerbosityConfig. Resolving first is what lets composite tokens
+            // like "all", "none", and bare numeric levels take effect; a
+            // token-by-token apply cannot decode them.
+            // upstream: options.c set_output_verbosity / parse_output_words
+            settings.apply_to_thread_local();
+
+            // upstream: options.c:2947 make_output_option() - forward the
+            // explicitly-set info categories to the peer. Normalize to
+            // `name{level}` tokens; the remote builders apply the role `where`
+            // filter.
+            let info_flags_list = settings
+                .iter_enabled_flags()
+                .into_iter()
+                .map(|(name, level)| OsString::from(format!("{name}{level}")))
+                .collect();
+
+            let name_level =
+                imply_name_from_progress(initial_progress, name_level, name_overridden);
+            Ok(InfoFlagsResult {
+                progress_setting,
+                stats_level,
+                name_level,
+                name_overridden,
+                show_copy_method: settings.copy.is_some_and(|level| level > 0),
+                info_flags_list,
+            })
+        }
+        Err(message) => Err(fail_with_message(message, stderr)),
+    }
+}
+
+/// Parses --debug flags and returns debug flag list.
+fn parse_debug_settings<Out, Err>(
+    stdout: &mut Out,
+    stderr: &mut MessageSink<Err>,
+    debug_args: &[OsString],
+) -> Result<Vec<OsString>, i32>
+where
+    Out: Write,
+    Err: Write,
+{
+    if debug_args.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    match parse_debug_flags(debug_args) {
+        Ok(settings) => {
+            if settings.help_requested {
+                if stdout.write_all(DEBUG_HELP_TEXT.as_bytes()).is_err() {
+                    let _ = write!(stderr.writer_mut(), "{DEBUG_HELP_TEXT}");
+                    return Err(1);
+                }
+                return Err(0);
+            }
+
+            let flags: Vec<OsString> = settings
+                .iter_enabled_flags()
+                .map(|(name, level)| OsString::from(format!("{name}{level}")))
+                .collect();
+
+            for debug_arg in debug_args {
+                if let Some(s) = debug_arg.to_str() {
+                    for token in s.split(',') {
+                        let token = token.trim();
+                        if !token.is_empty() && token != "help" {
+                            let _ = logging::apply_debug_flag(token);
+                        }
+                    }
+                }
+            }
+
+            Ok(flags)
+        }
+        Err(message) => Err(fail_with_message(message, stderr)),
+    }
+}
+
+/// Result of parsing size/limit arguments.
+struct SizeLimitsResult {
+    bandwidth_limit: Option<BandwidthLimit>,
+    max_delete_limit: Option<u64>,
+    min_size_limit: Option<u64>,
+    max_size_limit: Option<u64>,
+    block_size_override: Option<NonZeroU32>,
+    max_alloc_limit: Option<u64>,
+    modify_window_setting: Option<i64>,
+}
+
+/// Input parameters for size/limit parsing, grouped to reduce argument count.
+struct SizeLimitsInputs<'a> {
+    bwlimit: &'a Option<BandwidthArgument>,
+    max_delete: &'a Option<OsString>,
+    min_size: &'a Option<OsString>,
+    max_size: &'a Option<OsString>,
+    block_size: &'a Option<OsString>,
+    max_alloc: &'a Option<OsString>,
+    modify_window: &'a Option<OsString>,
+}
+
+/// Parses bandwidth and size limit arguments.
+fn parse_size_limits<Err>(
+    stderr: &mut MessageSink<Err>,
+    inputs: SizeLimitsInputs<'_>,
+) -> Result<SizeLimitsResult, i32>
+where
+    Err: Write,
+{
+    let bandwidth_limit = match inputs.bwlimit.as_ref() {
+        Some(BandwidthArgument::Limit(value)) => match parse_bandwidth_limit(value.as_os_str()) {
+            Ok(limit) => limit,
+            Err(message) => return Err(fail_with_message(message, stderr)),
+        },
+        Some(BandwidthArgument::Disabled) | None => None,
+    };
+
+    let max_delete_limit = match inputs.max_delete {
+        Some(value) => match parse_max_delete_argument(value.as_os_str()) {
+            Ok(limit) => Some(limit),
+            Err(message) => return Err(fail_with_message(message, stderr)),
+        },
+        None => None,
+    };
+
+    let min_size_limit = match inputs.min_size.as_ref() {
+        Some(value) => {
+            match parse_size_limit_argument(empty_size_means_zero(value.as_os_str()), "--min-size")
+            {
+                Ok(limit) => Some(limit),
+                Err(message) => return Err(fail_with_message(message, stderr)),
+            }
+        }
+        None => None,
+    };
+
+    let max_size_limit = match inputs.max_size.as_ref() {
+        Some(value) => {
+            match parse_size_limit_argument(empty_size_means_zero(value.as_os_str()), "--max-size")
+            {
+                Ok(limit) => Some(limit),
+                Err(message) => return Err(fail_with_message(message, stderr)),
+            }
+        }
+        None => None,
+    };
+
+    // upstream: options.c:1692-1695 - `--block-size=0` yields no override and
+    // falls back to the default, so a `None` here covers both "unset" and
+    // "explicit 0".
+    let block_size_override = match inputs.block_size.as_ref() {
+        Some(value) => match parse_block_size_argument(value.as_os_str()) {
+            Ok(size) => size,
+            Err(message) => return Err(fail_with_message(message, stderr)),
+        },
+        None => None,
+    };
+
+    let max_alloc_limit = match inputs.max_alloc.as_ref() {
+        Some(value) => match parse_max_alloc_argument(value.as_os_str()) {
+            Ok(limit) => Some(limit),
+            Err(message) => return Err(fail_with_message(message, stderr)),
+        },
+        None => None,
+    };
+
+    let modify_window_setting = match inputs.modify_window.as_ref() {
+        Some(value) => match parse_modify_window_argument(value.as_os_str()) {
+            Ok(window) => Some(window),
+            Err(message) => return Err(fail_with_message(message, stderr)),
+        },
+        None => None,
+    };
+
+    Ok(SizeLimitsResult {
+        bandwidth_limit,
+        max_delete_limit,
+        min_size_limit,
+        max_size_limit,
+        block_size_override,
+        max_alloc_limit,
+        modify_window_setting,
+    })
+}
+
+/// Result of parsing compression settings.
+struct CompressionResult {
+    compress: bool,
+    compression_level_override: Option<CompressionLevel>,
+    skip_compress_list: Option<SkipCompressList>,
+    skip_compress_spec: Option<String>,
+    compression_setting: CompressionSetting,
+    compression_algorithm: Option<CompressionAlgorithm>,
+    /// Raw `--compress-choice` name (trimmed, lowercased) preserved for the
+    /// `--debug=NSTR` summary. `CompressionAlgorithm` folds `zlibx` onto
+    /// `Zlib`, so this retains the exact token upstream prints
+    /// (`compat.c:206-219`).
+    compress_choice_name: Option<String>,
+    compression_threads: Option<NonZeroU8>,
+}
+
+/// Parses all compression-related settings.
+fn parse_compression_settings<Err>(
+    stderr: &mut MessageSink<Err>,
+    compress_flag: bool,
+    no_compress: bool,
+    compress_level: &Option<OsString>,
+    compress_choice: &Option<OsString>,
+    compress_threads: &Option<OsString>,
+    skip_compress: &Option<OsString>,
+) -> Result<CompressionResult, i32>
+where
+    Err: Write,
+{
+    let compression_threads = match compress_threads.as_ref() {
+        Some(value) => match parse_compress_threads(value.as_os_str()) {
+            Ok(threads) => threads,
+            Err(message) => return Err(fail_with_message(message, stderr)),
+        },
+        None => None,
+    };
+    let mut compress = compress_flag;
+    let mut compression_level_override = None;
+    let mut compression_algorithm = None;
+    let mut compress_choice_name = None;
+    let mut compress_level_setting: Option<CompressLevelArg> = None;
+    let mut compress_disabled_by_choice = false;
+
+    // Parse `--compress-choice` before `--compress-level` so the level is
+    // clamped against the selected codec's range. This mirrors upstream, where
+    // `token.c:init_compression_level()` runs once `do_compression` is known.
+    if let Some(choice) = compress_choice.as_ref() {
+        match parse_compress_choice(choice.as_os_str()) {
+            Ok(CompressChoice::Disabled) => {
+                compress = false;
+                compression_level_override = None;
+                compress_level_setting = Some(CompressLevelArg::Disable);
+                compress_disabled_by_choice = true;
+            }
+            // upstream: options.c:2013-2016 - `--compress-choice=auto` is nulled
+            // out, so it behaves as if `--compress-choice` had not been given:
+            // no forced codec, no disable, normal negotiation.
+            Ok(CompressChoice::Auto) => {}
+            Ok(CompressChoice::Codec(algorithm)) => {
+                compression_algorithm = Some(algorithm);
+                // upstream: compat.c:216-219 prints the user's verbatim
+                // compress_choice; retain the trimmed/lowercased token so
+                // `zlibx` survives (it folds onto `Zlib` in the enum).
+                compress_choice_name = Some(choice.to_string_lossy().trim().to_ascii_lowercase());
+                if !no_compress {
+                    compress = true;
+                }
+            }
+            Err(message) => return Err(fail_with_message(message, stderr)),
+        }
+    }
+
+    // upstream: compat.c:820 parse_compress_choice(1) calls
+    // init_compression_level() (token.c:55) AFTER negotiate_the_strings()
+    // (compat.c:809). When --compress-choice fixed the codec its range is known
+    // now, so clamp against it (level 0 disables zlib/zlibx). Otherwise the
+    // negotiated codec - and whether level 0 means "off" - is unknown until
+    // negotiation, so pass `None`: the raw level is carried forward and the
+    // off_level decision deferred to the post-negotiation resolution in the
+    // transfer layer, matching upstream ordering.
+    if !compress_disabled_by_choice && let Some(value) = compress_level {
+        match parse_compress_level(value.as_os_str(), compression_algorithm) {
+            Ok(setting) => compress_level_setting = Some(setting),
+            Err(message) => return Err(fail_with_message(message, stderr)),
+        }
+    }
+
+    if let Some(ref setting) = compress_level_setting {
+        match setting {
+            CompressLevelArg::Disable => {
+                compress = false;
+            }
+            CompressLevelArg::Level(level) => {
+                if !no_compress {
+                    compress = true;
+                    compression_level_override = Some(*level);
+                }
+            }
+        }
+    }
+
+    // upstream: options.c:150 - the `skip_compress` global is NULL unless the
+    // `--skip-compress` option is given, and only that explicit value is
+    // forwarded to the remote sender (options.c:2858-2860). The
+    // `RSYNC_SKIP_COMPRESS` environment fallback is an oc extension that still
+    // applies locally, but - like upstream - it is not forwarded on the wire.
+    let mut skip_compress_spec = None;
+    let skip_compress_list = if let Some(value) = skip_compress.as_ref() {
+        match parse_skip_compress_list(value.as_os_str()) {
+            Ok(list) => {
+                skip_compress_spec = Some(value.to_string_lossy().into_owned());
+                Some(list)
+            }
+            Err(message) => return Err(fail_with_message(message, stderr)),
+        }
+    } else {
+        match skip_compress_from_env("RSYNC_SKIP_COMPRESS") {
+            Ok(value) => value,
+            Err(message) => return Err(fail_with_message(message, stderr)),
+        }
+    };
+
+    let compression_setting = match compress_level_setting {
+        Some(CompressLevelArg::Disable) => CompressionSetting::disabled(),
+        Some(CompressLevelArg::Level(level)) => CompressionSetting::level(level),
+        None => CompressionSetting::default(),
+    };
+
+    Ok(CompressionResult {
+        compress,
+        compression_level_override,
+        skip_compress_list,
+        skip_compress_spec,
+        compression_setting,
+        compression_algorithm,
+        compress_choice_name,
+        compression_threads,
+    })
+}
+
+/// Result of parsing log file settings.
+struct LogFileResult {
+    log_file_path: Option<OsString>,
+    log_file_template: Option<OutFormat>,
+}
+
+/// Parses log file path and format settings.
+fn parse_log_settings<Err>(
+    stderr: &mut MessageSink<Err>,
+    log_file: Option<&OsString>,
+    log_file_format: Option<&OsString>,
+) -> Result<LogFileResult, i32>
+where
+    Err: Write,
+{
+    match log_file {
+        Some(path) => {
+            let format_string = if let Some(spec) = log_file_format {
+                spec.clone()
+            } else {
+                OsString::from("%i %n%L")
+            };
+
+            match parse_out_format(format_string.as_os_str()) {
+                Ok(template) => Ok(LogFileResult {
+                    log_file_path: Some(path.clone()),
+                    log_file_template: Some(template),
+                }),
+                Err(message) => Err(fail_with_message(message, stderr)),
+            }
+        }
+        None => Ok(LogFileResult {
+            log_file_path: None,
+            log_file_template: None,
+        }),
+    }
+}
+
+/// Parses out format template from CLI arguments.
+fn parse_out_format_template<Err>(
+    stderr: &mut MessageSink<Err>,
+    out_format: Option<&OsString>,
+    itemize_changes: bool,
+) -> Result<Option<OutFormat>, i32>
+where
+    Err: Write,
+{
+    let template = match out_format {
+        Some(value) => match parse_out_format(value.as_os_str()) {
+            Ok(template) => Some(template),
+            Err(message) => return Err(fail_with_message(message, stderr)),
+        },
+        None => None,
+    };
+
+    if itemize_changes && template.is_none() {
+        Ok(Some(
+            parse_out_format(OsString::from(ITEMIZE_CHANGES_FORMAT).as_os_str())
+                .expect("default itemize-changes format parses"),
+        ))
+    } else {
+        Ok(template)
+    }
+}
+
+/// Parses advanced execution settings derived from CLI flags.
+pub(crate) fn derive_settings<Out, Err>(
+    stdout: &mut Out,
+    stderr: &mut MessageSink<Err>,
+    inputs: SettingsInputs<'_>,
+) -> SettingsOutcome
+where
+    Out: Write,
+    Err: Write,
+{
+    let out_format_template =
+        match parse_out_format_template(stderr, inputs.out_format, inputs.itemize_changes) {
+            Ok(template) => template,
+            Err(code) => return SettingsOutcome::Exit(code),
+        };
+
+    let info_result = match parse_info_settings(
+        stdout,
+        stderr,
+        inputs.info,
+        inputs.initial_progress,
+        inputs.initial_stats_level,
+        inputs.initial_name_level,
+        inputs.initial_name_overridden,
+    ) {
+        Ok(result) => result,
+        Err(code) => return SettingsOutcome::Exit(code),
+    };
+
+    let debug_flags_list = match parse_debug_settings(stdout, stderr, inputs.debug) {
+        Ok(flags) => flags,
+        Err(code) => return SettingsOutcome::Exit(code),
+    };
+
+    let limits = match parse_size_limits(
+        stderr,
+        SizeLimitsInputs {
+            bwlimit: inputs.bwlimit,
+            max_delete: inputs.max_delete,
+            min_size: inputs.min_size,
+            max_size: inputs.max_size,
+            block_size: inputs.block_size,
+            max_alloc: inputs.max_alloc,
+            modify_window: inputs.modify_window,
+        },
+    ) {
+        Ok(limits) => limits,
+        Err(code) => return SettingsOutcome::Exit(code),
+    };
+
+    let compression = match parse_compression_settings(
+        stderr,
+        inputs.compress_flag,
+        inputs.no_compress,
+        inputs.compress_level,
+        inputs.compress_choice,
+        inputs.compress_threads,
+        inputs.skip_compress,
+    ) {
+        Ok(result) => result,
+        Err(code) => return SettingsOutcome::Exit(code),
+    };
+
+    let log = match parse_log_settings(stderr, inputs.log_file, inputs.log_file_format) {
+        Ok(result) => result,
+        Err(code) => return SettingsOutcome::Exit(code),
+    };
+
+    SettingsOutcome::Proceed(Box::new(DerivedSettings {
+        out_format_template,
+        progress_mode: info_result.progress_setting.resolved(),
+        stats_level: info_result.stats_level,
+        name_level: info_result.name_level,
+        name_overridden: info_result.name_overridden,
+        show_copy_method: info_result.show_copy_method,
+        debug_flags_list,
+        info_flags_list: info_result.info_flags_list,
+        bandwidth_limit: limits.bandwidth_limit,
+        max_delete_limit: limits.max_delete_limit,
+        min_size_limit: limits.min_size_limit,
+        max_size_limit: limits.max_size_limit,
+        block_size_override: limits.block_size_override,
+        max_alloc_limit: limits.max_alloc_limit,
+        modify_window_setting: limits.modify_window_setting,
+        compress: compression.compress,
+        compression_level_override: compression.compression_level_override,
+        skip_compress_list: compression.skip_compress_list,
+        skip_compress_spec: compression.skip_compress_spec,
+        compression_setting: compression.compression_setting,
+        compression_algorithm: compression.compression_algorithm,
+        compress_choice_name: compression.compress_choice_name,
+        compression_threads: compression.compression_threads,
+        log_file_path: log.log_file_path,
+        log_file_template: log.log_file_template,
+    }))
+}
+
+#[cfg(test)]
+mod compression_defer_tests {
+    use super::*;
+
+    fn parse(
+        compress_flag: bool,
+        no_compress: bool,
+        level: Option<&str>,
+        choice: Option<&str>,
+    ) -> CompressionResult {
+        let mut stderr = MessageSink::new(Vec::<u8>::new());
+        parse_compression_settings(
+            &mut stderr,
+            compress_flag,
+            no_compress,
+            &level.map(OsString::from),
+            &choice.map(OsString::from),
+            &None,
+            &None,
+        )
+        .expect("compression settings parse")
+    }
+
+    /// `-z --compress-level=0` with no `--compress-choice` must NOT disable
+    /// compression at parse time. Upstream defers the off_level decision to the
+    /// negotiated codec: `init_compression_level()` (token.c:76-98) runs from
+    /// `parse_compress_choice(1)` (compat.c:820) only after
+    /// `negotiate_the_strings()` (compat.c:809). Even though the preliminary
+    /// arg-layer estimate collapses level 0 against zlib (`compress_flag =
+    /// false`), the authoritative parse keeps compression on, leaves the codec
+    /// unresolved, and carries the raw level (0) forward for post-negotiation
+    /// resolution.
+    #[test]
+    fn level_zero_without_choice_defers_instead_of_disabling() {
+        let result = parse(false, false, Some("0"), None);
+        assert!(
+            result.compress,
+            "level 0 without a codec must keep compression on until negotiation"
+        );
+        assert!(
+            result.compression_algorithm.is_none(),
+            "no --compress-choice means the codec stays unresolved"
+        );
+        assert!(
+            result.compression_setting.is_enabled(),
+            "the deferred setting is enabled, not disabled"
+        );
+        // Raw level 0 is carried forward (CompressionLevel::None round-trips to 0
+        // via from_signed) so it forwards as --compress-level=0 to the peer.
+        assert!(matches!(
+            result.compression_level_override,
+            Some(CompressionLevel::None | CompressionLevel::PreciseSigned(0))
+        ));
+    }
+
+    /// Control: an explicit `--compress-choice=zstd --compress-level=0` is
+    /// resolved against the known codec at parse time and must stay on at zstd's
+    /// default level (3), never deferred or disabled. upstream: token.c:75-78 -
+    /// zstd maps a literal 0 to `ZSTD_CLEVEL_DEFAULT`.
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn explicit_zstd_level_zero_resolves_to_default() {
+        let result = parse(false, false, Some("0"), Some("zstd"));
+        assert!(result.compress);
+        assert_eq!(
+            result.compression_algorithm,
+            Some(CompressionAlgorithm::Zstd)
+        );
+        assert!(matches!(
+            result.compression_level_override,
+            Some(CompressionLevel::Precise(n)) if n.get() == 3
+        ));
+    }
+
+    /// Control: an explicit `--compress-choice=zlib --compress-level=0` hits
+    /// zlib's off_level (0) at parse time and disables compression - the
+    /// explicit-codec path is unchanged. upstream: token.c:66.
+    #[test]
+    fn explicit_zlib_level_zero_disables() {
+        let result = parse(true, false, Some("0"), Some("zlib"));
+        assert!(!result.compress);
+        assert!(result.compression_setting.is_disabled());
+    }
+}

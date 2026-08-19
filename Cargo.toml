@@ -21,6 +21,11 @@ publish = false
 
 [dependencies]
 uniffi = "0.28"
+# SYNC-002: the embedded oc-rsync engine (vendored patched fork, crates/core).
+# See vendor/oc-rsync/PATCHES.md for the portability patches and why the
+# feature set here maps to the spec's "openssl-vendored,zstd,lz4,parallel,xattr".
+oc-rsync-core = { package = "core", path = "vendor/oc-rsync/crates/core", default-features = false, features = ["zstd", "lz4", "xattr"] }
+thiserror = "2"
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -33,3 +38,162 @@ crate-type = ["cdylib", "lib"]
 name = "uniffi-bindgen"
 path = "uniffi-bindgen.rs"
 required-features = ["uniffi/cli"]
+
+# SYNC-002: dev-only CLI that runs the embedded engine (same code path the
+# Android app uses), so the #[ignore]'d rsyncd integration test can SIGKILL
+# a real transfer and verify --partial resume. Never enabled for the APK
+# build: required-features keeps it out of `cargo ndk`/Gradle builds.
+[features]
+test-helper = []
+
+[[bin]]
+name = "sync-test-helper"
+path = "src/bin/sync-test-helper.rs"
+required-features = ["test-helper"]
+
+[dev-dependencies]
+tempfile = "3"
+
+# SYNC-002: the vendored oc-rsync fork's `branding` build.rs reads the
+# workspace root it is built under (resolved via `git rev-parse --show-toplevel`,
+# which for a vendored path dep is THIS repo) and requires this table. Values
+# mirror vendor/oc-rsync/Cargo.toml so the embedded engine reports the fork's
+# own brand/version metadata.
+#
+# A manifest containing a `[workspace.metadata.*]` table counts as a Cargo
+# workspace root, which shadows the vendored fork's own `[workspace.package]`
+# inheritance for the vendored crates -- so the package-level defaults the
+# fork's crates inherit (`edition.workspace = true` etc.) must also exist here.
+[workspace.package]
+edition = "2024"
+rust-version = "1.91"
+version = "0.6.4"
+authors = ["ErikAllanKincaid"]
+license = "GPL-3.0-only"
+repository = "https://github.com/oferchen/rsync"
+
+# SYNC-002: vendored-crate inheritance (see the [workspace.package] comment
+# above): the fork's crates also inherit from `workspace.dependencies`, so this
+# table is mirrored verbatim from vendor/oc-rsync/Cargo.toml.
+[workspace.dependencies]
+# High-performance memory allocator - 8-50% faster than system allocator
+mimalloc = "0.1"
+# Fast non-cryptographic hash for HashMap/HashSet - 2-5x faster for integer keys
+rustc-hash = "2.1"
+# Parallel directory walking - ~4x faster than walkdir
+jwalk = "0.9"
+# Cross-platform ACL support (Linux, macOS, FreeBSD)
+exacl = "0.13"
+# Async runtime - feature-gated for optional async support
+tokio = { version = "1.52", features = ["rt-multi-thread", "io-util", "net", "fs", "sync", "time", "process", "macros"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+# Serialization framework - feature-gated for JSON config and data export
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Structured logging - feature-gated for instrumentation and diagnostics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Parallel computation - feature-gated for parallel file operations
+rayon = "1.10"
+# Crossbeam concurrency primitives - bounded channels with lower overhead than std
+crossbeam-channel = "0.5"
+# Concurrent hash map - for shared state across daemon sessions
+dashmap = "6.1"
+# Pure-Rust SSH client - embedded SSH transport alternative to system ssh binary.
+# 0.60+ retires GHSA-f5v4-2wr6-hqmg / RUSTSEC-2023-0071 (Marvin Attack on rsa
+# 0.9.x) by upgrading to rsa 0.10 with the constant-time rewrite. The keys
+# helpers (formerly russh-keys) are now re-exported under russh::keys.
+russh = { version = "0.62.1", default-features = false, features = ["flate2", "ring", "rsa"] }
+# QUIC transport (feature-gated) - quinn's sans-IO core with the rustls/ring
+# provider, driven directly from a dedicated I/O thread (no tokio, no quinn
+# runtime layer). default-features off keeps the aws-lc-rs provider and the
+# platform certificate verifier out of the dependency graph; `ring` 0.17 is
+# already pinned via russh.
+quinn-proto = { version = "0.11.16", default-features = false, features = ["rustls-ring"] }
+# Byte buffers for the quinn-proto datagram interface (already in the tree
+# as quinn-proto's own buffer type).
+bytes = "1.12"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# Self-signed certificate generation for QUIC loopback tests
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+# System trust-store loader for the QUIC client verification ladder (policy B,
+# system-roots default). Reads the live platform CA store at runtime, mirroring
+# the openssl/stunnel trust behaviour upstream rsync-ssl relies on - a frozen
+# compiled-in bundle (webpki-roots) would ignore operator-added/corporate CAs.
+rustls-native-certs = "0.8"
+# SHA-256 for the QUIC TOFU known-hosts certificate fingerprint.
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
+# URL parsing for ssh:// URIs
+url = "2"
+# Secure password input from terminal
+rpassword = "7"
+# Terminal detection for interactive prompts
+is-terminal = "0.4"
+# Secure memory zeroization - audited, widely deployed RAII wrapper
+zeroize = "1"
+# Error derive macro - workspace-wide pin keeps every crate on the same major
+thiserror = "2.0"
+# Temporary file/dir helpers - dev-dep across nearly every crate
+tempfile = "3.15"
+# Raw POSIX/Windows C types - shared across platform-specific code
+libc = "0.2"
+# Substring search helpers (memchr/memmem) - protocol/io hot paths
+memchr = "2.7"
+# Microbenchmark harness - dev-dep across nine crates
+criterion = { version = "0.8", features = ["html_reports"] }
+# Property-based testing - dev-dep across eight crates
+proptest = "1.8"
+# Random number generator - dev-dep across checksums/transfer/rsync_io benches and tests
+rand = "0.10"
+# Lock-free MPMC queues - used by engine/transfer for reorder/work pipelines
+crossbeam-queue = "0.3"
+# Concurrency primitives - Backoff for the SPSC pipeline spin-wait escalation
+crossbeam-utils = "0.8"
+# Pure-Rust DEFLATE - codec backbone for protocol/compress and xtask packaging
+flate2 = "1.0"
+# File modification time helpers - metadata, engine async, dev tests
+filetime = "0.2"
+# Low-level socket configuration - shared by core and daemon listeners
+socket2 = "0.6"
+# TOML parser - branding/xtask build + tooling
+toml = "1.1"
+# CLI argument parser - shared by cli/daemon/xtask binaries
+clap = { version = "4.5", features = ["std"] }
+# Base64 codec - daemon auth + core module list parsing
+base64 = "0.23"
+# Modern syscall wrappers - used by core, engine, metadata, fast_io
+rustix = "1.1"
+# CLI integration testing - dev-dep across cli and root bin
+assert_cmd = "2.0"
+# Glob pattern matcher - shared by engine and filters
+globset = "0.4"
+# Pure-Rust LZ4 codec - shared by compress and protocol (optional, per-crate features)
+lz4_flex = { version = "0.14", default-features = false }
+# MD5 hash - shared by checksums (asm on unix) and protocol (per-crate features)
+md-5 = { version = "0.10", default-features = false }
+# Unix syscall wrappers - shared by apple-fs, core, platform (per-crate features)
+nix = { version = "0.31", default-features = false }
+# Windows API bindings (high-level) - shared by daemon, metadata, platform (per-crate features)
+windows = "0.62"
+# Windows API bindings (low-level) - shared by engine and fast_io (per-crate features)
+windows-sys = "0.61"
+# Extended attribute helpers - shared by apple-fs, cli, daemon (dev), engine (dev), metadata (optional)
+xattr = "1.6"
+# Zstandard codec - shared by compress and protocol (optional)
+zstd = "0.13"
+[workspace.metadata.oc_rsync]
+brand = "oc"
+upstream_version = "3.4.4"
+rust_version = "0.6.4"
+protocol = 32
+client_bin = "oc-rsync"
+daemon_bin = "oc-rsync"
+legacy_client_bin = "rsync"
+legacy_daemon_bin = "rsync"
+daemon_config_dir = "/etc/oc-rsyncd"
+daemon_config = "/etc/oc-rsyncd/oc-rsyncd.conf"
+daemon_secrets = "/etc/oc-rsyncd/oc-rsyncd.secrets"
+legacy_daemon_config_dir = "/etc"
+legacy_daemon_config = "/etc/rsyncd.conf"
+legacy_daemon_secrets = "/etc/rsyncd.secrets"
+source = "https://github.com/oferchen/rsync"

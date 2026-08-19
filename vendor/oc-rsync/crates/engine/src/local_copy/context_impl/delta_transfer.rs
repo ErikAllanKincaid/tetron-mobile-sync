@@ -1,0 +1,806 @@
+/// Bundles the sparse-write toggle and rolling zero-run state for a single
+/// call to `copy_matched_block`.
+pub(super) struct SparseCopy<'state> {
+    enabled: bool,
+    state: &'state mut SparseWriteState,
+}
+
+/// Derives the `sum_head` describing the basis a delta body is matched against.
+///
+/// The three geometry fields are read straight off the index the matcher uses,
+/// so the header a `--write-batch` records and the block indices its tokens
+/// carry can only ever come from the same block layout.
+///
+/// upstream: `generator.c:sum_sizes_sqroot()` fills `struct sum_struct`, whose
+/// four fields `io.c:write_sum_head()` serialises; `remainder` is the length of
+/// the trailing short block, or 0 when the basis divides evenly.
+fn batch_sum_head(
+    index: &DeltaSignatureIndex,
+) -> Result<protocol::wire::SumHead, LocalCopyError> {
+    let reject = |detail: String| {
+        LocalCopyError::io(
+            "derive batch sum_head",
+            std::path::PathBuf::new(),
+            io::Error::new(io::ErrorKind::InvalidData, detail),
+        )
+    };
+    let field = |value: usize, name: &str| {
+        u32::try_from(value).map_err(|_| reject(format!("basis {name} {value} exceeds the wire field")))
+    };
+
+    let count = field(index.block_count(), "block count")?;
+    let blength = field(index.block_length(), "block length")?;
+    let s2length = field(index.strong_length(), "strong sum length")?;
+    let remainder = match count.checked_sub(1) {
+        // upstream: the trailing block is short only when the basis does not
+        // divide evenly, in which case `remainder` carries its real length.
+        Some(last) => {
+            let last_len = field(index.block(last as usize).len(), "trailing block length")?;
+            if last_len == blength { 0 } else { last_len }
+        }
+        None => 0,
+    };
+
+    protocol::wire::SumHead::with_blocks(count, blength, s2length, remainder)
+        .map_err(|error| reject(error.to_string()))
+}
+
+impl<'a> CopyContext<'a> {
+    /// Copies `source`'s content to `writer` by matching blocks against
+    /// `index` and writing literal bytes for the unmatched runs in between.
+    ///
+    /// Handles inplace mode, sparse writing, compression, and batch delta
+    /// capture. In inplace or sparse mode the destination is truncated to
+    /// its final length once the loop completes.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn copy_file_contents_with_delta(
+        &mut self,
+        reader: &mut fs::File,
+        writer: &mut fs::File,
+        buffer: &mut [u8],
+        sparse: bool,
+        compress: bool,
+        source: &Path,
+        destination: &Path,
+        relative: &Path,
+        index: &DeltaSignatureIndex,
+        total_size: u64,
+        initial_bytes: u64,
+        preallocated_len: u64,
+        start: Instant,
+        basis_separate_from_writer: bool,
+    ) -> Result<FileCopyOutcome, LocalCopyError> {
+        // upstream: receiver.c:receive_data() - the matched-block path mirrors
+        // upstream's two-condition optimization. When `updating_basis_or_equiv
+        // && offset == offset2` (inplace + basis at the same offset as where
+        // we are writing), upstream calls skip_matched(), avoiding the copy.
+        // Otherwise upstream calls write_file(fd, offset, map, len) to copy
+        // the basis bytes to the writer at the current offset. We open a
+        // read fd on the basis even in inplace mode so the copy fallback has
+        // a source; the fast skip-path still fires for the common case.
+        //
+        // When `basis_separate_from_writer` is true (e.g. `--inplace
+        // --backup-dir` moved the original destination to the backup
+        // location), the skip-path is never safe because the writer's file
+        // is freshly opened and contains nothing. Force every matched block
+        // through the copy path by treating the run as non-inplace.
+        let inplace_mode = self.inplace_enabled() && !basis_separate_from_writer;
+
+        // The batch body about to be written references blocks of this basis,
+        // so the reserved sum_head must describe exactly this geometry.
+        // upstream: match.c:match_sums() writes the sum_head it received from
+        // the generator immediately before the tokens built against it.
+        self.record_batch_delta_geometry(batch_sum_head(index)?);
+
+        // On NTFS the sparse zero-run seeks below only deallocate blocks once
+        // the handle is flagged sparse via FSCTL_SET_SPARSE. Elsewhere this is a
+        // no-op (holes are implicit). Best-effort: a non-NTFS volume or a
+        // refused control code falls back to a dense write, never an error.
+        if sparse {
+            let _ = fast_io::mark_file_sparse(writer);
+        }
+
+        let mut destination_reader =
+            Some(fs::File::open(destination).map_err(|error| {
+                LocalCopyError::io(
+                    "read existing destination",
+                    destination.to_path_buf(),
+                    error,
+                )
+            })?);
+        let mut compressor = self.start_compressor(compress, source)?;
+        let mut compressed_progress = 0u64;
+        let mut total_bytes = 0u64;
+        let mut literal_bytes = 0u64;
+        // upstream: match.c:363-366 match_sums() zeroes the per-file counters
+        // before scanning; the loop tallies confirmed matches inline and
+        // hash_hits/false_alarms through the counted probe, folded into the run
+        // totals at the end for the `-vv` `total:` line (match.c:439
+        // match_report()).
+        let mut probe = ProbeCounters::default();
+        let mut file_matches = 0u64;
+        // Accumulated where matches are produced, never derived from
+        // `total_size - literal_bytes`. upstream: match.c:121 `matched()` is the
+        // only place `stats.matched_data` grows, so a byte counts as matched
+        // exactly when a block match emitted it - bytes that are neither
+        // literal nor matched (the prefix an append skips over) count as
+        // neither. upstream: match.c:389-390 sets `last_match = s->flength;
+        // s->count = 0;` so append mode never reaches `matched()` at all.
+        let mut matched_bytes = 0u64;
+        let mut sparse_state = SparseWriteState::default();
+        sparse_state.set_preallocated_len(preallocated_len);
+        let mut window: VecDeque<u8> = VecDeque::with_capacity(index.block_length());
+        let mut pending_literals = Vec::with_capacity(index.block_length());
+        let mut scratch = Vec::with_capacity(index.block_length());
+        let mut rolling = RollingChecksum::new();
+        let mut outgoing: Option<u8> = None;
+        let mut read_buffer = vec![0u8; buffer.len().max(index.block_length())];
+        let mut buffer_len = 0usize;
+        let mut buffer_pos = 0usize;
+        // Inplace mode seeks to this position before each literal write.
+        let mut output_position = 0u64;
+        // 256KB interval - smaller than regular copy since delta is more
+        // CPU-intensive, but still amortizes clock_gettime syscalls.
+        const TIMEOUT_CHECK_INTERVAL: usize = 256 * 1024;
+        let mut bytes_since_timeout_check: usize = 0;
+
+        loop {
+            self.check_shutdown()?;
+            if bytes_since_timeout_check >= TIMEOUT_CHECK_INTERVAL {
+                self.enforce_timeout()?;
+                bytes_since_timeout_check = 0;
+            }
+            if buffer_pos == buffer_len {
+                buffer_len = reader.read(&mut read_buffer).map_err(|error| {
+                    LocalCopyError::io("copy file", source, error)
+                })?;
+                buffer_pos = 0;
+                if buffer_len == 0 {
+                    break;
+                }
+            }
+
+            let byte = read_buffer[buffer_pos];
+            buffer_pos += 1;
+            bytes_since_timeout_check += 1;
+
+            window.push_back(byte);
+            if let Some(outgoing_byte) = outgoing.take() {
+                debug_assert!(window.len() <= index.block_length());
+                rolling
+                    .roll_many(&[outgoing_byte], &[byte])
+                    .map_err(|_| {
+                        LocalCopyError::invalid_argument(
+                            LocalCopyArgumentError::UnsupportedFileType,
+                        )
+                    })?;
+            } else {
+                rolling.update(&[byte]);
+            }
+
+            if window.len() < index.block_length() {
+                continue;
+            }
+
+            let digest = rolling.digest();
+            if let Some(block_index) =
+                index.find_match_window_counted(digest, &window, &mut scratch, &mut probe)
+            {
+                file_matches = file_matches.saturating_add(1);
+                if !pending_literals.is_empty() {
+                    let flushed_len = pending_literals.len();
+                    if inplace_mode {
+                        writer.seek(SeekFrom::Start(output_position)).map_err(|error| {
+                            LocalCopyError::io("seek destination file", destination.to_path_buf(), error)
+                        })?;
+                    }
+                    let flushed = self.flush_literal_chunk(
+                        writer,
+                        pending_literals.as_slice(),
+                        sparse,
+                        &mut sparse_state,
+                        compressor.as_mut(),
+                        &mut compressed_progress,
+                        source,
+                        destination,
+                    )?;
+                    let literal_written = if sparse {
+                        flushed_len as u64
+                    } else {
+                        flushed as u64
+                    };
+                    literal_bytes = literal_bytes.saturating_add(literal_written);
+                    total_bytes = total_bytes.saturating_add(flushed_len as u64);
+                    output_position = output_position.saturating_add(flushed_len as u64);
+                    let progressed = initial_bytes.saturating_add(total_bytes);
+                    self.notify_progress(
+                        relative,
+                        Some(total_size),
+                        progressed,
+                        start.elapsed(),
+                    );
+                    pending_literals.clear();
+                }
+
+                let block = index.block(block_index);
+                let block_len = block.len();
+                let matched = MatchedBlock::new(block, index.block_length());
+                let basis_offset = matched.offset();
+
+                // upstream: receiver.c:468-477. The skip-fast-path only fires
+                // when basis offset == output position. For any other matched
+                // block (re-ordered content, inserted prefix, ...) copy the
+                // basis bytes to the current write offset just like upstream
+                // does when `offset != offset2`. Without this fallback the
+                // writer keeps stale basis bytes at the new position and the
+                // final ftruncate clips the file off at the wrong length.
+                if inplace_mode && basis_offset == output_position {
+                    output_position = output_position.saturating_add(block_len as u64);
+                } else if inplace_mode {
+                    // Inplace + basis == destination: reading basis at a
+                    // back-references offset can race with prior writes that
+                    // already overwrote that region. The matched window is
+                    // bit-equivalent to the basis block (both rolling and
+                    // strong checksums confirmed), so write the verified
+                    // source bytes directly rather than re-reading from the
+                    // (potentially overwritten) destination basis.
+                    writer
+                        .seek(SeekFrom::Start(output_position))
+                        .map_err(|error| {
+                            LocalCopyError::io(
+                                "seek destination file",
+                                destination.to_path_buf(),
+                                error,
+                            )
+                        })?;
+                    let matched_bytes = &scratch[..block_len];
+                    if sparse {
+                        let _ = write_sparse_chunk(
+                            writer,
+                            &mut sparse_state,
+                            matched_bytes,
+                            destination,
+                        )?;
+                    } else {
+                        writer.write_all(matched_bytes).map_err(|error| {
+                            LocalCopyError::io("copy file", destination, error)
+                        })?;
+                    }
+                    self.write_batch_block_match_token(
+                        matched.descriptor().index() as u32,
+                        matched_bytes,
+                        destination,
+                    )?;
+                    output_position = output_position.saturating_add(block_len as u64);
+                } else {
+                    self.copy_matched_block(
+                        destination_reader
+                            .as_mut()
+                            .expect("destination reader is always open"),
+                        writer,
+                        buffer,
+                        destination,
+                        matched,
+                        SparseCopy {
+                            enabled: sparse,
+                            state: &mut sparse_state,
+                        },
+                    )?;
+                }
+
+                total_bytes = total_bytes.saturating_add(block_len as u64);
+                matched_bytes = matched_bytes.saturating_add(block_len as u64);
+                let progressed = initial_bytes.saturating_add(total_bytes);
+                self.notify_progress(relative, Some(total_size), progressed, start.elapsed());
+                window.clear();
+                rolling.reset();
+                outgoing = None;
+                continue;
+            }
+
+            if let Some(front) = window.pop_front() {
+                pending_literals.push(front);
+                outgoing = Some(front);
+            }
+        }
+
+        // EOF tail match against the basis's short final block.
+        //
+        // Upstream reaches this block by shrinking the rolling window: once
+        // `offset + k >= len` there is no next byte to add, so `more` is false
+        // and `k` decrements on every step (`match.c:321`, `match.c:331`). Its
+        // scan runs to `end = len + 1 - s->sums[s->count-1].len`
+        // (`match.c:174`) - bounded by the LAST block's length, not by
+        // `blength` - so the window keeps narrowing until it is exactly as long
+        // as that final short block. Only then does the candidate pass
+        // `l = MIN(blength, len-offset); if (l != s->sums[i].len) continue;`
+        // (`match.c:222-224`), because a short block is the only one whose
+        // recorded length is below `blength`.
+        //
+        // Probing whatever the loop happened to leave behind fails twice over.
+        //
+        // First, the length. Each failed full-window probe pops one byte, so at
+        // EOF the window normally holds `block_length - 1` bytes, and
+        // `find_tail_match` rejects every candidate on `block.len() != tail_len`
+        // - the same length-equality rule as upstream. Only a basis whose final
+        // block happens to be exactly `block_length - 1` could even reach the
+        // strong-sum comparison.
+        //
+        // Second, the digest. `outgoing` is recorded when a byte is popped but
+        // the rolling sum is not corrected until the *next* push rolls it out,
+        // so after the final pop the digest still covers the popped byte. At EOF
+        // there is no next push, leaving the digest describing `block_length`
+        // bytes while the window holds one fewer. Even the coincidental
+        // length match above would fail on sum1/sum2.
+        //
+        // So drain to the basis's final block length EXPLICITLY and recompute
+        // the sum over exactly those bytes. That is upstream's shrinking window
+        // expressed as a single probe at the one width that can match, instead
+        // of re-probing at every intermediate width.
+        //
+        // What hid all of this: the window lands on the final block's length,
+        // with a digest that happens to agree, only when a match `clear()`ed it
+        // with exactly that many bytes left - an identical source, where every
+        // full block matches. A fixture built that way passes either way.
+        let short_tail_len = index
+            .block_count()
+            .checked_sub(1)
+            .map(|last| index.block(last).len())
+            .filter(|&len| len > 0 && len < index.block_length());
+        let tail_matched_block = match short_tail_len {
+            // A basis whose length is an exact multiple of the block length has
+            // no short final block, so upstream has nothing extra to offer and
+            // this is a clean no-op.
+            None => None,
+            Some(tail_len) => {
+                while window.len() > tail_len {
+                    if let Some(front) = window.pop_front() {
+                        pending_literals.push(front);
+                    }
+                }
+                // A source shorter than the final basis block never reaches the
+                // probe: upstream's `end` would be non-positive and its scan
+                // would not run either.
+                if window.len() == tail_len {
+                    // Recompute rather than adjust: the digest carried out of
+                    // the loop covers neither the pre-drain window nor the
+                    // post-drain one (see the stale-`outgoing` note above), so
+                    // there is no increment that would repair it.
+                    rolling.reset();
+                    let (first, second) = window.as_slices();
+                    rolling.update(first);
+                    if !second.is_empty() {
+                        rolling.update(second);
+                    }
+                    index.find_tail_match_window(rolling.digest(), &window, &mut scratch)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(block_index) = tail_matched_block {
+            // A matched trailing partial block is one confirmed match, and its
+            // bucket lookup is one hash hit. upstream: match.c hash_search()
+            // counts the shrunk-window tail probe the same as any other.
+            file_matches = file_matches.saturating_add(1);
+            probe.hash_hits = probe.hash_hits.saturating_add(1);
+            if !pending_literals.is_empty() {
+                let flushed_len = pending_literals.len();
+                if inplace_mode {
+                    writer.seek(SeekFrom::Start(output_position)).map_err(|error| {
+                        LocalCopyError::io(
+                            "seek destination file",
+                            destination.to_path_buf(),
+                            error,
+                        )
+                    })?;
+                }
+                let flushed = self.flush_literal_chunk(
+                    writer,
+                    pending_literals.as_slice(),
+                    sparse,
+                    &mut sparse_state,
+                    compressor.as_mut(),
+                    &mut compressed_progress,
+                    source,
+                    destination,
+                )?;
+                let literal_written = if sparse {
+                    flushed_len as u64
+                } else {
+                    flushed as u64
+                };
+                literal_bytes = literal_bytes.saturating_add(literal_written);
+                total_bytes = total_bytes.saturating_add(flushed_len as u64);
+                output_position = output_position.saturating_add(flushed_len as u64);
+                pending_literals.clear();
+            }
+
+            let block = index.block(block_index);
+            let block_len = block.len();
+            let matched = MatchedBlock::new(block, index.block_length());
+            let basis_offset = matched.offset();
+
+            if inplace_mode && basis_offset == output_position {
+                output_position = output_position.saturating_add(block_len as u64);
+            } else if inplace_mode {
+                writer.seek(SeekFrom::Start(output_position)).map_err(|error| {
+                    LocalCopyError::io(
+                        "seek destination file",
+                        destination.to_path_buf(),
+                        error,
+                    )
+                })?;
+                let matched_bytes = &scratch[..block_len];
+                if sparse {
+                    let _ = write_sparse_chunk(
+                        writer,
+                        &mut sparse_state,
+                        matched_bytes,
+                        destination,
+                    )?;
+                } else {
+                    writer.write_all(matched_bytes).map_err(|error| {
+                        LocalCopyError::io("copy file", destination, error)
+                    })?;
+                }
+                self.write_batch_block_match_token(
+                    matched.descriptor().index() as u32,
+                    matched_bytes,
+                    destination,
+                )?;
+                output_position = output_position.saturating_add(block_len as u64);
+            } else {
+                self.copy_matched_block(
+                    destination_reader
+                        .as_mut()
+                        .expect("destination reader is always open"),
+                    writer,
+                    buffer,
+                    destination,
+                    matched,
+                    SparseCopy {
+                        enabled: sparse,
+                        state: &mut sparse_state,
+                    },
+                )?;
+            }
+
+            total_bytes = total_bytes.saturating_add(block_len as u64);
+            matched_bytes = matched_bytes.saturating_add(block_len as u64);
+            let progressed = initial_bytes.saturating_add(total_bytes);
+            self.notify_progress(relative, Some(total_size), progressed, start.elapsed());
+            window.clear();
+        } else {
+            while let Some(byte) = window.pop_front() {
+                pending_literals.push(byte);
+            }
+        }
+
+        if !pending_literals.is_empty() {
+            let flushed_len = pending_literals.len();
+            if inplace_mode {
+                writer.seek(SeekFrom::Start(output_position)).map_err(|error| {
+                    LocalCopyError::io("seek destination file", destination.to_path_buf(), error)
+                })?;
+            }
+            let flushed = self.flush_literal_chunk(
+                writer,
+                pending_literals.as_slice(),
+                sparse,
+                &mut sparse_state,
+                compressor.as_mut(),
+                &mut compressed_progress,
+                source,
+                destination,
+            )?;
+            total_bytes = total_bytes.saturating_add(flushed_len as u64);
+            let literal_written = if sparse {
+                flushed_len as u64
+            } else {
+                flushed as u64
+            };
+            literal_bytes = literal_bytes.saturating_add(literal_written);
+            output_position = output_position.saturating_add(flushed_len as u64);
+            let progressed = initial_bytes.saturating_add(total_bytes);
+            self.notify_progress(relative, Some(total_size), progressed, start.elapsed());
+        }
+
+        if sparse {
+            // upstream: fileio.c:sparse_end() flushes the trailing zero run then
+            // ftruncates to the file's true size. In inplace mode matched blocks
+            // are skipped without advancing the writer, so the final length is
+            // the delta loop's output_position rather than the sparse writer's
+            // stream position; a fresh sparse copy uses the flushed logical end.
+            let sparse_end = sparse_state.finish(writer, destination)?;
+            let final_position = if inplace_mode {
+                output_position
+            } else {
+                sparse_end
+            };
+            writer.set_len(final_position).map_err(|error| {
+                LocalCopyError::io(
+                    "truncate destination file",
+                    destination.to_path_buf(),
+                    error,
+                )
+            })?;
+            self.register_progress();
+        } else if inplace_mode {
+            // Truncate to the final output size in case the new file is
+            // smaller than the old one.
+            writer.set_len(output_position).map_err(|error| {
+                LocalCopyError::io(
+                    "truncate destination file",
+                    destination.to_path_buf(),
+                    error,
+                )
+            })?;
+        }
+
+        // upstream: match.c:433-435 folds the per-file counters into the run
+        // totals after match_sums() returns; do the same so the end-of-run
+        // `-vv` `total:` line reports cumulative figures.
+        self.summary.record_delta_probe(file_matches, probe);
+
+        let outcome = if let Some(encoder) = compressor {
+            let compressed_total = encoder.finish().map_err(|error| {
+                LocalCopyError::io("compress file", source, error)
+            })?;
+            let delta = compressed_total.saturating_sub(compressed_progress);
+            self.register_limiter_bytes(delta);
+            self.record_adaptive_compression(literal_bytes, compressed_total);
+            FileCopyOutcome::new(literal_bytes, matched_bytes, Some(compressed_total))
+        } else {
+            FileCopyOutcome::new(literal_bytes, matched_bytes, None)
+        };
+
+        Ok(outcome)
+    }
+
+    /// Writes a literal (unmatched) chunk to `writer`, applying sparse
+    /// zero-run detection, compression, and bandwidth-limiter accounting.
+    ///
+    /// Captures the chunk as a batch delta literal token when batch mode is
+    /// active. Returns the number of bytes physically written, which is
+    /// less than `chunk.len()` when sparse writing elides a zero run.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn flush_literal_chunk(
+        &mut self,
+        writer: &mut fs::File,
+        chunk: &[u8],
+        sparse: bool,
+        state: &mut SparseWriteState,
+        compressor: Option<&mut ActiveCompressor>,
+        compressed_progress: &mut u64,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<usize, LocalCopyError> {
+        if chunk.is_empty() {
+            return Ok(0);
+        }
+        self.enforce_timeout()?;
+
+        // Capture LITERAL operation to the batch delta buffer if active.
+        // upstream: token.c:simple_send_token() - literals are written as
+        // write_int(length) + raw bytes, chunked to CHUNK_SIZE (32KB); under
+        // -z the batch tee records send_deflated_token()'s framing instead.
+        self.write_batch_literal_token(chunk, destination)?;
+
+        let written = if sparse {
+            write_sparse_chunk(writer, state, chunk, destination)?
+        } else {
+            writer.write_all(chunk).map_err(|error| {
+                LocalCopyError::io("copy file", destination, error)
+            })?;
+            chunk.len()
+        };
+
+        if let Some(encoder) = compressor {
+            encoder.write(chunk).map_err(|error| {
+                LocalCopyError::io("compress file", source, error)
+            })?;
+            let total = encoder.bytes_written();
+            let delta = total.saturating_sub(*compressed_progress);
+            *compressed_progress = total;
+            self.register_limiter_bytes(delta);
+        } else {
+            self.register_limiter_bytes(chunk.len() as u64);
+        }
+
+        Ok(written)
+    }
+
+    /// Records a block-match token to the batch delta stream, if active.
+    ///
+    /// Mirrors upstream `token.c:simple_send_token()` which encodes a block
+    /// reference as `write_int(-(token+1))`. Under `-z` the compressed encoder
+    /// additionally needs the matched bytes: `token.c:471-484` feeds them into
+    /// the deflate history so the receiver's dictionary stays in sync, so the
+    /// block is read back from `existing` (the basis) for that call only.
+    fn capture_batch_block_match(
+        &mut self,
+        existing: &mut fs::File,
+        matched: &MatchedBlock<'_>,
+        destination: &Path,
+    ) -> Result<(), LocalCopyError> {
+        if self.batch_delta_buf.is_none() {
+            return Ok(());
+        }
+
+        let block_index = matched.descriptor().index() as u32;
+
+        // The token references a basis block by index, so the sum_head this
+        // file reserved must already describe that block. Anything else is the
+        // stream upstream aborts on at receiver.c:414.
+        self.check_batch_block_index(block_index)?;
+
+        let mut see_data = Vec::new();
+        if self.batch_token_encoder.is_some() {
+            see_data.resize(matched.descriptor().len(), 0);
+            let basis_err = |e: io::Error| {
+                LocalCopyError::io(
+                    "read basis block for batch token history",
+                    destination.to_path_buf(),
+                    e,
+                )
+            };
+            existing
+                .seek(SeekFrom::Start(matched.offset()))
+                .map_err(basis_err)?;
+            existing.read_exact(&mut see_data).map_err(basis_err)?;
+        }
+
+        self.write_batch_block_match_token(block_index, &see_data, destination)
+    }
+
+    /// Copies a matched basis block from `existing` to `writer` at the
+    /// block's output position.
+    ///
+    /// Prefers a same-filesystem reflink clone (REFLINK-3/4) over the
+    /// byte-copy loop when available and not writing sparsely.
+    pub(super) fn copy_matched_block(
+        &mut self,
+        existing: &mut fs::File,
+        writer: &mut fs::File,
+        buffer: &mut [u8],
+        destination: &Path,
+        matched: MatchedBlock<'_>,
+        sparse: SparseCopy<'_>,
+    ) -> Result<(), LocalCopyError> {
+        let offset = matched.offset();
+        let block_length = matched.descriptor().len();
+
+        self.capture_batch_block_match(existing, &matched, destination)?;
+
+        // REFLINK-3/4: attempt a same-filesystem FICLONERANGE reflink before
+        // falling back to the read+write copy loop. On a CoW filesystem this
+        // shares the basis extents into the destination with zero data copied.
+        // Skipped for sparse output (the reflink cannot reproduce the sparse
+        // writer's hole layout) and when `--no-cow` disables reflink. When the
+        // clone is unavailable (cross-fs, unaligned, unsupported fs) the helper
+        // reports `false` and we fall through to the byte copy. Byte-identical
+        // output either way - this is a local-only acceleration with no wire
+        // impact.
+        if !sparse.enabled
+            && self.try_reflink_matched_block(existing, writer, offset, block_length, destination)?
+        {
+            return Ok(());
+        }
+
+        existing.seek(SeekFrom::Start(offset)).map_err(|error| {
+            LocalCopyError::io(
+                "read existing destination",
+                destination.to_path_buf(),
+                error,
+            )
+        })?;
+
+        let mut remaining = block_length;
+        while remaining > 0 {
+            self.enforce_timeout()?;
+            let chunk_len = remaining.min(buffer.len());
+            let read = existing.read(&mut buffer[..chunk_len]).map_err(|error| {
+                LocalCopyError::io(
+                    "read existing destination",
+                    destination.to_path_buf(),
+                    error,
+                )
+            })?;
+            if read == 0 {
+                let eof = io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF while reading existing block",
+                );
+                return Err(LocalCopyError::io(
+                    "read existing destination",
+                    destination.to_path_buf(),
+                    eof,
+                ));
+            }
+
+            if sparse.enabled {
+                let _ =
+                    write_sparse_chunk(writer, sparse.state, &buffer[..read], destination)?;
+            } else {
+                writer.write_all(&buffer[..read]).map_err(|error| {
+                    LocalCopyError::io("copy file", destination, error)
+                })?;
+            }
+
+            remaining -= read;
+        }
+
+        Ok(())
+    }
+
+    /// Attempts to reflink `existing[offset..offset+len]` into the writer at
+    /// its current position via Linux `FICLONERANGE`.
+    ///
+    /// Returns `Ok(true)` when the range clone succeeded and the writer's file
+    /// position has been advanced past the cloned range (so subsequent
+    /// sequential writes land correctly). Returns `Ok(false)` when the clone
+    /// was declined - `--no-cow` in effect, the operands are on different
+    /// filesystems (REFLINK-3), the range is below the worthwhile threshold,
+    /// or the ioctl reported that the filesystem / alignment cannot satisfy the
+    /// clone - so the caller falls back to the read+write copy.
+    ///
+    /// # Correctness
+    ///
+    /// The destination position is `writer.stream_position()`. On success the
+    /// clone copies no bytes but does not move the file offset, so we seek the
+    /// writer forward by `len` to match what an equivalent `write_all` would
+    /// have left behind. Cross-filesystem clones are never issued: `st_dev` of
+    /// the basis and destination are compared up front, and `FICLONERANGE`'s
+    /// own `EXDEV`/`EINVAL`/`EOPNOTSUPP` results are mapped to a graceful
+    /// fallback by the `fast_io` wrapper. The transfer never fails on a clone
+    /// error.
+    fn try_reflink_matched_block(
+        &self,
+        existing: &fs::File,
+        writer: &mut fs::File,
+        offset: u64,
+        len: usize,
+        destination: &Path,
+    ) -> Result<bool, LocalCopyError> {
+        // REFLINK-4: honour the `--cow` / `--no-cow` policy that also gates the
+        // whole-file FICLONE fast path.
+        if !self.reflink_enabled() {
+            return Ok(false);
+        }
+
+        let len = len as u64;
+        if len < fast_io::CLONE_FILE_RANGE_MIN_BYTES {
+            return Ok(false);
+        }
+
+        // REFLINK-3: never issue FICLONERANGE across filesystems. The ioctl
+        // returns EXDEV cross-mount; comparing st_dev up front avoids the
+        // wasted syscall. `None` (device id unavailable) falls through to let
+        // the ioctl decide rather than forcing the slow path.
+        if fast_io::same_fs::files_same_device(existing, writer) == Some(false) {
+            return Ok(false);
+        }
+
+        let dst_offset = writer.stream_position().map_err(|error| {
+            LocalCopyError::io("seek destination file", destination.to_path_buf(), error)
+        })?;
+
+        let cloned = fast_io::try_clone_file_range(existing, offset, writer, dst_offset, len)
+            .map_err(|error| LocalCopyError::io("clone basis range", destination, error))?;
+
+        if !cloned {
+            return Ok(false);
+        }
+
+        // FICLONERANGE leaves the writer's file offset unchanged; advance it so
+        // the next sequential write continues after the cloned range.
+        writer
+            .seek(SeekFrom::Start(dst_offset.saturating_add(len)))
+            .map_err(|error| {
+                LocalCopyError::io("seek destination file", destination.to_path_buf(), error)
+            })?;
+
+        Ok(true)
+    }
+}

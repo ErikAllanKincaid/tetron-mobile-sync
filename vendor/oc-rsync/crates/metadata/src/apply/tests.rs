@@ -1,0 +1,2735 @@
+use super::*;
+#[cfg(unix)]
+use crate::id_lookup::{map_gid, map_uid};
+#[cfg(unix)]
+use crate::ownership;
+use filetime::{FileTime, set_file_times};
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+use std::path::Path;
+use tempfile::tempdir;
+
+#[cfg(unix)]
+fn current_mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::metadata(path).expect("metadata").permissions().mode()
+}
+
+#[test]
+fn file_permissions_and_times_are_preserved() {
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source.txt");
+    let dest = temp.path().join("dest.txt");
+    fs::write(&source, b"data").expect("write source");
+    fs::write(&dest, b"data").expect("write dest");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&source, PermissionsExt::from_mode(0o640)).expect("set source perms");
+    }
+
+    let atime = FileTime::from_unix_time(1_700_000_000, 111_000_000);
+    let mtime = FileTime::from_unix_time(1_700_000_100, 222_000_000);
+    set_file_times(&source, atime, mtime).expect("set source times");
+
+    let metadata = fs::metadata(&source).expect("metadata");
+    apply_file_metadata(&dest, &metadata).expect("apply file metadata");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    let dest_atime = FileTime::from_last_access_time(&dest_meta);
+    let dest_mtime = FileTime::from_last_modification_time(&dest_meta);
+    // upstream: rsync.c:588-589 - without --atimes the destination access time
+    // is left unchanged (ATTRS_SKIP_ATIME); it must NOT be clobbered with the
+    // source atime. The default options preserve times but not atimes.
+    assert_ne!(
+        dest_atime, atime,
+        "atime must not be written to the source value without --atimes"
+    );
+    assert_eq!(dest_mtime, mtime);
+
+    #[cfg(unix)]
+    {
+        assert_eq!(current_mode(&dest) & 0o777, 0o640);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn file_ownership_is_preserved_when_requested() {
+    use rustix::fs::{AtFlags, CWD, chownat};
+
+    if rustix::process::geteuid().as_raw() != 0 {
+        return;
+    }
+
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source-owner.txt");
+    let dest = temp.path().join("dest-owner.txt");
+    fs::write(&source, b"data").expect("write source");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let owner = 12_345;
+    let group = 54_321;
+    chownat(
+        CWD,
+        &source,
+        Some(ownership::uid_from_raw(owner)),
+        Some(ownership::gid_from_raw(group)),
+        AtFlags::empty(),
+    )
+    .expect("assign ownership");
+
+    let metadata = fs::metadata(&source).expect("metadata");
+    apply_file_metadata_with_options(
+        &dest,
+        &metadata,
+        &MetadataOptions::new()
+            .preserve_owner(true)
+            .preserve_group(true),
+    )
+    .expect("preserve metadata");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    assert_eq!(dest_meta.uid(), owner);
+    assert_eq!(dest_meta.gid(), group);
+}
+
+#[cfg(unix)]
+#[test]
+fn file_permissions_respect_toggle() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source-perms.txt");
+    let dest = temp.path().join("dest-perms.txt");
+    fs::write(&source, b"data").expect("write source");
+    fs::write(&dest, b"data").expect("write dest");
+
+    fs::set_permissions(&source, PermissionsExt::from_mode(0o750)).expect("set source perms");
+    let metadata = fs::metadata(&source).expect("metadata");
+
+    apply_file_metadata_with_options(
+        &dest,
+        &metadata,
+        &MetadataOptions::new().preserve_permissions(false),
+    )
+    .expect("apply metadata");
+
+    let mode = current_mode(&dest) & 0o777;
+    assert_ne!(mode, 0o750);
+}
+
+#[cfg(unix)]
+#[test]
+fn file_executability_can_be_preserved_without_other_bits() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source-exec.txt");
+    let dest = temp.path().join("dest-exec.txt");
+
+    fs::write(&source, b"data").expect("write source");
+    fs::write(&dest, b"data").expect("write dest");
+
+    fs::set_permissions(&source, PermissionsExt::from_mode(0o751)).expect("set source perms");
+    fs::set_permissions(&dest, PermissionsExt::from_mode(0o620)).expect("set dest perms");
+
+    let metadata = fs::metadata(&source).expect("metadata");
+
+    apply_file_metadata_with_options(
+        &dest,
+        &metadata,
+        &MetadataOptions::new()
+            .preserve_permissions(false)
+            .preserve_executability(true),
+    )
+    .expect("apply metadata");
+
+    // upstream: rsync.c:457-465 - source has exec bits and dest has none,
+    // so dest gets exec granted to whoever can already read: 0o620 has
+    // owner-read so owner-exec is added, group has only write, other has
+    // nothing. Result is 0o720, not 0o731 / 0o751.
+    let mode = current_mode(&dest) & 0o777;
+    assert_eq!(mode, 0o720);
+}
+
+#[cfg(unix)]
+#[test]
+fn file_executability_matches_upstream_dest_mode_fixture() {
+    // upstream testsuite/executability.test (rsync 3.4.4) check_perms 3:
+    // source mode 0o601, dest mode 0o604, expected 0o705 after `-E`.
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source-2");
+    let dest = temp.path().join("dest-2");
+
+    fs::write(&source, b"#!/bin/sh\necho Program Two!\n").expect("write source");
+    fs::write(&dest, b"#!/bin/sh\necho Program Two!\n").expect("write dest");
+
+    fs::set_permissions(&source, PermissionsExt::from_mode(0o601)).expect("set source perms");
+    fs::set_permissions(&dest, PermissionsExt::from_mode(0o604)).expect("set dest perms");
+
+    let metadata = fs::metadata(&source).expect("metadata");
+
+    apply_file_metadata_with_options(
+        &dest,
+        &metadata,
+        &MetadataOptions::new()
+            .preserve_permissions(false)
+            .preserve_executability(true)
+            .preserve_times(false),
+    )
+    .expect("apply metadata");
+
+    let mode = current_mode(&dest) & 0o777;
+    assert_eq!(mode, 0o705, "expected 0o705 per upstream rsync.c:457-465");
+}
+
+#[test]
+fn file_times_respect_toggle() {
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source-times.txt");
+    let dest = temp.path().join("dest-times.txt");
+    fs::write(&source, b"data").expect("write source");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let atime = FileTime::from_unix_time(1_700_050_000, 100_000_000);
+    let mtime = FileTime::from_unix_time(1_700_060_000, 200_000_000);
+    set_file_times(&source, atime, mtime).expect("set source times");
+    let metadata = fs::metadata(&source).expect("metadata");
+
+    apply_file_metadata_with_options(
+        &dest,
+        &metadata,
+        &MetadataOptions::new().preserve_times(false),
+    )
+    .expect("apply metadata");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    let dest_mtime = FileTime::from_last_modification_time(&dest_meta);
+    assert_ne!(dest_mtime, mtime);
+}
+
+#[test]
+fn metadata_options_numeric_ids_toggle() {
+    let opts = MetadataOptions::new().numeric_ids(true);
+    assert!(opts.numeric_ids_enabled());
+    assert!(!MetadataOptions::new().numeric_ids_enabled());
+}
+
+#[cfg(unix)]
+#[test]
+fn map_uid_round_trips_current_user_without_numeric_flag() {
+    let uid = rustix::process::geteuid().as_raw();
+    let mapped = map_uid(uid, false).expect("uid");
+    assert_eq!(mapped.as_raw(), uid);
+}
+
+#[cfg(unix)]
+#[test]
+fn map_gid_round_trips_current_group_without_numeric_flag() {
+    let gid = rustix::process::getegid().as_raw();
+    let mapped = map_gid(gid, false).expect("gid");
+    assert_eq!(mapped.as_raw(), gid);
+}
+
+#[test]
+fn directory_permissions_and_times_are_preserved() {
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source-dir");
+    let dest = temp.path().join("dest-dir");
+    fs::create_dir(&source).expect("create source dir");
+    fs::create_dir(&dest).expect("create dest dir");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&source, PermissionsExt::from_mode(0o751)).expect("set source perms");
+    }
+
+    let atime = FileTime::from_unix_time(1_700_010_000, 0);
+    let mtime = FileTime::from_unix_time(1_700_020_000, 333_000_000);
+    set_file_times(&source, atime, mtime).expect("set source times");
+
+    let metadata = fs::metadata(&source).expect("metadata");
+    apply_directory_metadata(&dest, &metadata).expect("apply dir metadata");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    let dest_atime = FileTime::from_last_access_time(&dest_meta);
+    let dest_mtime = FileTime::from_last_modification_time(&dest_meta);
+    // upstream: rsync.c:725-726 - `!atimes_ndx || S_ISDIR` always sets
+    // ATTRS_SKIP_ATIME for directories, so a directory's access time is never
+    // written (not even under --atimes).
+    assert_ne!(
+        dest_atime, atime,
+        "directory atime must never be written (ATTRS_SKIP_ATIME for S_ISDIR)"
+    );
+    assert_eq!(dest_mtime, mtime);
+
+    #[cfg(unix)]
+    {
+        assert_eq!(current_mode(&dest) & 0o777, 0o751);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_times_are_preserved_without_following_target() {
+    use filetime::set_symlink_file_times;
+    use std::os::unix::fs::symlink;
+
+    let temp = tempdir().expect("tempdir");
+    let target = temp.path().join("target.txt");
+    fs::write(&target, b"data").expect("write target");
+
+    let source_link = temp.path().join("source-link");
+    let dest_link = temp.path().join("dest-link");
+    symlink(&target, &source_link).expect("create source link");
+    symlink(&target, &dest_link).expect("create dest link");
+
+    let atime = FileTime::from_unix_time(1_700_030_000, 444_000_000);
+    let mtime = FileTime::from_unix_time(1_700_040_000, 555_000_000);
+    set_symlink_file_times(&source_link, atime, mtime).expect("set link times");
+
+    let metadata = fs::symlink_metadata(&source_link).expect("metadata");
+    apply_symlink_metadata(&dest_link, &metadata).expect("apply symlink metadata");
+
+    let dest_meta = fs::symlink_metadata(&dest_link).expect("dest metadata");
+    let dest_mtime = FileTime::from_last_modification_time(&dest_meta);
+    // upstream: rsync.c:588-589 - without --atimes the symlink's access time is
+    // left unchanged; only its mtime is written (via lutimes, without following
+    // the target).
+    assert_eq!(dest_mtime, mtime);
+
+    let dest_target = fs::read_link(&dest_link).expect("read dest link");
+    assert_eq!(dest_target, target);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_metadata_with_options_no_times() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempdir().expect("tempdir");
+    let target = temp.path().join("target.txt");
+    fs::write(&target, b"data").expect("write target");
+
+    let source_link = temp.path().join("source-link2");
+    let dest_link = temp.path().join("dest-link2");
+    symlink(&target, &source_link).expect("create source link");
+    symlink(&target, &dest_link).expect("create dest link");
+
+    let metadata = fs::symlink_metadata(&source_link).expect("metadata");
+
+    apply_symlink_metadata_with_options(
+        &dest_link,
+        &metadata,
+        &MetadataOptions::new().preserve_times(false),
+    )
+    .expect("apply symlink metadata");
+
+    assert!(fs::symlink_metadata(&dest_link).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_metadata_with_options_no_times() {
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source-dir-notime");
+    let dest = temp.path().join("dest-dir-notime");
+    fs::create_dir(&source).expect("create source dir");
+    fs::create_dir(&dest).expect("create dest dir");
+
+    let metadata = fs::metadata(&source).expect("metadata");
+
+    apply_directory_metadata_with_options(
+        &dest,
+        &metadata,
+        MetadataOptions::new().preserve_times(false),
+    )
+    .expect("apply dir metadata");
+
+    assert!(fs::metadata(&dest).is_ok());
+}
+
+#[test]
+fn file_metadata_with_all_options_disabled() {
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source-noop.txt");
+    let dest = temp.path().join("dest-noop.txt");
+    fs::write(&source, b"data").expect("write source");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let metadata = fs::metadata(&source).expect("metadata");
+
+    apply_file_metadata_with_options(
+        &dest,
+        &metadata,
+        &MetadataOptions::new()
+            .preserve_times(false)
+            .preserve_permissions(false)
+            .preserve_owner(false)
+            .preserve_group(false),
+    )
+    .expect("apply metadata");
+
+    assert!(fs::metadata(&dest).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn executability_not_applied_to_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source-exec-dir");
+    let dest = temp.path().join("dest-exec-dir");
+    fs::create_dir(&source).expect("create source dir");
+    fs::create_dir(&dest).expect("create dest dir");
+
+    fs::set_permissions(&source, PermissionsExt::from_mode(0o755)).expect("set source perms");
+    fs::set_permissions(&dest, PermissionsExt::from_mode(0o700)).expect("set dest perms");
+
+    let metadata = fs::metadata(&source).expect("metadata");
+
+    apply_file_metadata_with_options(
+        &dest,
+        &metadata,
+        &MetadataOptions::new()
+            .preserve_permissions(false)
+            .preserve_executability(true)
+            .preserve_times(false),
+    )
+    .expect("apply metadata");
+
+    assert!(fs::metadata(&dest).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn executability_removed_when_source_not_executable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source-noexec.txt");
+    let dest = temp.path().join("dest-noexec.txt");
+    fs::write(&source, b"data").expect("write source");
+    fs::write(&dest, b"data").expect("write dest");
+
+    fs::set_permissions(&source, PermissionsExt::from_mode(0o644)).expect("set source perms");
+    fs::set_permissions(&dest, PermissionsExt::from_mode(0o755)).expect("set dest perms");
+
+    let metadata = fs::metadata(&source).expect("metadata");
+
+    apply_file_metadata_with_options(
+        &dest,
+        &metadata,
+        &MetadataOptions::new()
+            .preserve_permissions(false)
+            .preserve_executability(true)
+            .preserve_times(false),
+    )
+    .expect("apply metadata");
+
+    let mode = current_mode(&dest) & 0o111;
+    assert_eq!(mode, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_override_takes_precedence() {
+    if rustix::process::geteuid().as_raw() != 0 {
+        return;
+    }
+
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source-override.txt");
+    let dest = temp.path().join("dest-override.txt");
+    fs::write(&source, b"data").expect("write source");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let metadata = fs::metadata(&source).expect("metadata");
+
+    apply_file_metadata_with_options(
+        &dest,
+        &metadata,
+        &MetadataOptions::new()
+            .preserve_owner(true)
+            .with_owner_override(Some(1000))
+            .preserve_times(false),
+    )
+    .expect("apply metadata");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    assert_eq!(dest_meta.uid(), 1000);
+}
+
+#[cfg(unix)]
+#[test]
+fn group_override_takes_precedence() {
+    if rustix::process::geteuid().as_raw() != 0 {
+        return;
+    }
+
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source-grp-override.txt");
+    let dest = temp.path().join("dest-grp-override.txt");
+    fs::write(&source, b"data").expect("write source");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let metadata = fs::metadata(&source).expect("metadata");
+
+    apply_file_metadata_with_options(
+        &dest,
+        &metadata,
+        &MetadataOptions::new()
+            .preserve_group(true)
+            .with_group_override(Some(1000))
+            .preserve_times(false),
+    )
+    .expect("apply metadata");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    assert_eq!(dest_meta.gid(), 1000);
+}
+
+// GAP M8: upstream never distinguishes an explicit `--chown`/`--usermap`
+// override from the `-o`/`-a` preserve path - both set `preserve_uid` and are
+// gated by the same `change_uid = am_root && ...` check (rsync.c:526,
+// options.c:1793,1833). A non-root process that cannot chown must have the
+// attempt skipped, not surfaced as a fatal EPERM (exit code 23). Before this
+// fix `owner_override`/`group_override` bypassed the gate and propagated the
+// kernel's EPERM as a fatal `MetadataError`.
+#[cfg(unix)]
+#[test]
+fn owner_override_non_root_chown_is_skipped_not_fatal() {
+    if rustix::process::geteuid().is_root() {
+        // Root behaviour is exercised by owner_override_takes_precedence above.
+        return;
+    }
+
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source-nonroot-override.txt");
+    let dest = temp.path().join("dest-nonroot-override.txt");
+    fs::write(&source, b"data").expect("write source");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let metadata = fs::metadata(&source).expect("metadata");
+    let original_uid = fs::metadata(&dest).expect("dest metadata").uid();
+
+    // Explicit `--chown=root:...` (uid 0) as a non-root process: upstream
+    // never attempts this chown (change_uid requires am_root), so oc-rsync
+    // must complete without error and leave ownership untouched.
+    apply_file_metadata_with_options(
+        &dest,
+        &metadata,
+        &MetadataOptions::new()
+            .preserve_owner(true)
+            .with_owner_override(Some(0))
+            .preserve_times(false),
+    )
+    .expect("non-root --chown to an unreachable uid must be skipped, not fatal");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    assert_eq!(
+        dest_meta.uid(),
+        original_uid,
+        "ownership must be unchanged when the chown was skipped for lack of privilege"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn group_override_non_root_chown_to_foreign_group_is_skipped_not_fatal() {
+    if rustix::process::geteuid().is_root() {
+        // Root behaviour is exercised by group_override_takes_precedence above.
+        return;
+    }
+
+    // Pick a gid the current process is provably not a member of (neither its
+    // effective gid nor a supplementary group), reusing the same membership
+    // check the production gate uses.
+    let egid = rustix::process::getegid().as_raw();
+    let foreign_gid = (1u32..=4096)
+        .map(|delta| egid.wrapping_add(delta))
+        .find(|candidate| !super::ownership::process_in_group(ownership::gid_from_raw(*candidate)))
+        .expect("must find a gid outside the process's groups");
+
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source-nonroot-grp-override.txt");
+    let dest = temp.path().join("dest-nonroot-grp-override.txt");
+    fs::write(&source, b"data").expect("write source");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let metadata = fs::metadata(&source).expect("metadata");
+    let original_gid = fs::metadata(&dest).expect("dest metadata").gid();
+
+    // Explicit `--chown=:<foreign-group>` as a non-root process: upstream's
+    // FLAG_SKIP_GROUP gate (uidlist.c:284) drops this before it ever reaches
+    // do_lchown, so oc-rsync must complete without error and leave the group
+    // untouched rather than surface the kernel's EPERM as fatal.
+    apply_file_metadata_with_options(
+        &dest,
+        &metadata,
+        &MetadataOptions::new()
+            .preserve_group(true)
+            .with_group_override(Some(foreign_gid))
+            .preserve_times(false),
+    )
+    .expect("non-root --chown to a foreign group must be skipped, not fatal");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    assert_eq!(
+        dest_meta.gid(),
+        original_gid,
+        "group must be unchanged when the chgrp was skipped for lack of privilege"
+    );
+}
+
+// GAP M8b: the symlink ownership path (apply_symlink_ownership_from_entry) is a
+// distinct code path from the regular-file one - it targets the link itself via
+// AT_SYMLINK_NOFOLLOW and skips fake-super xattr storage - but shares the same
+// privilege gate. A non-root process must have an explicit --chown on a symlink
+// skipped, not surfaced as a fatal EPERM. (On BSD/macOS a symlink carries its
+// own owner, so lchown is meaningful there; the am_root gate short-circuits
+// before it on every Unix, so the observable result - link owner unchanged, no
+// error - is identical across platforms.)
+#[cfg(unix)]
+#[test]
+fn symlink_owner_override_non_root_chown_is_skipped_not_fatal() {
+    use protocol::flist::FileEntry;
+    use std::os::unix::fs::symlink;
+
+    if rustix::process::geteuid().is_root() {
+        // Root can lchown freely; this test asserts the non-root gate only.
+        return;
+    }
+
+    let temp = tempdir().expect("tempdir");
+    let target = temp.path().join("target.txt");
+    let dest_link = temp.path().join("dest-link");
+    fs::write(&target, b"data").expect("write target");
+    symlink(&target, &dest_link).expect("create dest link");
+
+    let original_uid = fs::symlink_metadata(&dest_link)
+        .expect("dest link metadata")
+        .uid();
+    let cached_meta = fs::symlink_metadata(&dest_link).ok();
+
+    // owner_override bypasses the entry's own uid, so the entry is a placeholder.
+    let entry = FileEntry::new_symlink("dest-link".into(), "target.txt".into());
+
+    // Explicit `--chown=root:...` (uid 0) as non-root: upstream never attempts
+    // the do_lchown (change_uid requires am_root), so oc-rsync must complete
+    // without error and leave the link's ownership untouched.
+    super::ownership::apply_symlink_ownership_from_entry(
+        &dest_link,
+        &entry,
+        &MetadataOptions::new()
+            .preserve_owner(true)
+            .with_owner_override(Some(0)),
+        cached_meta.as_ref(),
+    )
+    .expect("non-root symlink --chown to an unreachable uid must be skipped, not fatal");
+
+    let dest_meta = fs::symlink_metadata(&dest_link).expect("dest link metadata");
+    assert_eq!(
+        dest_meta.uid(),
+        original_uid,
+        "symlink ownership must be unchanged when the lchown was skipped for lack of privilege"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_group_override_non_root_chown_to_foreign_group_is_skipped_not_fatal() {
+    use protocol::flist::FileEntry;
+    use std::os::unix::fs::symlink;
+
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+
+    // Pick a gid the current process is provably not a member of, reusing the
+    // same membership check the production gate uses.
+    let egid = rustix::process::getegid().as_raw();
+    let foreign_gid = (1u32..=4096)
+        .map(|delta| egid.wrapping_add(delta))
+        .find(|candidate| !super::ownership::process_in_group(ownership::gid_from_raw(*candidate)))
+        .expect("must find a gid outside the process's groups");
+
+    let temp = tempdir().expect("tempdir");
+    let target = temp.path().join("target-grp.txt");
+    let dest_link = temp.path().join("dest-link-grp");
+    fs::write(&target, b"data").expect("write target");
+    symlink(&target, &dest_link).expect("create dest link");
+
+    let original_gid = fs::symlink_metadata(&dest_link)
+        .expect("dest link metadata")
+        .gid();
+    let cached_meta = fs::symlink_metadata(&dest_link).ok();
+
+    let entry = FileEntry::new_symlink("dest-link-grp".into(), "target-grp.txt".into());
+
+    // Explicit `--chown=:<foreign-group>` as non-root: FLAG_SKIP_GROUP drops the
+    // do_lchown before it runs, so the link's group must be left untouched.
+    super::ownership::apply_symlink_ownership_from_entry(
+        &dest_link,
+        &entry,
+        &MetadataOptions::new()
+            .preserve_group(true)
+            .with_group_override(Some(foreign_gid)),
+        cached_meta.as_ref(),
+    )
+    .expect("non-root symlink --chown to a foreign group must be skipped, not fatal");
+
+    let dest_meta = fs::symlink_metadata(&dest_link).expect("dest link metadata");
+    assert_eq!(
+        dest_meta.gid(),
+        original_gid,
+        "symlink group must be unchanged when the lchown was skipped for lack of privilege"
+    );
+}
+
+// Sub-100ns nanosecond preservation requires filesystem granularity finer than
+// NTFS's 100ns FILETIME, so the exact-equality assertion is Unix-only.
+#[cfg(unix)]
+#[test]
+fn apply_metadata_from_file_entry_with_timestamps() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("entry-dest.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let mut entry = FileEntry::new_file("entry-dest.txt".into(), 4, 0o644);
+    entry.set_mtime(1_700_000_000, 123_456_789);
+
+    let opts = MetadataOptions::new().preserve_times(true);
+    apply_metadata_from_file_entry(&dest, &entry, &opts).expect("apply from entry");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    let dest_mtime = FileTime::from_last_modification_time(&dest_meta);
+    assert_eq!(
+        dest_mtime,
+        FileTime::from_unix_time(1_700_000_000, 123_456_789)
+    );
+}
+
+/// upstream: rsync.c:632 `set_times()` runs before rsync.c:658 `do_chmod_at()`,
+/// so timestamps are applied ahead of the (possibly read-only) target mode. This
+/// test drives the full `apply_metadata_with_attrs_flags_and_pre_transfer` path
+/// with both `-p` and `-t` and a read-only target mode: the resulting file must
+/// carry BOTH the requested mtime AND the read-only mode. If the chmod preceded
+/// the time set (the pre-fix order), a mode that forbids owner-write would leave
+/// the mtime unset on any platform that requires write access for utimes - so
+/// the surviving mtime encodes the upstream times-before-chmod ordering.
+#[cfg(unix)]
+#[test]
+fn apply_metadata_sets_times_before_readonly_chmod() {
+    use protocol::flist::FileEntry;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("times-then-chmod.txt");
+    fs::write(&dest, b"data").expect("write dest");
+    // Start writable so the failure mode is solely about the apply ordering.
+    fs::set_permissions(&dest, PermissionsExt::from_mode(0o644)).expect("seed dest perms");
+
+    let mut entry = FileEntry::new_file("times-then-chmod.txt".into(), 4, 0o444);
+    entry.set_mtime(1_700_000_000, 123_456_789);
+
+    let opts = MetadataOptions::new()
+        .preserve_permissions(true)
+        .preserve_times(true);
+    apply_metadata_from_file_entry(&dest, &entry, &opts).expect("apply from entry");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    // The mtime must have been written even though the final mode is read-only.
+    assert_eq!(
+        FileTime::from_last_modification_time(&dest_meta),
+        FileTime::from_unix_time(1_700_000_000, 123_456_789),
+        "mtime must survive: times are set before the read-only chmod"
+    );
+    // And the read-only mode must be the final on-disk state.
+    assert_eq!(
+        current_mode(&dest) & 0o777,
+        0o444,
+        "read-only target mode must be applied after the times"
+    );
+}
+
+#[test]
+fn apply_metadata_from_file_entry_no_times() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("entry-notime.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let entry = FileEntry::new_file("entry-notime.txt".into(), 4, 0o644);
+
+    let opts = MetadataOptions::new().preserve_times(false);
+    apply_metadata_from_file_entry(&dest, &entry, &opts).expect("apply from entry");
+
+    assert!(fs::metadata(&dest).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_permissions_from_entry_respects_permissions_flag() {
+    use protocol::flist::FileEntry;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("entry-perms.txt");
+    fs::write(&dest, b"data").expect("write dest");
+    fs::set_permissions(&dest, PermissionsExt::from_mode(0o666)).expect("set dest perms");
+
+    let entry = FileEntry::new_file("entry-perms.txt".into(), 4, 0o755);
+
+    let opts = MetadataOptions::new()
+        .preserve_permissions(true)
+        .preserve_times(false);
+    apply_metadata_from_file_entry(&dest, &entry, &opts).expect("apply from entry");
+
+    let mode = current_mode(&dest) & 0o777;
+    assert_eq!(mode, 0o755);
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_permissions_from_entry_no_change_when_disabled() {
+    use protocol::flist::FileEntry;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("entry-noperms.txt");
+    fs::write(&dest, b"data").expect("write dest");
+    fs::set_permissions(&dest, PermissionsExt::from_mode(0o666)).expect("set dest perms");
+
+    let entry = FileEntry::new_file("entry-noperms.txt".into(), 4, 0o755);
+
+    let opts = MetadataOptions::new()
+        .preserve_permissions(false)
+        .preserve_times(false);
+    apply_metadata_from_file_entry(&dest, &entry, &opts).expect("apply from entry");
+
+    let mode = current_mode(&dest) & 0o777;
+    assert_eq!(mode, 0o666);
+}
+
+/// Remote-pull regression: on a transfer WITHOUT `--perms`, a newly-created
+/// destination file must land at the SOURCE entry's mode masked by the umask
+/// (upstream `rsync.c:dest_mode()` `exists=false` branch), NOT the temp
+/// file's `0o600` creation mode. The receiver commit paths (pipelined
+/// disk-commit, streaming sync) pass `cached_meta = None` to signal a fresh
+/// commit and `pre_transfer_meta = None` for a brand-new file; the
+/// chmod-on-commit `dest_mode()` must still fire. Before the fix these files
+/// silently kept the temp file's `0o600` mode over ssh/daemon (e.g. a source
+/// 0o644 file corrupted to 0o600), while a local copy and upstream both land
+/// the umask-masked source mode.
+// upstream: rsync.c:449-472 dest_mode() + rsync.c:489-682 set_file_attrs().
+#[cfg(unix)]
+#[test]
+fn no_perms_new_file_from_entry_gets_umask_masked_source_mode() {
+    use protocol::flist::FileEntry;
+    use std::os::unix::fs::PermissionsExt;
+
+    // Pin the umask so the expected dest_mode is deterministic under nextest's
+    // process-per-test isolation (the crate caches the umask on first read).
+    let prev = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o022));
+
+    let opts = MetadataOptions::new()
+        .preserve_permissions(false)
+        .preserve_times(false);
+
+    // (source entry mode, expected on-disk mode == source & (~CHMOD_BITS | 0o755))
+    for (src_mode, want) in [
+        (0o644, 0o644),
+        (0o640, 0o640),
+        (0o600, 0o600),
+        (0o777, 0o755),
+    ] {
+        let temp = tempdir().expect("tempdir");
+        let dest = temp.path().join("newfile.bin");
+        fs::write(&dest, b"payload").expect("write dest");
+        // Seed the temp file's O_TMPFILE creation mode the receiver commits.
+        fs::set_permissions(&dest, PermissionsExt::from_mode(0o600)).expect("seed temp mode");
+
+        let entry = FileEntry::new_file("newfile.bin".into(), 7, src_mode);
+        // cached_meta = None (fresh commit), pre_transfer_meta = None (new file).
+        apply_metadata_with_cached_stat(&dest, &entry, &opts, None).expect("apply from entry");
+
+        let got = current_mode(&dest) & 0o7777;
+        assert_eq!(
+            got, want,
+            "no-perms new file from entry 0o{src_mode:o} must land 0o{want:o} \
+             (dest_mode under umask 022), got 0o{got:o}",
+        );
+    }
+
+    nix::sys::stat::umask(prev);
+}
+
+/// Companion to the new-file regression: on a `--no-perms` transfer over an
+/// EXISTING destination the receiver must KEEP the destination's prior
+/// permission bits (upstream `dest_mode()` `exists=true` branch), threading
+/// the pre-transfer stat so the temp file's `0o600` never leaks through.
+// upstream: rsync.c:454-456 dest_mode() exists branch.
+#[cfg(unix)]
+#[test]
+fn no_perms_existing_file_from_entry_keeps_prior_mode() {
+    use protocol::flist::FileEntry;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    // The committed (post-rename) file carries the temp file's 0o600 mode.
+    let dest = temp.path().join("existing.bin");
+    fs::write(&dest, b"payload").expect("write dest");
+    fs::set_permissions(&dest, PermissionsExt::from_mode(0o600)).expect("seed temp mode");
+
+    // The destination existed pre-transfer at 0o755 (captured before rename).
+    let pre = temp.path().join("pre.bin");
+    fs::write(&pre, b"old").expect("write pre");
+    fs::set_permissions(&pre, PermissionsExt::from_mode(0o755)).expect("seed pre mode");
+    let pre_meta = fs::metadata(&pre).expect("pre metadata");
+
+    let entry = FileEntry::new_file("existing.bin".into(), 7, 0o644);
+    let opts = MetadataOptions::new()
+        .preserve_permissions(false)
+        .preserve_times(false);
+
+    apply_metadata_with_pre_transfer_stat(&dest, &entry, &opts, None, Some(pre_meta))
+        .expect("apply from entry");
+
+    assert_eq!(
+        current_mode(&dest) & 0o7777,
+        0o755,
+        "no-perms existing file must keep its prior 0o755 mode, not adopt temp 0o600 or source 0o644",
+    );
+}
+
+#[test]
+fn epoch_timestamp_zero_seconds_is_preserved() {
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("epoch-source.txt");
+    let dest = temp.path().join("epoch-dest.txt");
+    fs::write(&source, b"data").expect("write source");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let epoch_time = FileTime::from_unix_time(0, 0);
+    set_file_times(&source, epoch_time, epoch_time).expect("set epoch time");
+
+    let metadata = fs::metadata(&source).expect("metadata");
+    apply_file_metadata(&dest, &metadata).expect("apply file metadata");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    let dest_atime = FileTime::from_last_access_time(&dest_meta);
+    let dest_mtime = FileTime::from_last_modification_time(&dest_meta);
+
+    // upstream: rsync.c:588-589 - without --atimes the access time is left
+    // unchanged; only the epoch mtime must round-trip.
+    assert_ne!(
+        dest_atime, epoch_time,
+        "atime must not be written without --atimes"
+    );
+    assert_eq!(dest_mtime, epoch_time, "mtime should be preserved at epoch");
+}
+
+// NTFS FILETIME has 100ns granularity, so 123_456_789ns truncates to
+// 123_456_700ns and breaks the equality round-trip on Windows.
+#[cfg(unix)]
+#[test]
+fn epoch_timestamp_with_nanoseconds_is_preserved() {
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("epoch-nsec-source.txt");
+    let dest = temp.path().join("epoch-nsec-dest.txt");
+    fs::write(&source, b"data").expect("write source");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let epoch_time = FileTime::from_unix_time(0, 123_456_789);
+    set_file_times(&source, epoch_time, epoch_time).expect("set epoch time with nsec");
+
+    let metadata = fs::metadata(&source).expect("metadata");
+    apply_file_metadata(&dest, &metadata).expect("apply file metadata");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    let dest_mtime = FileTime::from_last_modification_time(&dest_meta);
+
+    assert_eq!(
+        dest_mtime, epoch_time,
+        "mtime with nanoseconds should be preserved at epoch"
+    );
+}
+
+// NTFS FILETIME has 100ns granularity, so 999_999_999ns truncates to
+// 999_999_900ns and breaks the equality round-trip on Windows.
+#[cfg(unix)]
+#[test]
+fn epoch_timestamp_round_trip_file() {
+    let temp = tempdir().expect("tempdir");
+    let file1 = temp.path().join("epoch-rt1.txt");
+    let file2 = temp.path().join("epoch-rt2.txt");
+    let file3 = temp.path().join("epoch-rt3.txt");
+    fs::write(&file1, b"data").expect("write file1");
+    fs::write(&file2, b"data").expect("write file2");
+    fs::write(&file3, b"data").expect("write file3");
+
+    let epoch_time = FileTime::from_unix_time(0, 999_999_999);
+    set_file_times(&file1, epoch_time, epoch_time).expect("set file1 epoch time");
+
+    let meta1 = fs::metadata(&file1).expect("metadata file1");
+    apply_file_metadata(&file2, &meta1).expect("apply to file2");
+
+    let meta2 = fs::metadata(&file2).expect("metadata file2");
+    apply_file_metadata(&file3, &meta2).expect("apply to file3");
+
+    let time1 = FileTime::from_last_modification_time(&meta1);
+    let time2 = FileTime::from_last_modification_time(&meta2);
+    let time3 =
+        FileTime::from_last_modification_time(&fs::metadata(&file3).expect("metadata file3"));
+
+    assert_eq!(time1, epoch_time);
+    assert_eq!(time2, epoch_time);
+    assert_eq!(time3, epoch_time);
+}
+
+#[test]
+fn epoch_timestamp_directory_preserved() {
+    let temp = tempdir().expect("tempdir");
+    let source_dir = temp.path().join("epoch-source-dir");
+    let dest_dir = temp.path().join("epoch-dest-dir");
+    fs::create_dir(&source_dir).expect("create source dir");
+    fs::create_dir(&dest_dir).expect("create dest dir");
+
+    let epoch_time = FileTime::from_unix_time(0, 0);
+    set_file_times(&source_dir, epoch_time, epoch_time).expect("set dir epoch time");
+
+    let metadata = fs::metadata(&source_dir).expect("metadata");
+    apply_directory_metadata(&dest_dir, &metadata).expect("apply directory metadata");
+
+    let dest_meta = fs::metadata(&dest_dir).expect("dest metadata");
+    let dest_mtime = FileTime::from_last_modification_time(&dest_meta);
+
+    assert_eq!(
+        dest_mtime, epoch_time,
+        "directory mtime should be preserved at epoch"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn epoch_timestamp_symlink_preserved() {
+    use filetime::set_symlink_file_times;
+    use std::os::unix::fs::symlink;
+
+    let temp = tempdir().expect("tempdir");
+    let target = temp.path().join("epoch-target.txt");
+    let source_link = temp.path().join("epoch-source-link");
+    let dest_link = temp.path().join("epoch-dest-link");
+    fs::write(&target, b"target data").expect("write target");
+    symlink(&target, &source_link).expect("create source link");
+    symlink(&target, &dest_link).expect("create dest link");
+
+    let epoch_time = FileTime::from_unix_time(0, 500_000_000);
+    set_symlink_file_times(&source_link, epoch_time, epoch_time).expect("set link epoch time");
+
+    let metadata = fs::symlink_metadata(&source_link).expect("metadata");
+    apply_symlink_metadata(&dest_link, &metadata).expect("apply symlink metadata");
+
+    let dest_meta = fs::symlink_metadata(&dest_link).expect("dest metadata");
+    let dest_mtime = FileTime::from_last_modification_time(&dest_meta);
+
+    assert_eq!(
+        dest_mtime, epoch_time,
+        "symlink mtime should be preserved at epoch"
+    );
+}
+
+#[test]
+fn epoch_timestamp_from_file_entry() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("epoch-entry.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let mut entry = FileEntry::new_file("epoch-entry.txt".into(), 4, 0o644);
+    entry.set_mtime(0, 0);
+
+    let opts = MetadataOptions::new().preserve_times(true);
+    apply_metadata_from_file_entry(&dest, &entry, &opts).expect("apply from entry with epoch");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    let dest_mtime = FileTime::from_last_modification_time(&dest_meta);
+
+    assert_eq!(
+        dest_mtime,
+        FileTime::from_unix_time(0, 0),
+        "FileEntry epoch timestamp should be preserved"
+    );
+}
+
+// NTFS FILETIME has 100ns granularity, so 987_654_321ns truncates to
+// 987_654_300ns and breaks the equality assertion on Windows.
+#[cfg(unix)]
+#[test]
+fn epoch_timestamp_from_file_entry_with_nanoseconds() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("epoch-entry-nsec.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let mut entry = FileEntry::new_file("epoch-entry-nsec.txt".into(), 4, 0o644);
+    entry.set_mtime(0, 987_654_321);
+
+    let opts = MetadataOptions::new().preserve_times(true);
+    apply_metadata_from_file_entry(&dest, &entry, &opts).expect("apply from entry with epoch nsec");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    let dest_mtime = FileTime::from_last_modification_time(&dest_meta);
+
+    assert_eq!(
+        dest_mtime,
+        FileTime::from_unix_time(0, 987_654_321),
+        "FileEntry epoch timestamp with nanoseconds should be preserved"
+    );
+}
+
+#[test]
+fn epoch_timestamp_formatting_is_correct() {
+    let epoch_zero = FileTime::from_unix_time(0, 0);
+    let epoch_nsec = FileTime::from_unix_time(0, 123_456_789);
+    let one_second = FileTime::from_unix_time(1, 0);
+
+    assert!(epoch_zero < one_second);
+    assert!(epoch_zero < epoch_nsec);
+    assert!(epoch_nsec < one_second);
+
+    assert_eq!(epoch_zero, FileTime::from_unix_time(0, 0));
+    assert_ne!(epoch_zero, epoch_nsec);
+
+    let debug_str = format!("{epoch_zero:?}");
+    assert!(!debug_str.is_empty());
+}
+
+#[test]
+fn epoch_timestamp_edge_case_one_nanosecond() {
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("epoch-one-nsec-source.txt");
+    let dest = temp.path().join("epoch-one-nsec-dest.txt");
+    fs::write(&source, b"data").expect("write source");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let one_nsec = FileTime::from_unix_time(0, 1);
+    set_file_times(&source, one_nsec, one_nsec).expect("set one nsec time");
+
+    let metadata = fs::metadata(&source).expect("metadata");
+    apply_file_metadata(&dest, &metadata).expect("apply file metadata");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    let dest_mtime = FileTime::from_last_modification_time(&dest_meta);
+
+    // Some filesystems may not support nanosecond precision,
+    // so we check that we at least preserved the second (0)
+    assert_eq!(dest_mtime.unix_seconds(), 0, "seconds should be zero");
+}
+
+#[test]
+fn attrs_flags_empty_applies_mtime_normally() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("attrs-empty.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let mut entry = FileEntry::new_file("attrs-empty.txt".into(), 4, 0o644);
+    entry.set_mtime(1_700_000_000, 0);
+
+    let opts = MetadataOptions::new().preserve_times(true);
+    apply_metadata_with_attrs_flags(&dest, &entry, &opts, None, AttrsFlags::empty())
+        .expect("apply with empty flags");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    let dest_mtime = FileTime::from_last_modification_time(&dest_meta);
+    assert_eq!(dest_mtime.unix_seconds(), 1_700_000_000);
+}
+
+#[test]
+fn attrs_flags_skip_mtime_prevents_mtime_application() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("attrs-skip-mtime.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let original_mtime = FileTime::from_last_modification_time(&fs::metadata(&dest).expect("meta"));
+
+    let mut entry = FileEntry::new_file("attrs-skip-mtime.txt".into(), 4, 0o644);
+    entry.set_mtime(1_600_000_000, 0);
+
+    let opts = MetadataOptions::new().preserve_times(true);
+    apply_metadata_with_attrs_flags(&dest, &entry, &opts, None, AttrsFlags::SKIP_MTIME)
+        .expect("apply with SKIP_MTIME");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    let dest_mtime = FileTime::from_last_modification_time(&dest_meta);
+    assert_eq!(dest_mtime, original_mtime);
+}
+
+#[test]
+fn attrs_flags_skip_crtime_prevents_crtime_application() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("attrs-skip-crtime.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let mut entry = FileEntry::new_file("attrs-skip-crtime.txt".into(), 4, 0o644);
+    entry.set_mtime(1_700_000_000, 0);
+    entry.set_crtime(1_600_000_000);
+
+    let opts = MetadataOptions::new()
+        .preserve_times(true)
+        .preserve_crtimes(true);
+    apply_metadata_with_attrs_flags(&dest, &entry, &opts, None, AttrsFlags::SKIP_CRTIME)
+        .expect("apply with SKIP_CRTIME");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    let dest_mtime = FileTime::from_last_modification_time(&dest_meta);
+    assert_eq!(dest_mtime.unix_seconds(), 1_700_000_000);
+}
+
+/// Birth time of `path` in whole seconds since the Unix epoch.
+#[cfg(target_os = "macos")]
+fn birthtime_secs(path: &std::path::Path) -> i64 {
+    let created = fs::metadata(path)
+        .expect("dest metadata")
+        .created()
+        .expect("birth time");
+    match created.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_secs()).expect("birth time fits i64"),
+        Err(e) => -i64::try_from(e.duration().as_secs()).expect("birth time fits i64"),
+    }
+}
+
+/// An incoming crtime of 0 must be stamped, not silently ignored.
+///
+/// Zero is a legitimate value on the wire rather than a marker for "absent".
+/// Upstream's `get_create_time()` returns 0 when the sender is a daemon running
+/// without chroot (`syscall.c`, 3.4.3+), so every file list produced by such a
+/// daemon carries crtime 0 - and upstream stamps it, because `rsync.c:615-623`
+/// gates only on `crtimes_ndx && !(flags & ATTRS_SKIP_CRTIME)` and then on
+/// `same_time()`, with no zero test anywhere.
+///
+/// oc previously carried an extra `entry.crtime() != 0` conjunct, so it left the
+/// destination's own birth time in place while upstream wrote 0 - measured as a
+/// real divergence pulling from an upstream 3.4.4 daemon. Guarding the whole
+/// behaviour rather than the removed conjunct: this fails if the zero test comes
+/// back in any form.
+#[cfg(target_os = "macos")]
+#[test]
+fn incoming_zero_crtime_is_applied_rather_than_treated_as_absent() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("zero-crtime.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let opts = MetadataOptions::new()
+        .preserve_times(true)
+        .preserve_crtimes(true);
+
+    // Give the destination a nonzero birth time, so a later zero is a real
+    // change rather than a no-op the assertion could pass on by accident.
+    let mut seeded = FileEntry::new_file("zero-crtime.txt".into(), 4, 0o644);
+    seeded.set_mtime(1_700_000_000, 0);
+    seeded.set_crtime(1_600_000_000);
+    apply_metadata_with_attrs_flags(&dest, &seeded, &opts, None, AttrsFlags::empty())
+        .expect("seed crtime");
+    assert_eq!(
+        birthtime_secs(&dest),
+        1_600_000_000,
+        "precondition: destination must carry a nonzero birth time"
+    );
+
+    // Now the daemon-sourced shape: crtime 0 alongside a normal mtime.
+    let mut entry = FileEntry::new_file("zero-crtime.txt".into(), 4, 0o644);
+    entry.set_mtime(1_700_000_000, 0);
+    entry.set_crtime(0);
+    apply_metadata_with_attrs_flags(&dest, &entry, &opts, None, AttrsFlags::empty())
+        .expect("apply zero crtime");
+
+    assert_eq!(
+        birthtime_secs(&dest),
+        0,
+        "an incoming crtime of 0 must be stamped, not skipped as if absent"
+    );
+}
+
+/// The zero-crtime rule must still yield to `SKIP_CRTIME`, which is the one
+/// conjunct upstream does have alongside `crtimes_ndx`.
+#[cfg(target_os = "macos")]
+#[test]
+fn skip_crtime_still_suppresses_an_incoming_zero_crtime() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("zero-crtime-skipped.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let opts = MetadataOptions::new()
+        .preserve_times(true)
+        .preserve_crtimes(true);
+
+    let mut seeded = FileEntry::new_file("zero-crtime-skipped.txt".into(), 4, 0o644);
+    seeded.set_mtime(1_700_000_000, 0);
+    seeded.set_crtime(1_600_000_000);
+    apply_metadata_with_attrs_flags(&dest, &seeded, &opts, None, AttrsFlags::empty())
+        .expect("seed crtime");
+
+    let mut entry = FileEntry::new_file("zero-crtime-skipped.txt".into(), 4, 0o644);
+    entry.set_mtime(1_700_000_000, 0);
+    entry.set_crtime(0);
+    apply_metadata_with_attrs_flags(&dest, &entry, &opts, None, AttrsFlags::SKIP_CRTIME)
+        .expect("apply with SKIP_CRTIME");
+
+    assert_eq!(
+        birthtime_secs(&dest),
+        1_600_000_000,
+        "SKIP_CRTIME must suppress the write even for a zero crtime"
+    );
+}
+
+#[test]
+fn attrs_flags_skip_all_times_prevents_all_time_application() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("attrs-skip-all.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let original_mtime = FileTime::from_last_modification_time(&fs::metadata(&dest).expect("meta"));
+
+    let mut entry = FileEntry::new_file("attrs-skip-all.txt".into(), 4, 0o644);
+    entry.set_mtime(1_600_000_000, 0);
+    entry.set_crtime(1_500_000_000);
+
+    let opts = MetadataOptions::new()
+        .preserve_times(true)
+        .preserve_atimes(true)
+        .preserve_crtimes(true);
+    apply_metadata_with_attrs_flags(&dest, &entry, &opts, None, AttrsFlags::SKIP_ALL_TIMES)
+        .expect("apply with SKIP_ALL_TIMES");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    let dest_mtime = FileTime::from_last_modification_time(&dest_meta);
+    assert_eq!(dest_mtime, original_mtime);
+}
+
+#[test]
+fn attrs_flags_skip_mtime_with_atime_still_applies_atime() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("attrs-skip-mtime-keep-atime.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let original_mtime = FileTime::from_last_modification_time(&fs::metadata(&dest).expect("meta"));
+
+    let mut entry = FileEntry::new_file("attrs-skip-mtime-keep-atime.txt".into(), 4, 0o644);
+    entry.set_mtime(1_600_000_000, 0);
+    entry.set_atime(1_650_000_000);
+
+    let opts = MetadataOptions::new()
+        .preserve_times(true)
+        .preserve_atimes(true);
+    apply_metadata_with_attrs_flags(&dest, &entry, &opts, None, AttrsFlags::SKIP_MTIME)
+        .expect("apply with SKIP_MTIME only");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    let dest_mtime = FileTime::from_last_modification_time(&dest_meta);
+    assert_eq!(dest_mtime, original_mtime);
+
+    let dest_atime = FileTime::from_last_access_time(&dest_meta);
+    assert_eq!(dest_atime.unix_seconds(), 1_650_000_000);
+}
+
+#[test]
+fn attrs_flags_delegating_function_matches_direct_call() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest1 = temp.path().join("delegate1.txt");
+    let dest2 = temp.path().join("delegate2.txt");
+    fs::write(&dest1, b"data").expect("write");
+    fs::write(&dest2, b"data").expect("write");
+
+    let mut entry = FileEntry::new_file("test.txt".into(), 4, 0o644);
+    entry.set_mtime(1_700_000_000, 0);
+
+    let opts = MetadataOptions::new().preserve_times(true);
+
+    apply_metadata_with_cached_stat(&dest1, &entry, &opts, None).expect("apply cached");
+    apply_metadata_with_attrs_flags(&dest2, &entry, &opts, None, AttrsFlags::empty())
+        .expect("apply flags");
+
+    let m1 = FileTime::from_last_modification_time(&fs::metadata(&dest1).expect("m1"));
+    let m2 = FileTime::from_last_modification_time(&fs::metadata(&dest2).expect("m2"));
+    assert_eq!(m1, m2);
+}
+
+#[test]
+fn attrs_flags_skip_atime_alone_does_not_affect_mtime() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("attrs-skip-atime-only.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let mut entry = FileEntry::new_file("attrs-skip-atime-only.txt".into(), 4, 0o644);
+    entry.set_mtime(1_700_000_000, 0);
+    entry.set_atime(1_650_000_000);
+
+    let opts = MetadataOptions::new()
+        .preserve_times(true)
+        .preserve_atimes(true);
+    apply_metadata_with_attrs_flags(&dest, &entry, &opts, None, AttrsFlags::SKIP_ATIME)
+        .expect("apply with SKIP_ATIME");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    let dest_mtime = FileTime::from_last_modification_time(&dest_meta);
+    assert_eq!(dest_mtime.unix_seconds(), 1_700_000_000);
+}
+
+#[cfg(unix)]
+#[test]
+fn attrs_flags_skip_mtime_does_not_affect_permissions() {
+    use protocol::flist::FileEntry;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("attrs-perms.txt");
+    fs::write(&dest, b"data").expect("write dest");
+    fs::set_permissions(&dest, PermissionsExt::from_mode(0o666)).expect("set dest perms");
+
+    let entry = FileEntry::new_file("attrs-perms.txt".into(), 4, 0o755);
+
+    let opts = MetadataOptions::new()
+        .preserve_permissions(true)
+        .preserve_times(true);
+    apply_metadata_with_attrs_flags(&dest, &entry, &opts, None, AttrsFlags::SKIP_MTIME)
+        .expect("apply with SKIP_MTIME");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    assert_eq!(dest_meta.permissions().mode() & 0o777, 0o755);
+}
+
+#[cfg(all(unix, feature = "xattr"))]
+#[test]
+fn fake_super_writes_rsync_stat_xattr_for_regular_file() {
+    use crate::fake_super::{FAKE_SUPER_XATTR, FakeSuperStat};
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("fakesuper-regular.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let mut entry = FileEntry::new_file("fakesuper-regular.txt".into(), 4, 0o100_644);
+    entry.set_uid(4242);
+    entry.set_gid(4343);
+
+    let opts = MetadataOptions::new()
+        .fake_super(true)
+        .preserve_owner(true)
+        .preserve_group(true);
+
+    apply_metadata_from_file_entry(&dest, &entry, &opts).expect("apply with fake-super");
+
+    let raw = match xattr::get(&dest, FAKE_SUPER_XATTR) {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            // Filesystem without xattr support (e.g. tmpfs without user_xattr).
+            return;
+        }
+        Err(_) => return,
+    };
+    let decoded =
+        FakeSuperStat::decode(std::str::from_utf8(&raw).expect("xattr utf-8")).expect("decode");
+
+    assert_eq!(decoded.mode, 0o100_644);
+    assert_eq!(decoded.uid, 4242);
+    assert_eq!(decoded.gid, 4343);
+    assert_eq!(decoded.rdev, None);
+}
+
+#[cfg(all(unix, feature = "xattr"))]
+#[test]
+fn fake_super_does_not_chown_destination() {
+    use crate::fake_super::FAKE_SUPER_XATTR;
+    use protocol::flist::FileEntry;
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("fakesuper-nochown.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let original_uid = fs::metadata(&dest).expect("metadata").uid();
+    let original_gid = fs::metadata(&dest).expect("metadata").gid();
+
+    let mut entry = FileEntry::new_file("fakesuper-nochown.txt".into(), 4, 0o100_644);
+    // Use a uid/gid the unprivileged test process cannot assume directly.
+    entry.set_uid(original_uid + 1000);
+    entry.set_gid(original_gid + 1000);
+
+    let opts = MetadataOptions::new()
+        .fake_super(true)
+        .preserve_owner(true)
+        .preserve_group(true);
+
+    apply_metadata_from_file_entry(&dest, &entry, &opts)
+        .expect("fake-super apply must not fail without root");
+
+    let after = fs::metadata(&dest).expect("metadata");
+    assert_eq!(
+        after.uid(),
+        original_uid,
+        "fake-super must not invoke chown on the inode"
+    );
+    assert_eq!(
+        after.gid(),
+        original_gid,
+        "fake-super must not invoke chown on the inode"
+    );
+
+    // Sanity: the xattr was written when the filesystem supports it.
+    if let Ok(Some(_)) = xattr::get(&dest, FAKE_SUPER_XATTR) {
+        // Nothing else to assert; existence proves the wire-up.
+    }
+}
+
+// upstream: xattrs.c:set_stat_xattr() under am_root<0 - a `--fake-super
+// --chmod=a=` directory keeps a self-accessible real mode (0700) while the
+// intended mode (040000) lands in the `user.rsync.%stat` xattr. Without the
+// deflection the local-copy path chmods the real dir to 000 and every later
+// open of it fails, mirroring the `xattrs` conformance-test failure.
+#[cfg(all(unix, feature = "xattr"))]
+#[test]
+fn fake_super_chmod_deflects_directory_real_mode() {
+    use crate::chmod::ChmodModifiers;
+    use crate::fake_super::load_fake_super;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let src = temp.path().join("src_dir");
+    let dst = temp.path().join("dst_dir");
+    fs::create_dir(&src).expect("create src dir");
+    fs::create_dir(&dst).expect("create dst dir");
+    fs::set_permissions(&src, fs::Permissions::from_mode(0o700)).expect("chmod src");
+
+    let src_meta = fs::symlink_metadata(&src).expect("stat src");
+    let opts = MetadataOptions::new()
+        .fake_super(true)
+        .preserve_owner(true)
+        .preserve_group(true)
+        .preserve_permissions(true)
+        .with_chmod(Some(ChmodModifiers::parse("a=").expect("parse a=")));
+
+    apply_directory_metadata_with_options(&dst, &src_meta, opts).expect("apply dir metadata");
+
+    // The real directory mode must stay self-accessible (0700), never 000.
+    let real = fs::metadata(&dst).expect("stat dst").mode() & 0o777;
+    if let Ok(Some(stat)) = load_fake_super(&dst) {
+        // Filesystem supports xattrs: assert the full upstream contract.
+        assert_eq!(real, 0o700, "real dir mode must be deflected to 0700");
+        assert_eq!(
+            stat.mode, 0o040_000,
+            "xattr must record the chmod-applied mode (040000), not the source mode"
+        );
+    } else {
+        // No xattr backing (e.g. tmpfs sans user_xattr): still must be readable.
+        assert_eq!(real, 0o700, "real dir mode must be deflected to 0700");
+    }
+}
+
+// upstream: xattrs.c:1220 - regular files are deflected to 0600 (not 0700).
+#[cfg(all(unix, feature = "xattr"))]
+#[test]
+fn fake_super_chmod_deflects_regular_file_real_mode() {
+    use crate::chmod::ChmodModifiers;
+    use crate::fake_super::load_fake_super;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let src = temp.path().join("src.txt");
+    let dst = temp.path().join("dst.txt");
+    fs::write(&src, b"data").expect("write src");
+    fs::write(&dst, b"data").expect("write dst");
+    fs::set_permissions(&src, fs::Permissions::from_mode(0o644)).expect("chmod src");
+
+    let src_meta = fs::symlink_metadata(&src).expect("stat src");
+    let opts = MetadataOptions::new()
+        .fake_super(true)
+        .preserve_owner(true)
+        .preserve_group(true)
+        .preserve_permissions(true)
+        .with_chmod(Some(ChmodModifiers::parse("a=").expect("parse a=")));
+
+    apply_file_metadata_with_options(&dst, &src_meta, &opts).expect("apply file metadata");
+
+    let real = fs::metadata(&dst).expect("stat dst").mode() & 0o777;
+    assert_eq!(real, 0o600, "real file mode must be deflected to 0600");
+    if let Ok(Some(stat)) = load_fake_super(&dst) {
+        assert_eq!(
+            stat.mode, 0o100_000,
+            "xattr must record the chmod-applied file mode (100000)"
+        );
+    }
+}
+
+// upstream: xattrs.c:1225-1237 - when the real mode/uid/gid already faithfully
+// represent the intended values (a plain 0755 dir owned by the copying user),
+// set_stat_xattr writes no shim and removes any stale %stat. An unprivileged
+// same-owner fake-super copy of such a directory must leave no %stat behind.
+#[cfg(all(unix, feature = "xattr"))]
+#[test]
+fn fake_super_faithful_directory_writes_no_stat_xattr() {
+    use crate::fake_super::load_fake_super;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let src = temp.path().join("src_dir");
+    let dst = temp.path().join("dst_dir");
+    fs::create_dir(&src).expect("create src dir");
+    fs::create_dir(&dst).expect("create dst dir");
+    fs::set_permissions(&src, fs::Permissions::from_mode(0o755)).expect("chmod src");
+
+    let src_meta = fs::symlink_metadata(&src).expect("stat src");
+    let opts = MetadataOptions::new()
+        .fake_super(true)
+        .preserve_owner(true)
+        .preserve_group(true)
+        .preserve_permissions(true);
+
+    apply_directory_metadata_with_options(&dst, &src_meta, opts).expect("apply dir metadata");
+
+    // Same-owner 0755 dir: the real 0755 mode already conveys the intent, so no
+    // %stat shim is written (matching upstream's write-or-remove rule).
+    assert!(
+        matches!(load_fake_super(&dst), Ok(None)),
+        "faithful same-owner dir must carry no rsync.%stat xattr"
+    );
+    let real = fs::metadata(&dst).expect("stat dst").mode() & 0o777;
+    assert_eq!(real, 0o755, "real dir mode preserved");
+}
+
+#[cfg(all(unix, feature = "xattr"))]
+#[test]
+fn fake_super_skips_rewrite_when_xattr_already_matches() {
+    use crate::fake_super::{FAKE_SUPER_XATTR, FakeSuperStat, store_fake_super};
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("fakesuper-skip.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let stat = FakeSuperStat {
+        mode: 0o100_640,
+        uid: 7777,
+        gid: 8888,
+        rdev: None,
+    };
+    if store_fake_super(&dest, &stat).is_err() {
+        // Filesystem without xattr support; skip silently.
+        return;
+    }
+    let raw_before = xattr::get(&dest, FAKE_SUPER_XATTR)
+        .expect("xattr get")
+        .expect("xattr present");
+
+    let mut entry = FileEntry::new_file("fakesuper-skip.txt".into(), 4, 0o100_640);
+    entry.set_uid(7777);
+    entry.set_gid(8888);
+
+    let opts = MetadataOptions::new()
+        .fake_super(true)
+        .preserve_owner(true)
+        .preserve_group(true);
+
+    apply_metadata_from_file_entry(&dest, &entry, &opts).expect("apply with fake-super");
+
+    let raw_after = xattr::get(&dest, FAKE_SUPER_XATTR)
+        .expect("xattr get")
+        .expect("xattr present");
+    assert_eq!(raw_before, raw_after, "xattr must remain byte-identical");
+}
+
+/// Confirms the local-copy path also writes `user.rsync.%stat` under
+/// `--fake-super`. This exercises `apply_file_metadata_with_options`, which
+/// takes an `fs::Metadata` directly rather than a wire-protocol `FileEntry`.
+// upstream: xattrs.c:set_stat_xattr() under am_root < 0
+#[cfg(all(unix, feature = "xattr"))]
+#[test]
+fn fake_super_writes_stat_xattr_via_local_metadata() {
+    use crate::fake_super::{FAKE_SUPER_XATTR, FakeSuperStat};
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("fakesuper-localmeta.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let metadata = fs::metadata(&dest).expect("dest metadata");
+
+    let opts = MetadataOptions::new()
+        .fake_super(true)
+        .preserve_owner(true)
+        .preserve_group(true)
+        .preserve_permissions(true);
+
+    apply_file_metadata_with_options(&dest, &metadata, &opts)
+        .expect("apply with fake-super via fs::Metadata");
+
+    let raw = match xattr::get(&dest, FAKE_SUPER_XATTR) {
+        Ok(Some(value)) => value,
+        Ok(None) | Err(_) => return,
+    };
+    let decoded =
+        FakeSuperStat::decode(std::str::from_utf8(&raw).expect("xattr utf-8")).expect("decode");
+
+    assert_eq!(decoded.mode, metadata.mode());
+    assert_eq!(decoded.uid, metadata.uid());
+    assert_eq!(decoded.gid, metadata.gid());
+    assert_eq!(decoded.rdev, None, "regular file must not carry rdev");
+}
+
+/// Without `--fake-super`, the local-copy ownership path must not synthesise
+/// the `user.rsync.%stat` xattr.
+#[cfg(all(unix, feature = "xattr"))]
+#[test]
+fn fake_super_off_does_not_write_stat_xattr_via_local_metadata() {
+    use crate::fake_super::FAKE_SUPER_XATTR;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("fakesuper-off.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let metadata = fs::metadata(&dest).expect("dest metadata");
+
+    let opts = MetadataOptions::new()
+        .preserve_owner(true)
+        .preserve_group(true)
+        .preserve_permissions(true);
+
+    apply_file_metadata_with_options(&dest, &metadata, &opts).expect("apply without fake-super");
+
+    let raw = xattr::get(&dest, FAKE_SUPER_XATTR).ok().flatten();
+    assert!(
+        raw.is_none(),
+        "user.rsync.%stat must not appear without --fake-super; got {raw:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn metadata_unchanged_returns_true_when_all_attrs_match() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("unchanged.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let meta = fs::metadata(&dest).expect("metadata");
+    let mtime = FileTime::from_last_modification_time(&meta);
+
+    let mut entry = FileEntry::new_file("unchanged.txt".into(), 4, meta.mode() & 0o7777);
+    entry.set_mtime(mtime.unix_seconds(), mtime.nanoseconds());
+    entry.set_uid(meta.uid());
+    entry.set_gid(meta.gid());
+
+    let opts = MetadataOptions::new()
+        .preserve_permissions(true)
+        .preserve_times(true)
+        .preserve_owner(true)
+        .preserve_group(true);
+
+    assert!(
+        metadata_unchanged(&entry, &opts, &meta, crate::ModifyWindow::ZERO),
+        "should return true when all attributes match"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn metadata_unchanged_returns_false_on_permission_mismatch() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("perm-mismatch.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let meta = fs::metadata(&dest).expect("metadata");
+    let mtime = FileTime::from_last_modification_time(&meta);
+
+    // Use different permissions than what's on disk
+    let disk_mode = meta.mode() & 0o7777;
+    let different_mode = disk_mode ^ 0o020; // flip group write bit
+
+    let mut entry = FileEntry::new_file("perm-mismatch.txt".into(), 4, different_mode);
+    entry.set_mtime(mtime.unix_seconds(), mtime.nanoseconds());
+    entry.set_uid(meta.uid());
+    entry.set_gid(meta.gid());
+
+    let opts = MetadataOptions::new()
+        .preserve_permissions(true)
+        .preserve_times(true)
+        .preserve_owner(true)
+        .preserve_group(true);
+
+    assert!(
+        !metadata_unchanged(&entry, &opts, &meta, crate::ModifyWindow::ZERO),
+        "should return false when permissions differ"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn metadata_unchanged_returns_false_on_mtime_mismatch() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("mtime-mismatch.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let meta = fs::metadata(&dest).expect("metadata");
+
+    let mut entry = FileEntry::new_file("mtime-mismatch.txt".into(), 4, meta.mode() & 0o7777);
+    // Set a different mtime
+    entry.set_mtime(1_600_000_000, 0);
+    entry.set_uid(meta.uid());
+    entry.set_gid(meta.gid());
+
+    let opts = MetadataOptions::new()
+        .preserve_permissions(true)
+        .preserve_times(true)
+        .preserve_owner(true)
+        .preserve_group(true);
+
+    assert!(
+        !metadata_unchanged(&entry, &opts, &meta, crate::ModifyWindow::ZERO),
+        "should return false when mtime differs"
+    );
+}
+
+/// upstream: generator.c:396 `mtime_differs()` -> util1.c:1478 `same_time()` -
+/// `unchanged_attrs()` must treat two mtimes within `--modify-window` as equal.
+/// Before threading the window, oc compared the mtime exactly, so a
+/// within-window destination was mis-classified as changed and its metadata was
+/// re-applied even though upstream would skip it. The default zero window keeps
+/// the whole-second exact comparison.
+#[cfg(unix)]
+#[test]
+fn metadata_unchanged_honors_modify_window() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("window.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let meta = fs::metadata(&dest).expect("metadata");
+    let base = meta.mtime();
+
+    let mut entry = FileEntry::new_file("window.txt".into(), 4, meta.mode() & 0o7777);
+    entry.set_uid(meta.uid());
+    entry.set_gid(meta.gid());
+
+    let opts = MetadataOptions::new()
+        .preserve_permissions(true)
+        .preserve_times(true)
+        .preserve_owner(true)
+        .preserve_group(true);
+
+    // Source mtime 1s newer than the destination: inside a 2s window it is
+    // "the same" (upstream same_time returns 1), so nothing changed.
+    entry.set_mtime(base + 1, 0);
+    assert!(
+        metadata_unchanged(&entry, &opts, &meta, crate::ModifyWindow::from_secs(2)),
+        "mtime delta (1s) <= window (2s) must be unchanged, mirroring same_time()"
+    );
+    // The default zero window keeps the exact whole-second comparison, so the
+    // same 1s drift is reported as changed.
+    assert!(
+        !metadata_unchanged(&entry, &opts, &meta, crate::ModifyWindow::ZERO),
+        "window 0 must stay exact: a 1s drift is a change"
+    );
+
+    // A drift larger than the window is a change regardless of tolerance.
+    entry.set_mtime(base + 3, 0);
+    assert!(
+        !metadata_unchanged(&entry, &opts, &meta, crate::ModifyWindow::from_secs(2)),
+        "mtime delta (3s) > window (2s) must be changed"
+    );
+}
+
+/// WHY: On Windows the only permission bit the apply path preserves is the
+/// read-only attribute, derived from the sender's owner-write bit (0o200).
+/// `windows_readonly_differs` is the pure compare that the `cfg(not(unix))`
+/// quick-check gates on; if it were wrong (or absent) a dest differing ONLY in
+/// the read-only attribute would be judged unchanged and never re-stamped. This
+/// runs on Linux to lock the mapping (0o200 clear == read-only) independent of
+/// any Windows filesystem, mirroring upstream `perms_differ()` (generator.c:418).
+#[test]
+fn windows_readonly_differs_maps_owner_write_bit() {
+    // Sender mode is writable (0o644): a read-only dest differs, a writable
+    // dest matches.
+    assert!(
+        crate::apply::windows_readonly_differs(0o644, true),
+        "writable source vs read-only dest must differ"
+    );
+    assert!(
+        !crate::apply::windows_readonly_differs(0o644, false),
+        "writable source vs writable dest must match"
+    );
+
+    // Sender mode is read-only (0o444, 0o200 clear): a writable dest differs, a
+    // read-only dest matches.
+    assert!(
+        crate::apply::windows_readonly_differs(0o444, false),
+        "read-only source vs writable dest must differ"
+    );
+    assert!(
+        !crate::apply::windows_readonly_differs(0o444, true),
+        "read-only source vs read-only dest must match"
+    );
+}
+
+/// WHY: `set_permissions_like` / `apply_permissions_from_entry` re-stamp the
+/// Windows read-only attribute under `--perms`, so the quick-check must report
+/// a file that differs ONLY in that attribute as changed - otherwise the update
+/// is silently skipped. Runs in the Windows CI job for the metadata crate.
+#[cfg(windows)]
+#[test]
+fn metadata_unchanged_detects_readonly_difference() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("ro.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    // Destination is writable on disk.
+    let meta = fs::metadata(&dest).expect("metadata");
+    assert!(!meta.permissions().readonly(), "dest starts writable");
+    let mtime = FileTime::from_last_modification_time(&meta);
+
+    // Sender entry carries a read-only mode (owner-write bit 0o200 cleared);
+    // every other preserved attribute matches the destination.
+    let mut entry = FileEntry::new_file("ro.txt".into(), 4, 0o444);
+    entry.set_mtime(mtime.unix_seconds(), mtime.nanoseconds());
+
+    let opts = MetadataOptions::new()
+        .preserve_permissions(true)
+        .preserve_times(true);
+
+    assert!(
+        !metadata_unchanged(&entry, &opts, &meta, crate::ModifyWindow::ZERO),
+        "a read-only-only difference must be reported as changed"
+    );
+
+    // Applying the entry must re-stamp the read-only attribute.
+    apply_metadata_from_file_entry(&dest, &entry, &opts).expect("apply from entry");
+    let applied = fs::metadata(&dest).expect("re-stat");
+    assert!(
+        applied.permissions().readonly(),
+        "read-only attribute must be applied to the destination"
+    );
+
+    // Now the destination matches: the quick-check reports unchanged.
+    assert!(
+        metadata_unchanged(&entry, &opts, &applied, crate::ModifyWindow::ZERO),
+        "matching read-only attribute must be reported as unchanged"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn metadata_unchanged_ignores_perms_when_not_preserved() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("no-perms.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let meta = fs::metadata(&dest).expect("metadata");
+    let mtime = FileTime::from_last_modification_time(&meta);
+
+    // Permissions differ but preservation is disabled
+    let mut entry = FileEntry::new_file("no-perms.txt".into(), 4, 0o777);
+    entry.set_mtime(mtime.unix_seconds(), mtime.nanoseconds());
+    entry.set_uid(meta.uid());
+    entry.set_gid(meta.gid());
+
+    let opts = MetadataOptions::new()
+        .preserve_permissions(false)
+        .preserve_times(true)
+        .preserve_owner(true)
+        .preserve_group(true);
+
+    assert!(
+        metadata_unchanged(&entry, &opts, &meta, crate::ModifyWindow::ZERO),
+        "should return true when perms differ but preservation is off"
+    );
+}
+
+/// upstream: generator.c:418-426 perms_differ() - without --perms,
+/// --executability must flag an executability-presence mismatch so the
+/// receiver's quick-check skip path still runs the attribute pass. Before the
+/// fix the network attr-only path left an up-to-date 0644 file at 0644 when
+/// the source was 0755 under `-rtE`.
+#[cfg(unix)]
+#[test]
+fn metadata_unchanged_detects_executability_presence_mismatch() {
+    use protocol::flist::FileEntry;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("exec-mismatch.txt");
+    fs::write(&dest, b"data").expect("write dest");
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o644)).expect("chmod dest");
+
+    let meta = fs::metadata(&dest).expect("metadata");
+    let mtime = FileTime::from_last_modification_time(&meta);
+
+    let mut entry = FileEntry::new_file("exec-mismatch.txt".into(), 4, 0o755);
+    entry.set_mtime(mtime.unix_seconds(), mtime.nanoseconds());
+
+    // MetadataOptions::new() defaults preserve_permissions to true; -E
+    // without -p means it must be explicitly off here, otherwise the perms
+    // leg masks the executability leg and the test passes pre-fix.
+    let opts = MetadataOptions::new()
+        .preserve_permissions(false)
+        .preserve_executability(true)
+        .preserve_times(true);
+
+    assert!(
+        !metadata_unchanged(&entry, &opts, &meta, crate::ModifyWindow::ZERO),
+        "executable source vs non-executable dest must force the attr pass"
+    );
+
+    // The reverse direction (source lost its exec bits) must also differ.
+    let mut entry = FileEntry::new_file("exec-mismatch.txt".into(), 4, 0o600);
+    entry.set_mtime(mtime.unix_seconds(), mtime.nanoseconds());
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).expect("chmod dest");
+    let meta = fs::metadata(&dest).expect("metadata");
+    assert!(
+        !metadata_unchanged(&entry, &opts, &meta, crate::ModifyWindow::ZERO),
+        "non-executable source vs executable dest must force the attr pass"
+    );
+}
+
+/// upstream: generator.c:423-426 - perms_differ() under --executability
+/// compares only exec-bit PRESENCE; read/write differences and matching
+/// presence must not trigger the attribute pass, and non-regular entries are
+/// never tweaked by dest_mode() (rsync.c:456 S_ISREG check).
+#[cfg(unix)]
+#[test]
+fn metadata_unchanged_executability_ignores_matching_presence_and_non_files() {
+    use protocol::flist::FileEntry;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("exec-match.txt");
+    fs::write(&dest, b"data").expect("write dest");
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o654)).expect("chmod dest");
+
+    let meta = fs::metadata(&dest).expect("metadata");
+    let mtime = FileTime::from_last_modification_time(&meta);
+
+    let opts = MetadataOptions::new()
+        .preserve_permissions(false)
+        .preserve_executability(true)
+        .preserve_times(true);
+
+    // Both sides executable (any exec bit counts) with differing rw bits.
+    let mut entry = FileEntry::new_file("exec-match.txt".into(), 4, 0o700);
+    entry.set_mtime(mtime.unix_seconds(), mtime.nanoseconds());
+    assert!(
+        metadata_unchanged(&entry, &opts, &meta, crate::ModifyWindow::ZERO),
+        "matching exec presence must not force the attr pass"
+    );
+
+    // A directory whose exec presence differs is out of scope for -E.
+    let dir = temp.path().join("subdir");
+    fs::create_dir(&dir).expect("create dir");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o600)).expect("chmod dir");
+    let dir_meta = fs::metadata(&dir).expect("dir metadata");
+    let dir_mtime = FileTime::from_last_modification_time(&dir_meta);
+    let mut dir_entry = FileEntry::new_directory("subdir".into(), 0o755);
+    dir_entry.set_mtime(dir_mtime.unix_seconds(), dir_mtime.nanoseconds());
+    assert!(
+        metadata_unchanged(&dir_entry, &opts, &dir_meta, crate::ModifyWindow::ZERO),
+        "-E never applies to directories"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn metadata_unchanged_returns_false_when_chmod_would_change_mode() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("chmod-changes.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let meta = fs::metadata(&dest).expect("metadata");
+
+    let entry = FileEntry::new_file("chmod-changes.txt".into(), 4, 0o644);
+
+    // u+x would change 0o644 to 0o744
+    let chmod = crate::ChmodModifiers::parse("u+x").expect("parse chmod");
+    let opts = MetadataOptions::new().with_chmod(Some(chmod));
+
+    assert!(
+        !metadata_unchanged(&entry, &opts, &meta, crate::ModifyWindow::ZERO),
+        "should return false when chmod would change mode"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn metadata_unchanged_returns_true_when_chmod_is_noop() {
+    use protocol::flist::FileEntry;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("chmod-noop.txt");
+    fs::write(&dest, b"data").expect("write dest");
+    fs::set_permissions(&dest, PermissionsExt::from_mode(0o755)).expect("set perms");
+
+    let meta = fs::metadata(&dest).expect("metadata");
+    let mtime = FileTime::from_last_modification_time(&meta);
+
+    let mut entry = FileEntry::new_file("chmod-noop.txt".into(), 4, meta.mode() & 0o7777);
+    entry.set_mtime(mtime.unix_seconds(), mtime.nanoseconds());
+    entry.set_uid(meta.uid());
+    entry.set_gid(meta.gid());
+
+    // u+x on a file that already has u+x is a no-op
+    let chmod = crate::ChmodModifiers::parse("u+x").expect("parse chmod");
+    let opts = MetadataOptions::new()
+        .preserve_permissions(true)
+        .preserve_times(true)
+        .preserve_owner(true)
+        .preserve_group(true)
+        .with_chmod(Some(chmod));
+
+    assert!(
+        metadata_unchanged(&entry, &opts, &meta, crate::ModifyWindow::ZERO),
+        "should return true when chmod modifier does not change mode"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn metadata_unchanged_returns_true_when_owner_override_matches() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("owner-match.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let meta = fs::metadata(&dest).expect("metadata");
+    let mtime = FileTime::from_last_modification_time(&meta);
+
+    let mut entry = FileEntry::new_file("owner-match.txt".into(), 4, meta.mode() & 0o7777);
+    entry.set_mtime(mtime.unix_seconds(), mtime.nanoseconds());
+    entry.set_uid(meta.uid());
+    entry.set_gid(meta.gid());
+
+    // Set owner override to current UID - no actual change needed
+    let opts = MetadataOptions::new()
+        .preserve_permissions(true)
+        .preserve_times(true)
+        .with_owner_override(Some(meta.uid()));
+
+    assert!(
+        metadata_unchanged(&entry, &opts, &meta, crate::ModifyWindow::ZERO),
+        "should return true when owner override matches current uid"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn metadata_unchanged_returns_false_when_owner_override_differs() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("owner-differ.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let meta = fs::metadata(&dest).expect("metadata");
+    let mtime = FileTime::from_last_modification_time(&meta);
+
+    let mut entry = FileEntry::new_file("owner-differ.txt".into(), 4, meta.mode() & 0o7777);
+    entry.set_mtime(mtime.unix_seconds(), mtime.nanoseconds());
+    entry.set_uid(meta.uid());
+    entry.set_gid(meta.gid());
+
+    // Set owner override to a different UID
+    let opts = MetadataOptions::new()
+        .preserve_permissions(true)
+        .preserve_times(true)
+        .with_owner_override(Some(meta.uid() + 1));
+
+    assert!(
+        !metadata_unchanged(&entry, &opts, &meta, crate::ModifyWindow::ZERO),
+        "should return false when owner override differs from current uid"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn metadata_unchanged_returns_true_when_group_override_matches() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("group-match.txt");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let meta = fs::metadata(&dest).expect("metadata");
+    let mtime = FileTime::from_last_modification_time(&meta);
+
+    let mut entry = FileEntry::new_file("group-match.txt".into(), 4, meta.mode() & 0o7777);
+    entry.set_mtime(mtime.unix_seconds(), mtime.nanoseconds());
+    entry.set_uid(meta.uid());
+    entry.set_gid(meta.gid());
+
+    // Set group override to current GID - no actual change needed
+    let opts = MetadataOptions::new()
+        .preserve_permissions(true)
+        .preserve_times(true)
+        .with_group_override(Some(meta.gid()));
+
+    assert!(
+        metadata_unchanged(&entry, &opts, &meta, crate::ModifyWindow::ZERO),
+        "should return true when group override matches current gid"
+    );
+}
+
+/// UTS-16.b: applying permissions through a destination path whose parent
+/// component is a symlink to an outside directory must NOT chmod the
+/// outside target. Upstream `syscall.c:do_chmod_at()` (rsync 3.4.3+)
+/// opens the parent under `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` so a
+/// symlink swapped into any parent component is rejected.
+///
+/// Regression coverage for the testsuite `chdir-symlink-race` failure on
+/// the `-r --size-only into upload/ root` flavour: the symlinked
+/// `subdir` was being chased by the path-based chmod, flipping the
+/// outside sentinel from 0o600 to 0o666.
+#[cfg(unix)]
+#[test]
+fn apply_permissions_from_entry_refuses_parent_symlink_escape() {
+    use protocol::flist::FileEntry;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let module = temp.path().join("module");
+    let outside = temp.path().join("outside");
+    fs::create_dir(&module).expect("create module");
+    fs::create_dir(&outside).expect("create outside");
+
+    // Outside-the-module sentinel the attacker is trying to chmod via
+    // the symlink-traversed path.
+    let outside_target = outside.join("target.txt");
+    fs::write(&outside_target, b"OUTSIDE_SECRET_DATA").expect("write outside");
+    fs::set_permissions(&outside_target, PermissionsExt::from_mode(0o600))
+        .expect("set outside mode");
+
+    // Attacker plants a symlink at module/subdir -> outside, then the
+    // receiver tries to chmod module/subdir/target.txt (which resolves
+    // to outside/target.txt via the symlink).
+    std::os::unix::fs::symlink(&outside, module.join("subdir")).expect("plant symlink");
+
+    let dest = module.join("subdir").join("target.txt");
+    let entry = FileEntry::new_file("target.txt".into(), 19, 0o666);
+    let opts = MetadataOptions::new()
+        .preserve_permissions(true)
+        .preserve_times(false);
+
+    let result = apply_metadata_from_file_entry(&dest, &entry, &opts);
+    assert!(
+        result.is_err(),
+        "chmod through a symlinked parent must fail, not silently succeed"
+    );
+
+    let outside_mode = fs::metadata(&outside_target)
+        .expect("stat outside")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(
+        outside_mode, 0o600,
+        "outside file mode must remain 0o600 after refused chmod escape (got {outside_mode:o})"
+    );
+}
+
+/// KDL.8: with `--keep-dirlinks` active, a path-based chmod through a
+/// destination whose parent is a symlink-to-a-real-dir must succeed by
+/// resolving the symlink, instead of being refused by the dirfd-anchored
+/// `secure_chmod_at` sandbox. Mirrors upstream `generator.c:1356`'s
+/// `link_stat(fname, &sx.st, keep_dirlinks && is_dir)` which follows the
+/// symlinked parent at stat time.
+///
+/// Regression coverage for the macOS panic in
+/// `engine::local_copy::tests::execute_keep_dirlinks_multiple_symlink_subdirs_all_preserved`
+/// where the `apply dest_mode` chmod hit `ENOTDIR` because `secure_open_dir`
+/// rejects symlinked parents.
+#[cfg(unix)]
+#[test]
+fn keep_dirlinks_bypasses_secure_chmod_sandbox() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let real_alpha = temp.path().join("real_alpha");
+    fs::create_dir(&real_alpha).expect("create real_alpha");
+
+    let dest_root = temp.path().join("dest");
+    fs::create_dir(&dest_root).expect("create dest");
+    // dest/alpha is a symlink to real_alpha/.
+    std::os::unix::fs::symlink(&real_alpha, dest_root.join("alpha")).expect("symlink alpha");
+
+    let source = temp.path().join("a.txt");
+    fs::write(&source, b"alpha").expect("write source");
+    fs::set_permissions(&source, PermissionsExt::from_mode(0o644)).expect("source mode");
+
+    let dest_file = dest_root.join("alpha").join("a.txt");
+    fs::write(&dest_file, b"alpha").expect("write dest through symlink");
+    fs::set_permissions(&dest_file, PermissionsExt::from_mode(0o600)).expect("dest mode");
+
+    let source_meta = fs::metadata(&source).expect("stat source");
+
+    // Without keep_dirlinks the path-based sandbox refuses the chmod
+    // because dest_root/alpha is a symlink. This is the bug symptom.
+    let strict_opts = MetadataOptions::new()
+        .preserve_permissions(true)
+        .preserve_times(false);
+    let strict_result = apply_file_metadata_with_options(&dest_file, &source_meta, &strict_opts);
+    assert!(
+        strict_result.is_err(),
+        "without keep_dirlinks the dirfd sandbox must reject symlinked parents",
+    );
+
+    // With keep_dirlinks the bypass uses std::fs::set_permissions which
+    // follows the symlink, so the chmod lands on real_alpha/a.txt.
+    let opts = MetadataOptions::new()
+        .preserve_permissions(true)
+        .preserve_times(false)
+        .with_keep_dirlinks(true);
+    apply_file_metadata_with_options(&dest_file, &source_meta, &opts)
+        .expect("chmod must succeed through symlinked parent under --keep-dirlinks");
+
+    let landed_mode = fs::metadata(real_alpha.join("a.txt"))
+        .expect("stat real_alpha/a.txt")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(
+        landed_mode, 0o644,
+        "chmod must follow the symlink and land on real_alpha/a.txt (got {landed_mode:o})",
+    );
+}
+
+// KDL.7.1 cross-platform regression: `--keep-dirlinks` must succeed through a
+// symlinked destination directory on every supported platform. Pins the
+// guarantee from PR #5793 (macOS chmod bypass), PRs #5798/#5799 (extended to
+// four more chmod sites), and the KDL.7 audit that confirmed Linux
+// (openat2 RESOLVE_BENEATH sandboxes parents only, leaf symlink legal) and
+// Windows (chmod is a no-op) were CLEAN by construction but unpinned.
+#[test]
+fn keep_dirlinks_bypass_is_cross_platform_safe() {
+    let temp = tempdir().expect("tempdir");
+    let real_dir = temp.path().join("real_dir");
+    fs::create_dir(&real_dir).expect("create real_dir");
+
+    let dest_root = temp.path().join("dest");
+    fs::create_dir(&dest_root).expect("create dest");
+    let symlinked_dest = dest_root.join("alpha");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real_dir, &symlinked_dest).expect("symlink alpha");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&real_dir, &symlinked_dest).expect("symlink_dir alpha");
+
+    let source = temp.path().join("a.txt");
+    fs::write(&source, b"alpha").expect("write source");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&source, PermissionsExt::from_mode(0o755)).expect("source mode");
+    }
+
+    let dest_file = symlinked_dest.join("a.txt");
+    fs::write(&dest_file, b"alpha").expect("write dest through symlink");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dest_file, PermissionsExt::from_mode(0o600)).expect("dest mode");
+    }
+
+    let source_meta = fs::metadata(&source).expect("stat source");
+
+    let opts = MetadataOptions::new()
+        .preserve_permissions(true)
+        .preserve_times(false)
+        .with_keep_dirlinks(true);
+    apply_file_metadata_with_options(&dest_file, &source_meta, &opts)
+        .expect("apply_file_metadata_with_options must succeed under --keep-dirlinks");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let landed_mode = fs::metadata(real_dir.join("a.txt"))
+            .expect("stat real_dir/a.txt")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            landed_mode, 0o755,
+            "chmod must follow the symlink and land on real_dir/a.txt (got {landed_mode:o})",
+        );
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows chmod is a no-op (FILE_ATTRIBUTE_READONLY only). The
+        // KDL.7.1 guarantee on Windows is that the call succeeds without
+        // ELOOP / permission errors through the symlinked dest dir.
+        let landed = fs::metadata(real_dir.join("a.txt")).expect("stat real_dir/a.txt");
+        assert!(
+            landed.is_file(),
+            "real_dir/a.txt must remain a regular file"
+        );
+    }
+}
+
+// Mirrors upstream rsync's `change_uid`/`change_gid` privilege gates
+// (rsync.c:526-528): a non-root process must not attempt to set a file's owner
+// uid, and may only set its group to one it belongs to. Before this gate,
+// oc-rsync attempted the chown unconditionally and surfaced the resulting
+// EPERM as a fatal exit-code-23 error (e.g. under `-aR` when an implied parent
+// directory is owned by root).
+#[cfg(unix)]
+#[test]
+fn non_root_ownership_gate_drops_owner_keeps_member_group() {
+    if rustix::process::geteuid().is_root() {
+        // As root the gate is a no-op; root behaviour is exercised by the
+        // geteuid()==0 chown tests above.
+        return;
+    }
+
+    let owner = Some(ownership::uid_from_raw(0));
+    let group = Some(ownership::gid_from_raw(rustix::process::getegid().as_raw()));
+
+    let gated_owner = super::ownership::gate_preserved_owner(owner);
+    let gated_group = super::ownership::gate_preserved_group(group);
+
+    assert!(
+        gated_owner.is_none(),
+        "non-root must not attempt to set the owner uid"
+    );
+    assert!(
+        gated_group.is_some(),
+        "non-root may set the group to its own effective gid"
+    );
+}
+
+// Task #168 regression coverage: directory permissions without -p over the
+// entry/network path, atime omission without --atimes, directory atime skip,
+// inherited setgid preservation, and zeroed atime nanoseconds under --atimes.
+
+#[cfg(unix)]
+#[test]
+fn dir_without_perms_over_entry_path_lands_source_mode() {
+    use protocol::flist::FileEntry;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let dir = temp.path().join("d");
+    fs::create_dir(&dir).expect("create dir");
+    // Simulate the receiver's mkdirat(0o777) umask-default result.
+    fs::set_permissions(&dir, PermissionsExt::from_mode(0o755)).expect("chmod 0755");
+
+    let entry = FileEntry::new_directory("d".into(), 0o700);
+    let opts = MetadataOptions::new()
+        .preserve_permissions(false)
+        .preserve_times(false);
+    apply_metadata_from_file_entry(&dir, &entry, &opts).expect("apply dir entry");
+
+    // upstream: generator.c:1466-1467 + rsync.c:659-660 - a new directory
+    // without -p lands the source mode masked by dflt_perms, so a 0700 source
+    // dir stays 0700 rather than the mkdir umask default 0755.
+    assert_eq!(
+        current_mode(&dir) & 0o777,
+        0o700,
+        "new directory without -p must land the source mode, not 0755"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dir_without_perms_over_entry_path_keeps_existing_dir_mode() {
+    use protocol::flist::FileEntry;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let dir = temp.path().join("d");
+    fs::create_dir(&dir).expect("create dir");
+    fs::set_permissions(&dir, PermissionsExt::from_mode(0o700)).expect("chmod 0700");
+    let pre_transfer = fs::metadata(&dir).expect("pre-transfer stat");
+
+    let entry = FileEntry::new_directory("d".into(), 0o777);
+    let opts = MetadataOptions::new()
+        .preserve_permissions(false)
+        .preserve_times(false);
+    // pre_transfer = Some means the dir already existed: upstream keeps its own
+    // permission bits (dest_mode exists=true), never rewriting them.
+    apply_metadata_with_pre_transfer_stat(&dir, &entry, &opts, None, Some(pre_transfer))
+        .expect("apply dir entry");
+
+    assert_eq!(
+        current_mode(&dir) & 0o777,
+        0o700,
+        "an existing directory without -p must keep its own permission bits"
+    );
+}
+
+#[test]
+fn entry_path_omits_atime_without_atimes() {
+    use protocol::flist::FileEntry;
+
+    let temp = tempdir().expect("tempdir");
+    let dest = temp.path().join("f.txt");
+    fs::write(&dest, b"data").expect("write dest");
+    let before = FileTime::from_last_access_time(&fs::metadata(&dest).expect("pre meta"));
+
+    let mut entry = FileEntry::new_file("f.txt".into(), 4, 0o644);
+    entry.set_mtime(1_600_000_000, 0);
+    entry.set_atime(1_650_000_000);
+
+    let opts = MetadataOptions::new().preserve_times(true);
+    apply_metadata_from_file_entry(&dest, &entry, &opts).expect("apply entry");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    let dest_atime = FileTime::from_last_access_time(&dest_meta);
+    let dest_mtime = FileTime::from_last_modification_time(&dest_meta);
+    // upstream: rsync.c:588-589 - without --atimes the access time is left
+    // unchanged (UTIME_OMIT); only the mtime is written.
+    assert_eq!(
+        dest_mtime,
+        FileTime::from_unix_time(1_600_000_000, 0),
+        "mtime must be written from the entry"
+    );
+    assert_eq!(
+        dest_atime, before,
+        "atime must be left unchanged without --atimes"
+    );
+    assert_ne!(
+        dest_atime.unix_seconds(),
+        1_650_000_000,
+        "atime must not be clobbered with the entry atime without --atimes"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn setgid_parent_new_dir_keeps_inherited_sgid() {
+    use protocol::flist::FileEntry;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let parent = temp.path().join("sgid-parent");
+    fs::create_dir(&parent).expect("create parent");
+    // Mark the parent setgid so a child directory inherits S_ISGID at mkdir.
+    fs::set_permissions(&parent, PermissionsExt::from_mode(0o2755)).expect("chmod g+s parent");
+
+    let child = parent.join("child");
+    fs::create_dir(&child).expect("create child");
+
+    // Only meaningful when the filesystem propagated the setgid bit at mkdir.
+    let inherited = fs::metadata(&child)
+        .expect("stat child")
+        .permissions()
+        .mode()
+        & 0o2000
+        != 0;
+    if !inherited {
+        return;
+    }
+
+    let entry = FileEntry::new_directory("child".into(), 0o755);
+    let opts = MetadataOptions::new()
+        .preserve_permissions(false)
+        .preserve_times(false);
+    apply_metadata_from_file_entry(&child, &entry, &opts).expect("apply dir entry");
+
+    // upstream: rsync.c:512-516 - a freshly-created dir keeps an inherited
+    // S_ISGID even though dest_mode() strips it from the non-preserved mode.
+    assert_ne!(
+        current_mode(&child) & 0o2000,
+        0,
+        "inherited setgid must be preserved on a new directory without -p"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn local_atimes_zeroes_atime_nsec() {
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("src.txt");
+    let dest = temp.path().join("dst.txt");
+    fs::write(&source, b"data").expect("write source");
+    fs::write(&dest, b"data").expect("write dest");
+
+    let atime = FileTime::from_unix_time(1_700_000_000, 123_456_789);
+    let mtime = FileTime::from_unix_time(1_700_000_100, 0);
+    set_file_times(&source, atime, mtime).expect("set source times");
+
+    let metadata = fs::metadata(&source).expect("metadata");
+    let opts = MetadataOptions::new()
+        .preserve_times(true)
+        .preserve_atimes(true);
+    apply_file_metadata_with_options(&dest, &metadata, &opts).expect("apply metadata");
+
+    let dest_meta = fs::metadata(&dest).expect("dest metadata");
+    let dest_atime = FileTime::from_last_access_time(&dest_meta);
+    // upstream: rsync.c:609 - the applied access time's nanosecond field is 0.
+    assert_eq!(
+        dest_atime.unix_seconds(),
+        1_700_000_000,
+        "atime seconds preserved"
+    );
+    assert_eq!(
+        dest_atime.nanoseconds(),
+        0,
+        "upstream zeroes the atime nanosecond field"
+    );
+}
+
+// Symlink-mode application only exists where the OS can chmod a link
+// (`CAN_CHMOD_SYMLINK` = macOS/BSD). The two tests below encode WHY it matters:
+// a receiver/local-copy that reports a `p` column for a symlink must also apply
+// that mode, or report and action would drift (upstream rsync.c:658-668 chmods
+// every file type; syscall.c:761 do_chmod() uses lchmod/setattrlist for
+// symlinks). They fail on pre-fix code, which skipped the symlink chmod.
+#[cfg(target_os = "macos")]
+#[test]
+fn symlink_own_mode_applied_from_entry_under_preserve_perms() {
+    use protocol::flist::FileEntry;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    assert!(
+        crate::CAN_CHMOD_SYMLINK,
+        "macOS must advertise symlink chmod support"
+    );
+
+    let temp = tempdir().expect("tempdir");
+    let target = temp.path().join("target.txt");
+    let link = temp.path().join("link");
+    fs::write(&target, b"data").expect("write target");
+    symlink(&target, &link).expect("create link");
+
+    // Seed the link at a mode that differs from the sender's, so a correct
+    // apply is observable as a state change rather than a no-op.
+    fast_io::secure_chmod_at(&link, 0o777, false).expect("seed link mode");
+    assert_eq!(
+        fs::symlink_metadata(&link).unwrap().permissions().mode() & 0o7777,
+        0o777
+    );
+
+    let mut entry = FileEntry::new_symlink("link".into(), "target.txt".into());
+    entry.set_mode(0o120741);
+
+    super::apply_symlink_metadata_from_entry(
+        &link,
+        &entry,
+        &MetadataOptions::new().preserve_permissions(true),
+    )
+    .expect("apply symlink metadata");
+
+    assert_eq!(
+        fs::symlink_metadata(&link).unwrap().permissions().mode() & 0o7777,
+        0o741,
+        "the link's own mode must track the sender under -p"
+    );
+    // The chmod must not have followed the link into its target.
+    assert_eq!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+        0o644,
+        "the symlink chmod must not touch the target file"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn symlink_own_mode_applied_from_source_metadata_local_copy() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let temp = tempdir().expect("tempdir");
+    let target = temp.path().join("t.txt");
+    let src = temp.path().join("src");
+    let dst = temp.path().join("dst");
+    fs::write(&target, b"data").expect("write target");
+    symlink(&target, &src).expect("create src link");
+    symlink(&target, &dst).expect("create dst link");
+
+    fast_io::secure_chmod_at(&src, 0o714, false).expect("seed src mode");
+    fast_io::secure_chmod_at(&dst, 0o777, false).expect("seed dst mode");
+
+    let src_meta = fs::symlink_metadata(&src).expect("src link metadata");
+    super::apply_symlink_metadata_with_options(
+        &dst,
+        &src_meta,
+        &MetadataOptions::new().preserve_permissions(true),
+    )
+    .expect("apply symlink metadata");
+
+    assert_eq!(
+        fs::symlink_metadata(&dst).unwrap().permissions().mode() & 0o7777,
+        0o714,
+        "local-copy must carry the source link's own mode where the OS allows"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn symlink_own_mode_is_noop_on_linux() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    // On Linux a symlink's st_mode is a fixed 0o777 and fchmodat rejects
+    // AT_SYMLINK_NOFOLLOW, so the capability const is false and the apply must
+    // neither error nor change anything - report and action stay silent as one.
+    assert!(!crate::CAN_CHMOD_SYMLINK);
+
+    let temp = tempdir().expect("tempdir");
+    let target = temp.path().join("t.txt");
+    let dst = temp.path().join("dst");
+    fs::write(&target, b"data").expect("write target");
+    symlink(&target, &dst).expect("create dst link");
+
+    let src_meta = fs::symlink_metadata(&dst).expect("dst link metadata");
+    super::apply_symlink_metadata_with_options(
+        &dst,
+        &src_meta,
+        &MetadataOptions::new().preserve_permissions(true),
+    )
+    .expect("apply must be a no-op, not an error, on Linux");
+
+    assert_eq!(
+        fs::symlink_metadata(&dst).unwrap().permissions().mode() & 0o7777,
+        0o777,
+        "a Linux symlink keeps its fixed 0o777 mode"
+    );
+}

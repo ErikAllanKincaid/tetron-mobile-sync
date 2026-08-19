@@ -1,0 +1,22 @@
+#[test]
+fn runtime_options_loads_max_connections_from_config() {
+    let mut file = NamedTempFile::new().expect("config file");
+    writeln!(
+        file,
+        "[docs]\npath = /srv/docs\nuse chroot = no\nmax connections = 7\n"
+    )
+    .expect("write config");
+
+    let options = RuntimeOptions::parse(&[
+        OsString::from("--config"),
+        file.path().as_os_str().to_os_string(),
+    ])
+    .expect("config parses");
+
+    // upstream: connection.c:33 - a positive value is the slot-scan bound.
+    assert_eq!(
+        options.modules[0].max_connections(),
+        MaxConnections::Limited(NonZeroU32::new(7).expect("non-zero"))
+    );
+}
+

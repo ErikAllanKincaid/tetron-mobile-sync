@@ -45,22 +45,35 @@ def check_tests() -> dict:
     return {"pass": r.returncode == 0}
 
 
+# SYNC-002 spec/sync.py's own ACCEPTANCE text: "cargo audit shows only the
+# known russh advisory" -- rsa's Marvin-attack timing side channel, pulled in
+# transitively via russh (SSH transport, never enabled in this app's feature
+# set). No fixed rsa release exists yet (cargo audit's own advisory record:
+# "No fixed upgrade is available!"), so this is accepted indefinitely, not a
+# TODO to clear. Update this set only alongside a spec.py change recording
+# the new exception's rationale, same bar as adding one here did.
+ACCEPTED_ADVISORIES = {"RUSTSEC-2023-0071"}
+
+
 def check_cargo_audit() -> dict:
     """Known-CVE scanning of the dependency tree via `cargo audit`. Mirrors
     core's D-02 check. `cargo-audit` not being installed is reported
-    distinctly from an actual finding. SYNC-002 adds the one known, accepted
-    advisory (RUSTSEC-2023-0071 via russh); until then this gate is already
-    in place."""
+    distinctly from an actual finding. Advisory ids in ACCEPTED_ADVISORIES
+    do not count against the gate (SYNC-002 added the first one,
+    2026-08-19 -- until this fix, ANY appearance of the accepted rsa/russh
+    advisory failed reconcile.py outright, contradicting spec/sync.py's own
+    stated acceptance criterion for this exact advisory)."""
     try:
         r = run(["cargo", "audit", "--json"])
     except FileNotFoundError:
         return {"installed": False, "count": -1}
     try:
         data = json.loads(r.stdout)
-        count = data["vulnerabilities"]["count"]
+        findings = data["vulnerabilities"]["list"]
     except (json.JSONDecodeError, KeyError):
         return {"installed": True, "count": -1}
-    return {"installed": True, "count": count}
+    unaccepted = [f for f in findings if f["advisory"]["id"] not in ACCEPTED_ADVISORIES]
+    return {"installed": True, "count": len(unaccepted)}
 
 
 if __name__ == "__main__":

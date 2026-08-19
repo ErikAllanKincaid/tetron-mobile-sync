@@ -1,0 +1,364 @@
+use super::*;
+
+impl ClientConfig {
+    /// Returns the preferred address family used for daemon or remote-shell connections.
+    #[must_use]
+    #[doc(alias = "--ipv4")]
+    #[doc(alias = "--ipv6")]
+    pub const fn address_mode(&self) -> AddressMode {
+        self.address_mode
+    }
+
+    /// Returns the transport that carries the daemon protocol.
+    ///
+    /// [`Transport::Quic`](crate::client::Transport::Quic) is selected by
+    /// `--quic` or a `quic://` target; the default is
+    /// [`Transport::Tcp`](crate::client::Transport::Tcp). Available only under
+    /// the `quic` feature.
+    #[cfg(feature = "quic")]
+    #[must_use]
+    #[doc(alias = "--quic")]
+    pub const fn daemon_transport(&self) -> crate::client::Transport {
+        self.daemon_transport
+    }
+
+    /// Returns the `--quic-ca` private CA bundle path, if one was supplied.
+    ///
+    /// When present it verifies the daemon's QUIC certificate against this PEM
+    /// bundle instead of the platform trust store (policy B). Available only
+    /// under the `quic` feature.
+    #[cfg(feature = "quic")]
+    #[must_use]
+    #[doc(alias = "--quic-ca")]
+    pub fn quic_ca(&self) -> Option<&std::path::Path> {
+        self.quic_ca.as_deref()
+    }
+
+    /// Returns the configured connect program, if any.
+    #[doc(alias = "--connect-program")]
+    pub fn connect_program(&self) -> Option<&OsStr> {
+        self.connect_program.as_deref()
+    }
+
+    /// Returns the configured bind address, if any.
+    #[doc(alias = "--address")]
+    pub const fn bind_address(&self) -> Option<&BindAddress> {
+        self.bind_address.as_ref()
+    }
+
+    /// Returns the configured socket options, if any.
+    #[doc(alias = "--sockopts")]
+    pub fn sockopts(&self) -> Option<&OsStr> {
+        self.sockopts.as_deref()
+    }
+
+    /// Returns the configured TCP Fast Open mode.
+    ///
+    /// Defaults to [`TcpFastOpenMode::Auto`]: TFO is enabled
+    /// opportunistically on platforms that implement it. `On` requests TFO
+    /// unconditionally, `Off` disables it.
+    #[doc(alias = "--tcp-fastopen")]
+    #[must_use]
+    pub const fn tcp_fastopen(&self) -> TcpFastOpenMode {
+        self.tcp_fastopen
+    }
+
+    /// Returns the requested blocking I/O preference for remote shells.
+    #[doc(alias = "--blocking-io")]
+    #[doc(alias = "--no-blocking-io")]
+    pub const fn blocking_io(&self) -> Option<bool> {
+        self.blocking_io
+    }
+
+    /// Returns the requested bandwidth limit, if any.
+    pub const fn bandwidth_limit(&self) -> Option<BandwidthLimit> {
+        self.bandwidth_limit
+    }
+
+    /// Returns the configured transfer timeout.
+    #[must_use]
+    #[doc(alias = "--timeout")]
+    pub const fn timeout(&self) -> TransferTimeout {
+        self.timeout
+    }
+
+    /// Resolves the `--timeout` value into the I/O stall timeout applied to the
+    /// SSH data channel.
+    ///
+    /// Returns `None` when `--timeout` is unset or `0`, matching upstream where
+    /// `io_timeout == 0` disables the check entirely; a positive value maps to
+    /// that many seconds. Upstream applies the same `io_timeout` uniformly to
+    /// every transport (the SSH pipe included) via `set_io_timeout(io_timeout)`.
+    ///
+    /// upstream: options.c:2369 `set_io_timeout(io_timeout)`, io.c:1148-1160.
+    #[must_use]
+    pub fn ssh_io_timeout(&self) -> Option<std::time::Duration> {
+        self.timeout
+            .as_seconds()
+            .map(|secs| std::time::Duration::from_secs(secs.get()))
+    }
+
+    /// Returns the configured connection timeout.
+    #[must_use]
+    #[doc(alias = "--contimeout")]
+    pub const fn connect_timeout(&self) -> TransferTimeout {
+        self.connect_timeout
+    }
+
+    /// Returns the configured stop-at deadline, if any.
+    #[doc(alias = "--stop-after")]
+    #[doc(alias = "--stop-at")]
+    pub const fn stop_at(&self) -> Option<SystemTime> {
+        self.stop_at
+    }
+
+    /// Returns the extra options forwarded to the remote rsync process.
+    ///
+    /// Empty when no `-M` / `--remote-option` flags were specified.
+    /// upstream: `options.c:server_options()` appends these after all other
+    /// server arguments.
+    #[doc(alias = "--remote-option")]
+    #[doc(alias = "-M")]
+    pub fn remote_options(&self) -> &[OsString] {
+        &self.remote_options
+    }
+
+    /// Returns the custom remote shell command arguments, if specified.
+    #[doc(alias = "--rsh")]
+    #[doc(alias = "-e")]
+    pub fn remote_shell(&self) -> Option<&[OsString]> {
+        self.remote_shell.as_deref()
+    }
+
+    /// Returns the custom remote rsync binary path, if specified.
+    #[doc(alias = "--rsync-path")]
+    pub fn rsync_path(&self) -> Option<&OsStr> {
+        self.rsync_path.as_deref()
+    }
+
+    /// Returns the early-input file path, if specified.
+    ///
+    /// When set, rsync reads from this file immediately before the transfer
+    /// starts and makes the content available to the remote rsync process via
+    /// the `RSYNC_EARLY_INPUT` environment variable.
+    #[doc(alias = "--early-input")]
+    pub fn early_input(&self) -> Option<&Path> {
+        self.early_input.as_deref()
+    }
+
+    /// Returns the AES-GCM cipher preference for SSH connections.
+    ///
+    /// `Some(true)` forces AES-GCM ciphers regardless of hardware detection,
+    /// `Some(false)` disables automatic cipher selection entirely,
+    /// `None` (default) uses runtime hardware detection.
+    #[doc(alias = "--aes")]
+    pub const fn prefer_aes_gcm(&self) -> Option<bool> {
+        self.prefer_aes_gcm
+    }
+
+    /// Returns the protect-args (secluded-args) preference for SSH connections.
+    ///
+    /// When `Some(true)`, arguments are sent over stdin after the SSH connection
+    /// is established instead of passing them on the remote command line. This
+    /// avoids shell quoting issues with special characters in file paths.
+    ///
+    /// `Some(false)` explicitly disables protect-args even when the environment
+    /// variable `RSYNC_PROTECT_ARGS` would otherwise enable it.
+    ///
+    /// `None` uses the default behavior (disabled unless the environment enables it).
+    #[doc(alias = "--protect-args")]
+    #[doc(alias = "--secluded-args")]
+    #[doc(alias = "-s")]
+    pub const fn protect_args(&self) -> Option<bool> {
+        self.protect_args
+    }
+
+    /// Returns the old-args preference for remote shell transfers.
+    ///
+    /// When `Some(true)`, filename arguments are passed unescaped to the remote
+    /// shell, preserving the pre-3.0 behaviour where spaces in a remote path
+    /// cause `eval` to split them into separate arguments.
+    ///
+    /// Returns the `old_style_args` level: `Some(1)` skips filename escaping,
+    /// `Some(2)` skips every safe_arg escape, `Some(0)` explicitly disables
+    /// old-args, and `None` uses the default (disabled unless `RSYNC_OLD_ARGS`
+    /// is set in the environment).
+    ///
+    /// upstream: options.c:1642 OPT_OLD_ARGS, `RSYNC_OLD_ARGS` env var.
+    #[doc(alias = "--old-args")]
+    #[doc(alias = "--no-old-args")]
+    pub const fn old_args(&self) -> Option<u8> {
+        self.old_args
+    }
+
+    /// Returns the configured OpenSSH ProxyJump hosts, if any.
+    ///
+    /// The returned value is a comma-separated list of `[user@]host[:port]`
+    /// entries forwarded to `ssh -J <value>` before the destination operand.
+    /// `None` (the default) leaves SSH to honour the user's `ssh_config`.
+    #[doc(alias = "--jump-host")]
+    #[doc(alias = "-J")]
+    pub fn jump_hosts(&self) -> Option<&OsStr> {
+        self.jump_hosts.as_deref()
+    }
+
+    /// Returns the embedded SSH options, if configured.
+    ///
+    /// These options override `SshConfig` defaults when the `embedded-ssh`
+    /// feature is enabled and an `ssh://` URL is used.
+    #[cfg(feature = "embedded-ssh")]
+    #[doc(alias = "--ssh-cipher")]
+    #[doc(alias = "--ssh-no-agent")]
+    pub fn embedded_ssh_config(&self) -> Option<&super::EmbeddedSshOptions> {
+        self.embedded_ssh_config.as_ref()
+    }
+
+    /// Returns the forced protocol version, if any.
+    ///
+    /// When set, the client advertises this version during the daemon handshake
+    /// instead of `ProtocolVersion::NEWEST`. This mirrors the upstream
+    /// `--protocol` flag which clamps the negotiation ceiling.
+    #[doc(alias = "--protocol")]
+    pub const fn protocol_version(&self) -> Option<protocol::ProtocolVersion> {
+        self.protocol_version
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_config() -> ClientConfig {
+        ClientConfig::default()
+    }
+
+    #[test]
+    fn address_mode_default_is_default() {
+        let config = default_config();
+        assert_eq!(config.address_mode(), AddressMode::Default);
+    }
+
+    #[test]
+    fn connect_program_default_is_none() {
+        let config = default_config();
+        assert!(config.connect_program().is_none());
+    }
+
+    #[test]
+    fn bind_address_default_is_none() {
+        let config = default_config();
+        assert!(config.bind_address().is_none());
+    }
+
+    #[test]
+    fn sockopts_default_is_none() {
+        let config = default_config();
+        assert!(config.sockopts().is_none());
+    }
+
+    #[test]
+    fn tcp_fastopen_default_is_auto() {
+        let config = default_config();
+        assert_eq!(config.tcp_fastopen(), TcpFastOpenMode::Auto);
+    }
+
+    #[test]
+    fn blocking_io_default_is_none() {
+        let config = default_config();
+        assert!(config.blocking_io().is_none());
+    }
+
+    #[test]
+    fn bandwidth_limit_default_is_none() {
+        let config = default_config();
+        assert!(config.bandwidth_limit().is_none());
+    }
+
+    #[test]
+    fn timeout_default_is_default() {
+        let config = default_config();
+        assert_eq!(config.timeout(), TransferTimeout::Default);
+    }
+
+    #[test]
+    fn connect_timeout_default_is_default() {
+        let config = default_config();
+        assert_eq!(config.connect_timeout(), TransferTimeout::Default);
+    }
+
+    #[test]
+    fn ssh_io_timeout_maps_positive_timeout_to_seconds() {
+        // WHY: --timeout N must reach the SSH stall watchdog so a hung remote
+        // aborts after N seconds instead of hanging the client forever.
+        // upstream: options.c:815 --timeout sets io_timeout; options.c:2369
+        // set_io_timeout applies it to every transport, the SSH pipe included.
+        let mut config = default_config();
+        config.timeout = TransferTimeout::Seconds(std::num::NonZeroU64::new(45).unwrap());
+        assert_eq!(
+            config.ssh_io_timeout(),
+            Some(std::time::Duration::from_secs(45))
+        );
+    }
+
+    #[test]
+    fn ssh_io_timeout_absent_or_disabled_stays_off() {
+        // WHY: io_timeout == 0 (unset or --no-timeout) disables the check, so
+        // the SSH watchdog must remain in its default-off state and never abort
+        // an otherwise-healthy transfer. upstream: io.c:179-180 - `check_timeout()`
+        // returns immediately on `if (!io_timeout)`.
+        let default = default_config();
+        assert_eq!(default.ssh_io_timeout(), None);
+
+        let mut disabled = default_config();
+        disabled.timeout = TransferTimeout::Disabled;
+        assert_eq!(disabled.ssh_io_timeout(), None);
+    }
+
+    #[test]
+    fn stop_at_default_is_none() {
+        let config = default_config();
+        assert!(config.stop_at().is_none());
+    }
+
+    #[test]
+    fn remote_options_default_is_empty() {
+        let config = default_config();
+        assert!(config.remote_options().is_empty());
+    }
+
+    #[test]
+    fn remote_shell_default_is_none() {
+        let config = default_config();
+        assert!(config.remote_shell().is_none());
+    }
+
+    #[test]
+    fn rsync_path_default_is_none() {
+        let config = default_config();
+        assert!(config.rsync_path().is_none());
+    }
+
+    #[test]
+    fn early_input_default_is_none() {
+        let config = default_config();
+        assert!(config.early_input().is_none());
+    }
+
+    #[test]
+    fn prefer_aes_gcm_default_is_none() {
+        let config = default_config();
+        assert!(config.prefer_aes_gcm().is_none());
+    }
+
+    #[test]
+    fn protect_args_default_is_none() {
+        let config = default_config();
+        assert!(config.protect_args().is_none());
+    }
+
+    #[test]
+    fn jump_hosts_default_is_none() {
+        let config = default_config();
+        assert!(config.jump_hosts().is_none());
+    }
+}

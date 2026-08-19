@@ -1,0 +1,272 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 23b8402..53732e5 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -157,7 +157,7 @@ xattr = { workspace = true }
+ # High-performance global allocator, selected per platform. Unix uses jemalloc
+ # for its compile-time `malloc_conf` page-return tuning (see src/bin/oc-rsync.rs);
+ # Windows keeps mimalloc, which lacks comparable jemalloc support.
+-[target.'cfg(unix)'.dependencies]
++[target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
+ tikv-jemallocator = "0.7"
+ 
+ [target.'cfg(windows)'.dependencies]
+diff --git a/crates/cli/src/platform.rs b/crates/cli/src/platform.rs
+index c985c11..d07d4cc 100644
+--- a/crates/cli/src/platform.rs
++++ b/crates/cli/src/platform.rs
+@@ -1,52 +1,52 @@
+ //! Platform-specific helpers for user and group identity lookups.
+ 
+-#[cfg(unix)]
++#[cfg(all(unix, not(target_os = "android")))]
+ use uzers::{get_group_by_name, get_user_by_name, gid_t as UsersGid, uid_t as UsersUid};
+ 
+-#[cfg(unix)]
++#[cfg(all(unix, not(target_os = "android")))]
+ #[allow(non_camel_case_types)]
+ pub(crate) type gid_t = UsersGid;
+-#[cfg(unix)]
++#[cfg(all(unix, not(target_os = "android")))]
+ #[allow(non_camel_case_types)]
+ pub(crate) type uid_t = UsersUid;
+ 
+-#[cfg(not(unix))]
++#[cfg(any(not(unix), target_os = "android"))]
+ #[allow(non_camel_case_types)]
+ pub(crate) type gid_t = u32;
+-#[cfg(not(unix))]
++#[cfg(any(not(unix), target_os = "android"))]
+ #[allow(non_camel_case_types)]
+ pub(crate) type uid_t = u32;
+ 
+ /// Indicates whether the platform supports resolving user names.
+ #[inline]
+ pub(crate) const fn supports_user_name_lookup() -> bool {
+-    cfg!(unix)
++    cfg!(all(unix, not(target_os = "android")))
+ }
+ /// Indicates whether the platform supports resolving group names.
+ #[inline]
+ pub(crate) const fn supports_group_name_lookup() -> bool {
+-    cfg!(unix)
++    cfg!(all(unix, not(target_os = "android")))
+ }
+ 
+-#[cfg(unix)]
++#[cfg(all(unix, not(target_os = "android")))]
+ #[inline]
+ pub(crate) fn lookup_user_by_name(name: &str) -> Option<uid_t> {
+     get_user_by_name(name).map(|user| user.uid())
+ }
+ 
+-#[cfg(not(unix))]
++#[cfg(any(not(unix), target_os = "android"))]
+ #[inline]
+ pub(crate) fn lookup_user_by_name(_name: &str) -> Option<uid_t> {
+     None
+ }
+ 
+-#[cfg(unix)]
++#[cfg(all(unix, not(target_os = "android")))]
+ #[inline]
+ pub(crate) fn lookup_group_by_name(name: &str) -> Option<gid_t> {
+     get_group_by_name(name).map(|group| group.gid())
+ }
+ 
+-#[cfg(not(unix))]
++#[cfg(any(not(unix), target_os = "android"))]
+ #[inline]
+ pub(crate) fn lookup_group_by_name(_name: &str) -> Option<gid_t> {
+     None
+@@ -56,13 +56,13 @@ pub(crate) fn lookup_group_by_name(_name: &str) -> Option<gid_t> {
+ mod tests {
+     use super::*;
+ 
+-    #[cfg(unix)]
++    #[cfg(all(unix, not(target_os = "android")))]
+     use uzers::{get_current_gid, get_current_uid, get_group_by_gid, get_user_by_uid};
+ 
+     #[test]
+     fn support_flags_match_platform() {
+-        assert_eq!(supports_user_name_lookup(), cfg!(unix));
+-        assert_eq!(supports_group_name_lookup(), cfg!(unix));
++        assert_eq!(supports_user_name_lookup(), cfg!(all(unix, not(target_os = "android"))));
++        assert_eq!(supports_group_name_lookup(), cfg!(all(unix, not(target_os = "android"))));
+     }
+ 
+     #[cfg(unix)]
+diff --git a/crates/compress/Cargo.toml b/crates/compress/Cargo.toml
+index 104fc3c..3f569b9 100644
+--- a/crates/compress/Cargo.toml
++++ b/crates/compress/Cargo.toml
+@@ -15,7 +15,7 @@ rustdoc-args = ["--cfg", "docsrs", "-D", "rustdoc::broken_intra_doc_links"]
+ targets = ["x86_64-unknown-linux-gnu"]
+ 
+ [features]
+-default = ["zstd", "lz4", "zlib-ng"]
++default = ["zstd", "lz4", "zlib-rs"]
+ zstd = ["dep:zstd"]
+ # Enables zstd multithreaded compression (ZSTD_c_nbWorkers / --compress-threads).
+ # Adds a small build-time C dependency in zstd-sys; off by default to keep
+diff --git a/crates/daemon/src/daemon/module_state/auth.rs b/crates/daemon/src/daemon/module_state/auth.rs
+index ec94858..77cfba2 100644
+--- a/crates/daemon/src/daemon/module_state/auth.rs
++++ b/crates/daemon/src/daemon/module_state/auth.rs
+@@ -82,11 +82,11 @@ pub(crate) struct SystemGroupMembership;
+ 
+ impl GroupMembership for SystemGroupMembership {
+     fn groups_of(&self, user: &str) -> Vec<String> {
+-        #[cfg(any(unix, windows))]
++        #[cfg(all(any(unix, windows), not(target_os = "android")))]
+         {
+             metadata::id_lookup::groups_for_user(user).unwrap_or_default()
+         }
+-        #[cfg(not(any(unix, windows)))]
++        #[cfg(any(not(any(unix, windows)), target_os = "android"))]
+         {
+             let _ = user;
+             Vec::new()
+diff --git a/crates/daemon/src/daemon/sections/privilege.rs b/crates/daemon/src/daemon/sections/privilege.rs
+index b0ee8fb..d042d40 100644
+--- a/crates/daemon/src/daemon/sections/privilege.rs
++++ b/crates/daemon/src/daemon/sections/privilege.rs
+@@ -405,15 +405,15 @@ fn resolve_nobody_gid() -> io::Result<u32> {
+ ///
+ /// upstream: clientserver.c:849 `want_all_groups(f_out, uid)` ->
+ /// uidlist.c:576 `getallgroups`.
+-#[cfg(unix)]
++#[cfg(all(unix, not(target_os = "android")))]
+ fn resolve_all_user_groups(uid: Option<u32>) -> io::Result<Vec<u32>> {
+     let target = uid.unwrap_or_else(platform::privilege::effective_uid);
+     metadata::id_lookup::supplementary_gids_for_uid(target)
+ }
+ 
+-/// Non-Unix stub: no NSS group list is available, so only the explicit extras
++/// Non-Unix / Android stub: no NSS group list is available, so only the explicit extras
+ /// (resolved by the caller) apply.
+-#[cfg(not(unix))]
++#[cfg(any(not(unix), target_os = "android"))]
+ fn resolve_all_user_groups(_uid: Option<u32>) -> io::Result<Vec<u32>> {
+     Ok(Vec::new())
+ }
+diff --git a/crates/fast_io/src/confined_open.rs b/crates/fast_io/src/confined_open.rs
+index fdb3217..dd518c2 100644
+--- a/crates/fast_io/src/confined_open.rs
++++ b/crates/fast_io/src/confined_open.rs
+@@ -352,6 +352,15 @@ mod imp {
+             leaf: LeafPolicy,
+             noatime: bool,
+         ) -> io::Result<Option<File>> {
++            // Android's libc crate lacks `open_how`/`RESOLVE_*` constants
++            // (glibc-only). Fall through to the portable walk there.
++            #[cfg(target_os = "android")]
++            {
++                let _ = (root_fd, relative, leaf, noatime);
++                return Ok(None);
++            }
++            #[cfg(not(target_os = "android"))]
++            {
+             if !openat2_supported() {
+                 return Ok(None);
+             }
+@@ -375,10 +384,12 @@ mod imp {
+                 }
+             }
+             raw_openat2(root_fd, &c_rel, base)
++            }
+         }
+ 
+         /// Issues the raw `openat2(2)` syscall with
+         /// `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`.
++        #[cfg(not(target_os = "android"))]
+         fn raw_openat2(
+             root_fd: BorrowedFd<'_>,
+             c_rel: &CString,
+diff --git a/crates/metadata/src/id_lookup/cache.rs b/crates/metadata/src/id_lookup/cache.rs
+index 7cfd3e8..9677860 100644
+--- a/crates/metadata/src/id_lookup/cache.rs
++++ b/crates/metadata/src/id_lookup/cache.rs
+@@ -9,7 +9,10 @@
+ 
+ #![allow(unsafe_code)]
+ 
++#[cfg(all(unix, not(target_os = "android")))]
+ use super::nss::{lookup_group_by_name, lookup_group_name, lookup_user_by_name, lookup_user_name};
++#[cfg(any(not(unix), target_os = "android"))]
++use super::nss_stub::{lookup_group_by_name, lookup_group_name, lookup_user_by_name, lookup_user_name};
+ use crate::ownership;
+ use rustix::fs::{Gid, Uid};
+ use rustix::process::{RawGid, RawUid};
+diff --git a/crates/metadata/src/id_lookup/mod.rs b/crates/metadata/src/id_lookup/mod.rs
+index 7d7fecf..edf7949 100644
+--- a/crates/metadata/src/id_lookup/mod.rs
++++ b/crates/metadata/src/id_lookup/mod.rs
+@@ -25,23 +25,23 @@
+ mod cache;
+ mod converter;
+ mod name_cache;
+-#[cfg(unix)]
++#[cfg(all(unix, not(target_os = "android")))]
+ mod nss;
+-#[cfg(not(unix))]
++#[cfg(any(not(unix), target_os = "android"))]
+ mod nss_stub;
+ #[cfg(windows)]
+ mod nss_win;
+ 
+ #[cfg(unix)]
+ pub use cache::{map_gid, map_uid};
+ pub use converter::{NameConverterCallbacks, clear_name_converter, set_name_converter};
+ pub use name_cache::{lookup_group_name_cached, lookup_user_name_cached};
+-#[cfg(unix)]
++#[cfg(all(unix, not(target_os = "android")))]
+ pub use nss::{
+     groups_for_user, lookup_group_by_name, lookup_group_name, lookup_user_by_name,
+     lookup_user_name, supplementary_gids_for_uid,
+ };
+-#[cfg(not(unix))]
++#[cfg(any(not(unix), target_os = "android"))]
+ pub use nss_stub::{
+     lookup_group_by_name, lookup_group_name, lookup_user_by_name, lookup_user_name,
+ };
+diff --git a/crates/metadata/src/special.rs b/crates/metadata/src/special.rs
+index 4bd325c..a52a146 100644
+--- a/crates/metadata/src/special.rs
++++ b/crates/metadata/src/special.rs
+@@ -220,7 +220,8 @@ fn create_fifo_parts_inner(
+     mode_bits: u32,
+     is_socket: bool,
+ ) -> Result<(), MetadataError> {
+-    use nix::sys::stat::{Mode, SFlag, makedev, mknod};
++    use nix::sys::stat::{Mode, SFlag, mknod};
++    use nix::libc::makedev;
+ 
+     let (kind, context) = if is_socket {
+         // Linux defines MKNOD_CREATES_SOCKETS, so upstream materialises socket
+diff --git a/crates/protocol/Cargo.toml b/crates/protocol/Cargo.toml
+index c05956d..87360f1 100644
+--- a/crates/protocol/Cargo.toml
++++ b/crates/protocol/Cargo.toml
+@@ -16,7 +16,7 @@ targets = ["x86_64-unknown-linux-gnu"]
+ 
+ [features]
+ # Compression algorithm features (match compress crate features)
+-default = ["zlib-ng"]
++default = ["zlib-rs"]
+ lz4 = ["compress/lz4", "dep:lz4_flex"]
+ zstd = ["compress/zstd", "dep:zstd"]
+ # zlib-ng backend (C library with SIMD: SSE2, AVX2, NEON) - matches upstream rsync performance
+diff --git a/src/bin/oc-rsync.rs b/src/bin/oc-rsync.rs
+index a72e98e..0a15c7a 100644
+--- a/src/bin/oc-rsync.rs
++++ b/src/bin/oc-rsync.rs
+@@ -5,7 +5,7 @@
+ // Unix uses jemalloc so the page-return tuning below can be applied at
+ // allocator init (see `_rjem_malloc_conf`). Windows keeps mimalloc, which
+ // has no comparable jemalloc support on that platform.
+-#[cfg(unix)]
++#[cfg(all(unix, not(target_os = "android")))]
+ #[global_allocator]
+ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+ 

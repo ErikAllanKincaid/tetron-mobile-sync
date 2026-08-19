@@ -1,0 +1,1456 @@
+//! Symlink and hardlink creation from the received file list.
+//!
+//! Handles symbolic link creation (Unix-only with `--links`) and hardlink
+//! creation (leader/follower via `hardlink_idx`). Protocol 28-29 entries are
+//! normalized to use `hardlink_idx` and `hlink_first` during file list
+//! reception, so this module handles both protocol versions uniformly.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use logging::{debug_log, info_log};
+#[cfg(any(unix, windows))]
+use metadata::{MetadataOptions, apply_symlink_metadata_from_entry};
+use protocol::flist::{trace_leader_is, trace_looking_for_leader, trace_virtual_first};
+
+use crate::generator::ItemFlags;
+use crate::receiver::ReceiverContext;
+
+impl ReceiverContext {
+    /// Reports whether a received symlink's mtime should be preserved.
+    ///
+    /// True when `--times` is active and `--omit-link-times` (`-J`) is not.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `rsync.c:583` - `set_file_attrs()` adds `ATTRS_SKIP_MTIME |
+    ///   ATTRS_SKIP_ATIME | ATTRS_SKIP_CRTIME` when `omit_link_times &&
+    ///   S_ISLNK(file->mode)`, so a symlink keeps its wall-clock creation time
+    ///   instead of the sender-supplied mtime.
+    /// - `options.c:2648-2649` - `-J` is packed into `server_options` only on a
+    ///   push (`am_sender`), so on a pull the local receiver applies it itself.
+    ///
+    /// Mirrors the local-copy executor, which builds symlink options as
+    /// `metadata_options.clone().preserve_times(false)` when
+    /// `omit_link_times_enabled()` (engine `local_copy/executor/special/symlink.rs`).
+    const fn preserve_symlink_times(&self) -> bool {
+        self.config.flags.times && !self.config.flags.omit_link_times
+    }
+
+    /// Creates symbolic links from the file list entries.
+    ///
+    /// Iterates through the received file list, finds symlink entries with
+    /// `preserve_links` enabled, and creates them on the destination filesystem.
+    /// Existing symlinks pointing to the correct target are skipped (quick-check).
+    /// Existing files/symlinks at the destination path are removed before creation.
+    ///
+    /// Emits MSG_INFO itemize frames for each symlink created or found up-to-date
+    /// when the daemon has itemize output enabled.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `generator.c:1556` - `if (preserve_links && ftype == FT_SYMLINK)`
+    /// - `generator.c:1603` - `atomic_create(file, fname, sl, ...)`
+    #[cfg(unix)]
+    pub(in crate::receiver) fn create_symlinks<W: crate::writer::MsgInfoSender + ?Sized>(
+        &self,
+        dest_dir: &Path,
+        sandbox: Option<&fast_io::DirSandbox>,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        if !self.config.flags.links || self.config.flags.skip_dest_writes() {
+            return Ok(());
+        }
+
+        for (flist_idx, entry) in self.file_list.iter().enumerate() {
+            if !entry.is_symlink() {
+                continue;
+            }
+
+            let wire_target = match entry.link_target() {
+                Some(t) => t,
+                None => continue,
+            };
+
+            let relative_path = entry.path();
+
+            // upstream: flist.c:1329 - `if (sanitize_paths && !munge_symlinks
+            // && *bp) sanitize_path(bp, bp, "", lastdir_depth, SP_DEFAULT)`.
+            // `sanitize_paths` is set for a daemon module serving a path
+            // (clientserver.c:1068), so turning munging off does not leave the
+            // received target untouched: it still cannot resolve above the
+            // module root. The two transforms are mutually exclusive upstream,
+            // which is why this runs only when munging is off.
+            //
+            // Applied *before* the safe-links evaluation because upstream
+            // sanitizes during the file-list decode, so the `--safe-links`
+            // check at generator.c:1951 reads the already-sanitized
+            // `F_SYMLINK(file)`. Sanitizing after the check instead would skip
+            // entries upstream creates.
+            let sanitized: PathBuf;
+            let wire_target = if !self.config.munge_symlinks
+                && self.config.connection.is_daemon_connection
+                && !wire_target.as_os_str().is_empty()
+            {
+                sanitized = sanitize_received_symlink_target(wire_target, relative_path);
+                &sanitized
+            } else {
+                wire_target
+            };
+
+            // upstream: generator.c:1951 - `if (safe_symlinks && unsafe_symlink(sl, fname))`
+            // skips unsafe symlinks when --safe-links is set. The check stays
+            // here (not in sanitize_file_list) to preserve protocol index
+            // alignment with the sender.
+            //
+            // Note the operand differs from upstream's. oc evaluates the wire
+            // target (pre-munge); upstream evaluates the already-munged one,
+            // because it applies the prefix during file-list decode and the
+            // generator then reads `F_SYMLINK(file)`. `unsafe_symlink()`
+            // rejects every absolute target, and munging makes every target
+            // absolute, so upstream under `munge symlinks = true` with
+            // --safe-links skips every symlink - safe ones included - while oc
+            // creates the safe ones. Measured against 3.4.4 and 3.5.0.
+            // Reordering to match is a behaviour change, not a comment fix.
+            if self.config.flags.safe_links
+                && crate::symlink_safety::is_unsafe_symlink(wire_target.as_os_str(), relative_path)
+            {
+                // upstream: generator.c:1952 - `if (INFO_GTE(NAME, 1))` gates the
+                // skipped-symlink report at the first -v level.
+                info_log!(
+                    Name,
+                    1,
+                    "skipping unsafe symlink \"{}\" -> \"{}\"",
+                    relative_path.display(),
+                    wire_target.display()
+                );
+                continue;
+            }
+
+            // upstream: flist.c:1122-1126 - receiver prepends `/rsyncd-munged/`
+            // to the symlink target when the daemon enabled `munge symlinks`,
+            // so the on-disk link cannot resolve outside the module root when
+            // followed. Apply once here so both the quick-check comparison and
+            // the create syscall see the prefixed form.
+            let munged: std::path::PathBuf;
+            let target: &std::path::Path = if self.config.munge_symlinks {
+                munged = apply_symlink_munge_prefix(wire_target);
+                munged.as_path()
+            } else {
+                wire_target.as_path()
+            };
+
+            let link_path = dest_dir.join(relative_path);
+
+            // upstream: generator.c:1606-1609 - the post-create itemize keeps
+            // `statret == 0` when the replaced destination was itself a
+            // symlink, diffing attributes against the pre-replace lstat; a
+            // non-symlink obstacle has `statret` forced to -1 and an absent
+            // destination arrives with it, so both render ITEM_IS_NEW.
+            // Capture the old lstat before the obstacle is backed up/unlinked.
+            let mut pre_replace_symlink_meta: Option<fs::Metadata> = None;
+
+            // upstream: generator.c:1573 - quick_check_ok(FT_SYMLINK, ...)
+            if let Ok(existing_target) = std::fs::read_link(&link_path) {
+                if existing_target == *target {
+                    // upstream: generator.c:1573-1577 - the up-to-date branch
+                    // still calls `itemize(fname, file, ndx, 0, &sx, 0, 0, NULL)`.
+                    // Compute the row from the pre-apply lstat so an mtime-only
+                    // difference lights the `t` column (keep_time =
+                    // !omit_link_times); `sx` was filled by `link_stat` before
+                    // `set_file_attrs` runs, so this must precede the apply below.
+                    let iflags =
+                        ItemFlags::from_raw(self.existing_symlink_iflags(entry, &link_path));
+                    // upstream: generator.c:1575 - even on the up-to-date branch
+                    // `set_file_attrs(fname, file, &sx, NULL, maybe_ATTRS_REPORT)`
+                    // still runs so a stale on-disk mtime is corrected.
+                    let symlink_options = MetadataOptions::new()
+                        .preserve_owner(self.config.flags.owner)
+                        .preserve_group(self.config.flags.group)
+                        .preserve_times(self.preserve_symlink_times())
+                        .preserve_atimes(self.config.flags.atimes)
+                        .numeric_ids(self.config.flags.numeric_ids.maps_numeric())
+                        .fake_super(self.config.fake_super);
+                    if let Err(error) =
+                        apply_symlink_metadata_from_entry(&link_path, entry, &symlink_options)
+                    {
+                        debug_log!(
+                            Recv,
+                            1,
+                            "failed to refresh symlink metadata for {}: {}",
+                            link_path.display(),
+                            error
+                        );
+                    }
+                    let _ = self.emit_or_record_itemize(writer, flist_idx, &iflags, entry);
+                    self.record_server_no_transfer_itemize(flist_idx, iflags.raw());
+                    // upstream: log.c log_item / send_directory NAME emissions
+                    // upstream: generator.c:1145 - "%s is uptodate" at INFO_GTE(NAME, 2)
+                    info_log!(Name, 2, "{} is uptodate", relative_path.display());
+                    continue;
+                }
+                pre_replace_symlink_meta = fs::symlink_metadata(&link_path).ok();
+                // upstream: generator.c:2018-2020 atomic_create - back the old
+                // symlink up before it is removed when --backup is set; on
+                // backup-mechanism failure upstream skips the entry.
+                match self.backup_existing_before_replace(
+                    &link_path,
+                    relative_path,
+                    dest_dir,
+                    sandbox,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // SEC-1.g: route the obstacle unlink through the sandbox
+                        // dirfd when the destination parent is the sandbox root,
+                        // so a TOCTOU swap on `link_path` between the readlink
+                        // above and this unlink cannot redirect the syscall to
+                        // an attacker-chosen parent. Falls back to path-based
+                        // `remove_file` otherwise.
+                        let _ = fast_io::unlink_via_sandbox_or_fallback(
+                            sandbox,
+                            dest_dir,
+                            relative_path,
+                            &link_path,
+                            fast_io::UnlinkFlags::File,
+                        );
+                    }
+                    Err(error) => {
+                        debug_log!(
+                            Recv,
+                            1,
+                            "failed to back up existing symlink {}: {}",
+                            link_path.display(),
+                            error
+                        );
+                        continue;
+                    }
+                }
+            } else if fast_io::lstat_via_sandbox_or_fallback(
+                sandbox,
+                dest_dir,
+                relative_path,
+                &link_path,
+            )
+            .is_ok()
+            {
+                // SEC-1.f: when the sandbox is plumbed and the destination
+                // parent is the sandbox root, the obstacle stat goes through
+                // `fstatat(AT_SYMLINK_NOFOLLOW)` so a TOCTOU symlink swap on
+                // `link_path` cannot redirect the probe to a different
+                // inode. Falls back to `symlink_metadata` otherwise.
+                //
+                // upstream: generator.c:2018-2020 atomic_create - back the old
+                // obstacle up before removal when --backup is set.
+                match self.backup_existing_before_replace(
+                    &link_path,
+                    relative_path,
+                    dest_dir,
+                    sandbox,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // SEC-1.g: matching unlink also goes through the sandbox
+                        // dirfd via `unlinkat` so the obstacle-remove syscall is
+                        // anchored on the same parent the stat just observed.
+                        let _ = fast_io::unlink_via_sandbox_or_fallback(
+                            sandbox,
+                            dest_dir,
+                            relative_path,
+                            &link_path,
+                            fast_io::UnlinkFlags::File,
+                        );
+                    }
+                    Err(error) => {
+                        debug_log!(
+                            Recv,
+                            1,
+                            "failed to back up existing obstacle {}: {}",
+                            link_path.display(),
+                            error
+                        );
+                        continue;
+                    }
+                }
+            } else if !self.config.reference_directories.is_empty() {
+                // upstream: generator.c:1978 - `else if (basis_dir[0] != NULL)`
+                // is reached only when the destination is absent (`statret !=
+                // 0`). An identical symlink in a `--compare-dest` basis leaves
+                // the destination absent; a `--link-dest` basis is hard-linked.
+                // The comparison target is the post-munge on-disk value, matching
+                // the stored `F_SYMLINK(file)` upstream compares.
+                let compare_opts = MetadataOptions::new()
+                    .preserve_owner(self.config.flags.owner)
+                    .preserve_group(self.config.flags.group)
+                    .preserve_times(self.preserve_symlink_times())
+                    .preserve_atimes(self.config.flags.atimes)
+                    .numeric_ids(self.config.flags.numeric_ids.maps_numeric())
+                    .fake_super(self.config.fake_super);
+                if crate::receiver::quick_check::try_reference_dest_non(
+                    entry,
+                    dest_dir,
+                    &self.config.reference_directories,
+                    &crate::receiver::quick_check::NonRegularBasis::Symlink { target },
+                    &compare_opts,
+                    self.config.file_selection.modify_window,
+                ) {
+                    continue;
+                }
+            }
+
+            // Ensure parent directory exists for --relative paths.
+            // upstream: generator.c:1329-1338 - make_path() for relative_paths
+            if let Some(parent) = link_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+
+            // upstream: generator.c:1603 - atomic_create() -> do_symlink()
+            //
+            // SEC-1.h: when the sandbox is plumbed and the destination
+            // parent is the sandbox root, the create goes through
+            // `symlinkat(target, dirfd, leaf)` so a TOCTOU swap on a
+            // mid-path component cannot redirect the create to an
+            // attacker-chosen parent. Falls back to path-based
+            // `std::os::unix::fs::symlink` otherwise.
+            if let Err(e) = fast_io::symlinkat_via_sandbox_or_fallback(
+                sandbox,
+                dest_dir,
+                relative_path,
+                &link_path,
+                target,
+            ) {
+                debug_log!(
+                    Recv,
+                    1,
+                    "failed to create symlink {} -> {}: {}",
+                    link_path.display(),
+                    target.display(),
+                    e
+                );
+                // EDG-SANDBOX.C: discriminate by error class. EACCES is
+                // the upstream-parity non-fatal class (matches
+                // `generator.c:atomic_create -> do_symlink` where a
+                // permission failure leaves the link missing and the
+                // io_error bit drives the non-zero exit). ELOOP from a
+                // TOCTOU swap on a mid-path component, EOPNOTSUPP from
+                // a sandbox-anchored refusal, and EEXIST on a planted
+                // non-symlink leaf are security boundaries: propagate
+                // so the receiver surfaces a non-zero exit instead of
+                // silently skipping the symlink.
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    continue;
+                }
+                return Err(e);
+            }
+            // upstream: generator.c:2003 - `set_file_attrs(fname, file, NULL, NULL, 0)`
+            // runs immediately after `atomic_create` -> `do_symlink` so the new
+            // symlink's mtime matches the sender-supplied value. Without this
+            // step the receiver-created symlink wears the wall-clock time from
+            // `symlinkat(2)`, breaking the `--copy-dest` parity that
+            // `testsuite/alt-dest.test` enforces over SSH.
+            let symlink_options = MetadataOptions::new()
+                .preserve_owner(self.config.flags.owner)
+                .preserve_group(self.config.flags.group)
+                .preserve_times(self.preserve_symlink_times())
+                .preserve_atimes(self.config.flags.atimes)
+                .numeric_ids(self.config.flags.numeric_ids.maps_numeric())
+                .fake_super(self.config.fake_super);
+            if let Err(error) =
+                apply_symlink_metadata_from_entry(&link_path, entry, &symlink_options)
+            {
+                debug_log!(
+                    Recv,
+                    1,
+                    "failed to apply symlink metadata for {}: {}",
+                    link_path.display(),
+                    error
+                );
+            }
+            // upstream: generator.c:1604-1610 - itemize after atomic_create
+            // with base ITEM_LOCAL_CHANGE|ITEM_REPORT_CHANGE: a replaced
+            // symlink itemizes as a change against the pre-replace lstat
+            // (`statret == 0`); an absent destination or a non-symlink
+            // obstacle (`statret` forced to -1) renders the all-new row.
+            let raw = self.itemize_existing_flags(
+                entry,
+                &link_path,
+                pre_replace_symlink_meta.as_ref(),
+                ItemFlags::ITEM_LOCAL_CHANGE | ItemFlags::ITEM_REPORT_CHANGE,
+            );
+            let iflags = ItemFlags::from_raw(raw);
+            let _ = self.emit_or_record_itemize(writer, flist_idx, &iflags, entry);
+            self.record_server_no_transfer_itemize(flist_idx, iflags.raw());
+            if raw & ItemFlags::ITEM_IS_NEW != 0 {
+                // upstream: receiver.c:733-741 - only an ITEM_IS_NEW row bumps
+                // stats.created_files / created_symlinks.
+                self.record_created(entry.mode());
+            }
+        }
+        Ok(())
+    }
+
+    /// Materializes symbolic links from the file list on the Windows receiver.
+    ///
+    /// Mirrors the Unix path but routes creation through the safe
+    /// `fast_io::win_symlink` helpers: a link whose target resolves to a
+    /// directory is created as a real directory symbolic link, falling back to
+    /// a junction when the process lacks the create-symlink privilege; a file
+    /// link has no privilege-free equivalent, so a privilege refusal skips the
+    /// entry with a warning and sets the soft-error flag so the transfer still
+    /// finishes but exits `RERR_PARTIAL` (23). This matches the local-copy
+    /// executor's `create_symlink` behaviour so a remote transfer to a Windows
+    /// receiver no longer silently drops symlinks from the flist.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `generator.c:1556` - `if (preserve_links && ftype == FT_SYMLINK)`
+    /// - `generator.c:1603` - `atomic_create(file, fname, sl, ...)`
+    #[cfg(windows)]
+    pub(in crate::receiver) fn create_symlinks<W: crate::writer::MsgInfoSender + ?Sized>(
+        &mut self,
+        dest_dir: &Path,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        if !self.config.flags.links || self.config.flags.skip_dest_writes() {
+            return Ok(());
+        }
+
+        // A file-symlink privilege refusal is skipped per-entry; record it here
+        // and fold it into `flist_io_error` after the loop so the immutable
+        // borrow of `self.file_list` never overlaps the mutable field write.
+        let mut unsupported_skip = false;
+
+        for (flist_idx, entry) in self.file_list.iter().enumerate() {
+            if !entry.is_symlink() {
+                continue;
+            }
+
+            let wire_target = match entry.link_target() {
+                Some(t) => t,
+                None => continue,
+            };
+
+            let relative_path = entry.path();
+
+            // upstream: generator.c:1547 - skip unsafe symlinks when --safe-links.
+            if self.config.flags.safe_links
+                && crate::symlink_safety::is_unsafe_symlink(wire_target.as_os_str(), relative_path)
+            {
+                // upstream: generator.c:1554 - log skipped unsafe symlinks
+                info_log!(
+                    Name,
+                    1,
+                    "skipping unsafe symlink \"{}\" -> \"{}\"",
+                    relative_path.display(),
+                    wire_target.display()
+                );
+                continue;
+            }
+
+            // upstream: flist.c:1122-1126 - prepend the `/rsyncd-munged/` prefix
+            // when the daemon enabled `munge symlinks` so the on-disk link
+            // cannot resolve outside the module root when followed.
+            let munged: std::path::PathBuf;
+            let target: &std::path::Path = if self.config.munge_symlinks {
+                munged = std::path::PathBuf::from(::metadata::munge_symlink(
+                    &wire_target.to_string_lossy(),
+                ));
+                munged.as_path()
+            } else {
+                wire_target.as_path()
+            };
+
+            let link_path = dest_dir.join(relative_path);
+
+            // upstream: generator.c:1606-1609 - the post-create itemize keeps
+            // `statret == 0` when the replaced destination was itself a
+            // symlink, diffing attributes against the pre-replace lstat; a
+            // non-symlink obstacle has `statret` forced to -1 and an absent
+            // destination arrives with it, so both render ITEM_IS_NEW.
+            let mut pre_replace_symlink_meta: Option<fs::Metadata> = None;
+
+            // upstream: generator.c:1573 - quick_check_ok(FT_SYMLINK, ...)
+            if let Ok(existing_target) = std::fs::read_link(&link_path) {
+                if existing_target == *target {
+                    // upstream: generator.c:1573-1577 - the up-to-date branch
+                    // still calls `itemize(fname, file, ndx, 0, &sx, 0, 0, NULL)`.
+                    // Compute the row from the pre-apply lstat so an mtime-only
+                    // difference lights the `t` column (keep_time =
+                    // !omit_link_times); `sx` was filled by `link_stat` before
+                    // `set_file_attrs` runs, so this must precede the apply below.
+                    let iflags =
+                        ItemFlags::from_raw(self.existing_symlink_iflags(entry, &link_path));
+                    // upstream: generator.c:1563 - refresh metadata even when the
+                    // link is already up-to-date so a stale mtime is corrected.
+                    let symlink_options = MetadataOptions::new()
+                        .preserve_owner(self.config.flags.owner)
+                        .preserve_group(self.config.flags.group)
+                        .preserve_times(self.preserve_symlink_times())
+                        .preserve_atimes(self.config.flags.atimes)
+                        .numeric_ids(self.config.flags.numeric_ids.maps_numeric())
+                        .fake_super(self.config.fake_super);
+                    if let Err(error) =
+                        apply_symlink_metadata_from_entry(&link_path, entry, &symlink_options)
+                    {
+                        debug_log!(
+                            Recv,
+                            1,
+                            "failed to refresh symlink metadata for {}: {}",
+                            link_path.display(),
+                            error
+                        );
+                    }
+                    let _ = self.emit_or_record_itemize(writer, flist_idx, &iflags, entry);
+                    self.record_server_no_transfer_itemize(flist_idx, iflags.raw());
+                    // upstream: generator.c:1145 - "%s is uptodate" at INFO_GTE(NAME, 2)
+                    info_log!(Name, 2, "{} is uptodate", relative_path.display());
+                    continue;
+                }
+                pre_replace_symlink_meta = fs::symlink_metadata(&link_path).ok();
+                // upstream: generator.c:2018-2020 atomic_create - back the old
+                // symlink up before removal when --backup is set.
+                match self.backup_existing_before_replace(&link_path, relative_path, dest_dir) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let _ = fs::remove_file(&link_path);
+                    }
+                    Err(error) => {
+                        debug_log!(
+                            Recv,
+                            1,
+                            "failed to back up existing symlink {}: {}",
+                            link_path.display(),
+                            error
+                        );
+                        continue;
+                    }
+                }
+            } else if fs::symlink_metadata(&link_path).is_ok() {
+                // upstream: generator.c:2018-2020 atomic_create - back the old
+                // obstacle up before removal when --backup is set.
+                match self.backup_existing_before_replace(&link_path, relative_path, dest_dir) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let _ = fs::remove_file(&link_path);
+                    }
+                    Err(error) => {
+                        debug_log!(
+                            Recv,
+                            1,
+                            "failed to back up existing obstacle {}: {}",
+                            link_path.display(),
+                            error
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // Ensure parent directory exists for --relative paths.
+            // upstream: generator.c:1329-1338 - make_path() for relative_paths
+            if let Some(parent) = link_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+
+            // upstream: generator.c:1603 - atomic_create() -> do_symlink().
+            if let Err(e) = create_windows_symlink(target, &link_path) {
+                // A Windows file symbolic link cannot be created without
+                // privilege and has no junction fallback (directory links do
+                // fall back inside the helper). Skip it with a warning and a
+                // soft error so the transfer still finishes but exits
+                // RERR_PARTIAL (23), matching upstream's FERROR_XFER handling.
+                if fast_io::is_unprivileged_symlink_error(&e) {
+                    info_log!(
+                        Nonreg,
+                        1,
+                        "skipping symlink \"{}\" -> \"{}\" (symlink creation requires Administrator or Developer Mode)",
+                        relative_path.display(),
+                        target.display()
+                    );
+                    unsupported_skip = true;
+                    continue;
+                }
+                debug_log!(
+                    Recv,
+                    1,
+                    "failed to create symlink {} -> {}: {}",
+                    link_path.display(),
+                    target.display(),
+                    e
+                );
+                return Err(e);
+            }
+
+            // upstream: generator.c:1604 - set_file_attrs() runs immediately
+            // after atomic_create -> do_symlink so the new link's mtime matches
+            // the sender-supplied value.
+            let symlink_options = MetadataOptions::new()
+                .preserve_owner(self.config.flags.owner)
+                .preserve_group(self.config.flags.group)
+                .preserve_times(self.preserve_symlink_times())
+                .preserve_atimes(self.config.flags.atimes)
+                .numeric_ids(self.config.flags.numeric_ids.maps_numeric())
+                .fake_super(self.config.fake_super);
+            if let Err(error) =
+                apply_symlink_metadata_from_entry(&link_path, entry, &symlink_options)
+            {
+                debug_log!(
+                    Recv,
+                    1,
+                    "failed to apply symlink metadata for {}: {}",
+                    link_path.display(),
+                    error
+                );
+            }
+            // upstream: generator.c:1604-1610 - itemize after atomic_create
+            // with base ITEM_LOCAL_CHANGE|ITEM_REPORT_CHANGE: a replaced
+            // symlink itemizes as a change against the pre-replace lstat
+            // (`statret == 0`); an absent destination or a non-symlink
+            // obstacle (`statret` forced to -1) renders the all-new row.
+            let raw = self.itemize_existing_flags(
+                entry,
+                &link_path,
+                pre_replace_symlink_meta.as_ref(),
+                ItemFlags::ITEM_LOCAL_CHANGE | ItemFlags::ITEM_REPORT_CHANGE,
+            );
+            let iflags = ItemFlags::from_raw(raw);
+            let _ = self.emit_or_record_itemize(writer, flist_idx, &iflags, entry);
+            self.record_server_no_transfer_itemize(flist_idx, iflags.raw());
+            if raw & ItemFlags::ITEM_IS_NEW != 0 {
+                // upstream: receiver.c:733-741 - only an ITEM_IS_NEW row bumps
+                // stats.created_files / created_symlinks.
+                self.record_created(entry.mode());
+            }
+        }
+
+        if unsupported_skip {
+            // upstream: main.c - a skipped do_symlink sets io_error, which maps
+            // to _exit(RERR_PARTIAL).
+            self.flist_io_error |= crate::generator::io_error_flags::IOERR_GENERAL;
+        }
+        Ok(())
+    }
+
+    /// No-op on platforms that are neither Unix nor Windows.
+    #[cfg(not(any(unix, windows)))]
+    pub(in crate::receiver) fn create_symlinks<W: crate::writer::MsgInfoSender + ?Sized>(
+        &self,
+        _dest_dir: &Path,
+        _writer: &mut W,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Resolves the on-disk hard-link target for a group, promoting the next
+    /// present member when the recorded leader never materialized on disk.
+    ///
+    /// The receiver only transfers a group's leader (`hlink_first`); followers
+    /// are hard-linked to it afterwards. When the leader's own transfer is
+    /// skipped or errors, its destination is absent and it must not be used as
+    /// a link source. This mirrors upstream `hlink.c` exactly:
+    ///
+    /// - `skip_hard_link()` (hlink.c:546-565) sets `FLAG_SKIP_HLINK` on a
+    ///   member that was not transferred.
+    /// - `check_prior()` (hlink.c:246-282) walks the group's `F_HL_PREV` chain
+    ///   past every `FLAG_SKIP_HLINK` member to find the next still-present one.
+    /// - `hard_link_check()` (hlink.c:299-310) promotes that member to the
+    ///   group's "virtual first" link source.
+    ///
+    /// Returns the promoted leader's path - recording it in the tracker so the
+    /// remaining followers reuse it - or `None` when no member of the group
+    /// materialized on disk.
+    fn promote_hardlink_leader(
+        file_list: &[protocol::flist::FileEntry],
+        tracker: &mut engine::HardlinkApplyTracker,
+        gnum: u32,
+        dest_dir: &Path,
+    ) -> Option<PathBuf> {
+        // A previously recorded leader is only valid while its file is still
+        // present (its transfer may have errored after we recorded it).
+        if let Some(recorded) = tracker.leader_path(gnum) {
+            if recorded.symlink_metadata().is_ok() {
+                return Some(recorded.to_path_buf());
+            }
+        }
+        // upstream: hlink.c:253-265 - walk the group in list (ndx) order and
+        // promote the first member whose file materialized on disk.
+        for member in file_list {
+            if member.hardlink_idx() != Some(gnum) {
+                continue;
+            }
+            let relative_path = member.path();
+            let candidate = if relative_path.as_os_str() == "." {
+                dest_dir.to_path_buf()
+            } else {
+                dest_dir.join(relative_path)
+            };
+            if candidate.symlink_metadata().is_ok() {
+                tracker.record_leader(gnum, candidate.clone());
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// Creates hard links for hardlink follower entries after the leader has been transferred.
+    ///
+    /// Hardlinked files are grouped by a shared `hardlink_idx`. The first file in
+    /// each group (the "leader", with `hlink_first = true`) is transferred normally.
+    /// Subsequent files ("followers") are created as hard links to the leader's
+    /// destination path instead of being transferred independently.
+    ///
+    /// This method works uniformly for both protocol versions:
+    /// - Protocol 30+: `hardlink_idx` and `hlink_first` come from the wire encoding
+    /// - Protocol 28-29: `normalize_pre30_hardlinks()` assigns synthetic
+    ///   `hardlink_idx` and `hlink_first` from (dev, ino) pairs during file list
+    ///   reception, so both versions use the same leader/follower logic here.
+    ///
+    /// Uses `HardlinkApplyTracker` for leader path tracking and deferred follower
+    /// resolution. Leaders committed during pipelined transfer are already recorded
+    /// in the tracker; this method records any remaining leaders (e.g., files that
+    /// matched quick-check and were not transferred) and links all followers.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `hlink.c:hard_link_check()` - skips followers, links to leader
+    /// - `hlink.c:finish_hard_link()` - creates links after leader transfer completes
+    /// - `generator.c:1551` - `F_HLINK_NOT_FIRST` check before `hard_link_check()`
+    pub(in crate::receiver) fn create_hardlinks<W: crate::writer::MsgInfoSender + ?Sized>(
+        &mut self,
+        dest_dir: &Path,
+        #[cfg(unix)] sandbox: Option<&fast_io::DirSandbox>,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        if !self.config.flags.hard_links || self.config.flags.skip_dest_writes() {
+            return Ok(());
+        }
+
+        // Protocol 30+: use HardlinkApplyTracker for leader/follower resolution.
+        // Take the tracker temporarily to avoid borrow conflicts with itemize emission.
+        if let Some(mut tracker) = self.hardlink_tracker.take() {
+            // First pass: ensure all leaders are recorded in the tracker.
+            // Leaders committed during pipelined transfer are already recorded;
+            // this covers leaders that matched quick-check (not transferred) or
+            // were processed via the sync path.
+            for entry in &self.file_list {
+                if entry.hlink_first() {
+                    let gnum = match entry.hardlink_idx() {
+                        Some(idx) => idx,
+                        None => continue,
+                    };
+                    // Skip if already recorded during pipelined commit.
+                    if tracker.leader_path(gnum).is_some() {
+                        continue;
+                    }
+                    let relative_path = entry.path();
+                    let dest_path = if relative_path.as_os_str() == "." {
+                        dest_dir.to_path_buf()
+                    } else {
+                        dest_dir.join(relative_path)
+                    };
+                    // upstream: hlink.c:546-565 skip_hard_link() sets
+                    // FLAG_SKIP_HLINK on a group member that was not transferred
+                    // (e.g. its own transfer errored), and check_prior()
+                    // (hlink.c:246-282) then refuses it as a link source. Only
+                    // record a leader whose file actually materialized on disk;
+                    // an absent leader is left unrecorded so the second pass can
+                    // promote the next present group member (hlink.c:299-310
+                    // "virtual first") instead of hard-linking to a path that
+                    // does not exist (ENOENT -> fatal abort).
+                    if dest_path.symlink_metadata().is_err() {
+                        continue;
+                    }
+                    // No deferred followers expected here since we process
+                    // followers in the second pass below.
+                    let _ = tracker.record_leader(gnum, dest_path);
+                }
+            }
+
+            // Second pass: link followers to their leaders.
+            for (follower_ndx, entry) in self.file_list.iter().enumerate() {
+                if !entry.hlinked() || entry.hlink_first() {
+                    continue;
+                }
+                let leader_idx = match entry.hardlink_idx() {
+                    Some(idx) => idx,
+                    None => continue,
+                };
+
+                let entry_name = entry.path().display().to_string();
+                let leader_path = match Self::promote_hardlink_leader(
+                    &self.file_list,
+                    &mut tracker,
+                    leader_idx,
+                    dest_dir,
+                ) {
+                    Some(p) => p,
+                    None => {
+                        // upstream: hlink.c:299-310 - when every prior member of
+                        // the group carries FLAG_SKIP_HLINK (their transfers were
+                        // skipped or errored) check_prior() returns no leader and
+                        // hard_link_check() treats the member as a "virtual
+                        // first" that upstream would transfer anew. In this
+                        // post-transfer apply pass there is no data left to link,
+                        // so the group is left unlinked with a soft I/O error
+                        // (IOERR_GENERAL -> RERR_PARTIAL, exit 23) - never a fatal
+                        // receiver abort.
+                        trace_virtual_first(follower_ndx as i32, &entry_name, leader_idx as i32);
+                        debug_log!(
+                            Recv,
+                            1,
+                            "hardlink group {} has no leader materialized on disk; leaving follower {} unlinked",
+                            leader_idx,
+                            entry.name()
+                        );
+                        self.flist_io_error |= crate::generator::io_error_flags::IOERR_GENERAL;
+                        continue;
+                    }
+                };
+                // upstream: hlink.c HLINK debug emissions
+                // Pre-resolution diagnostic plus the final `leader is` message.
+                trace_looking_for_leader(follower_ndx as i32, &entry_name, leader_idx as i32);
+                trace_leader_is(
+                    follower_ndx as i32,
+                    &entry_name,
+                    leader_idx as i32,
+                    leader_idx as i32,
+                    &leader_path.display().to_string(),
+                );
+
+                let relative_path = entry.path();
+                let link_path = dest_dir.join(relative_path);
+
+                // The promoted "virtual first" (hlink.c:299-310) can be this
+                // very follower when its own file is the only group member that
+                // materialized on disk. There is nothing to link a file to
+                // itself, and removing it to re-link would destroy the group's
+                // sole copy. The Unix quick-check below catches this via a
+                // dev/ino match, but Windows metadata exposes no inode, so guard
+                // the self-link case explicitly on every platform.
+                if link_path == leader_path {
+                    continue;
+                }
+
+                // Quick-check: if destination already hard-links to the leader, skip.
+                //
+                // SEC-1.f: the `link_path` stat goes through the sandbox
+                // dirfd via `fstatat(AT_SYMLINK_NOFOLLOW)` when the
+                // sandbox is plumbed and the relative path is a single
+                // component. The `leader_path` is owned by the receiver-
+                // managed `HardlinkApplyTracker` (it may live under a
+                // different parent than `dest_dir` for cross-segment
+                // hardlinks) and stays on the path-based stat for now.
+                #[cfg(unix)]
+                let link_meta_outcome = fast_io::lstat_via_sandbox_or_fallback(
+                    sandbox,
+                    dest_dir,
+                    relative_path,
+                    &link_path,
+                );
+                #[cfg(not(unix))]
+                let link_meta_outcome = fs::symlink_metadata(&link_path);
+                if let Ok(link_meta) = link_meta_outcome {
+                    if let Ok(leader_meta) = fs::symlink_metadata(&leader_path) {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::MetadataExt;
+                            if link_meta.dev() == leader_meta.dev()
+                                && link_meta.ino() == leader_meta.ino()
+                            {
+                                // upstream: hlink.c:218-222 - an up-to-date
+                                // hardlink follower itemizes with
+                                // ITEM_LOCAL_CHANGE | ITEM_XNAME_FOLLOWS and an
+                                // empty xname. log.c:707-708 renders column 0 as
+                                // 'h' (LOCAL_CHANGE + XNAME_FOLLOWS), and the
+                                // empty xname suppresses the ` => ` suffix
+                                // (log.c:644 / itemize.rs:192 gate on a
+                                // non-empty name).
+                                let iflags = ItemFlags::from_raw(
+                                    ItemFlags::ITEM_LOCAL_CHANGE | ItemFlags::ITEM_XNAME_FOLLOWS,
+                                );
+                                let _ = self.emit_itemize_indexed(
+                                    writer,
+                                    follower_ndx,
+                                    &iflags,
+                                    entry,
+                                    None,
+                                );
+                                // upstream: hlink.c:223 - "%s is uptodate"
+                                // emitted at INFO_GTE(NAME, 2) when the
+                                // destination already hard-links to the leader.
+                                info_log!(Name, 2, "{} is uptodate", relative_path.display());
+                                continue;
+                            }
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            let _ = (&link_meta, leader_meta);
+                        }
+                    }
+                    // Remove existing file so we can create the hard link.
+                    //
+                    // SEC-1.g: on Unix, route the unlink through the
+                    // sandbox dirfd when the destination parent is the
+                    // sandbox root so a TOCTOU swap between the stat
+                    // above and the unlink cannot redirect the syscall
+                    // to an attacker-chosen parent. Windows stays on
+                    // the path-based `remove_file` per the SEC-1.l
+                    // NTFS-handle audit.
+                    #[cfg(unix)]
+                    let _ = fast_io::unlink_via_sandbox_or_fallback(
+                        sandbox,
+                        dest_dir,
+                        relative_path,
+                        &link_path,
+                        fast_io::UnlinkFlags::File,
+                    );
+                    #[cfg(not(unix))]
+                    let _ = fs::remove_file(&link_path);
+                }
+
+                // Ensure parent directory exists.
+                if let Some(parent) = link_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+
+                // upstream: hlink.c:maybe_hard_link() -> atomic_create() -> do_link()
+                //
+                // SEC-1.h (Unix): when the sandbox is plumbed and the
+                // follower's destination parent is the sandbox root,
+                // route through `linkat(AT_FDCWD, leader, dirfd, leaf,
+                // 0)` so a mid-syscall symlink swap on the follower's
+                // parent cannot redirect the create to an
+                // attacker-chosen directory. Falls back to
+                // `fast_io::hard_link` (direct `linkat(2)` syscall) for
+                // the multi-component and no-sandbox cases, preserving
+                // the existing
+                // `EXDEV` / `EPERM` error semantics. Windows stays on
+                // the path-based fallback per the SEC-1.l NTFS-handle
+                // audit.
+                #[cfg(unix)]
+                let link_result = fast_io::linkat_via_sandbox_or_fallback(
+                    sandbox,
+                    &leader_path,
+                    dest_dir,
+                    relative_path,
+                    &link_path,
+                );
+                #[cfg(not(unix))]
+                let link_result = fast_io::hard_link(&leader_path, &link_path);
+                if let Err(e) = link_result {
+                    debug_log!(
+                        Recv,
+                        1,
+                        "failed to hard link {} => {}: {}",
+                        link_path.display(),
+                        leader_path.display(),
+                        e
+                    );
+                    // EDG-SANDBOX.D: discriminate by error class. EACCES
+                    // is the upstream-parity non-fatal class (matches
+                    // `hlink.c:maybe_hard_link -> atomic_create` where a
+                    // permission failure leaves the follower missing and
+                    // the io_error bit drives the non-zero exit).
+                    // EMLINK (link-count exhaustion) and EXDEV
+                    // (cross-device link) are not transient: failing loud
+                    // surfaces the configuration error instead of leaving
+                    // the follower silently missing. ELOOP / EOPNOTSUPP
+                    // from sandbox-anchored refusals are also fail-loud.
+                    if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        continue;
+                    }
+                    // upstream: hlink.c:246-282 check_prior() re-derives a group
+                    // whose prior member has gone away rather than aborting. A
+                    // NotFound here means the resolved leader's file vanished
+                    // after we stat'd it (its transfer errored, or a concurrent
+                    // unlink): leave this follower unlinked with a soft error
+                    // (IOERR_GENERAL -> RERR_PARTIAL, exit 23) instead of a fatal
+                    // receiver desync (exit 12).
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        self.flist_io_error |= crate::generator::io_error_flags::IOERR_GENERAL;
+                        continue;
+                    }
+                    // Restore the tracker before propagating so the
+                    // receiver's invariant (`hardlink_tracker` always
+                    // populated when `hard_links` is set) is preserved.
+                    self.hardlink_tracker = Some(tracker);
+                    return Err(e);
+                }
+                // upstream: hlink.c:finish_hard_link() - itemize new hardlink.
+                // The xname is the leader's transfer-relative name so the row
+                // renders the `%L` ` => <leader>` suffix (hlink.c:232-234 pass
+                // `realname`; log.c:643-646 render ` => hlink`).
+                let iflags = ItemFlags::from_raw(
+                    ItemFlags::ITEM_LOCAL_CHANGE
+                        | ItemFlags::ITEM_XNAME_FOLLOWS
+                        | ItemFlags::ITEM_IS_NEW,
+                );
+                let leader_rel = leader_path.strip_prefix(dest_dir).unwrap_or(&leader_path);
+                let xname = leader_rel.display().to_string();
+                let _ = self.emit_itemize_indexed(
+                    writer,
+                    follower_ndx,
+                    &iflags,
+                    entry,
+                    Some(xname.as_bytes()),
+                );
+                // upstream: hlink.c:236 - "%s => %s" at INFO_GTE(NAME, 1)
+                // when a hardlink follower is linked to its leader.
+                info_log!(
+                    Name,
+                    1,
+                    "{} => {}",
+                    relative_path.display(),
+                    leader_path.display()
+                );
+            }
+
+            // Resolve any remaining deferred followers from incremental commits.
+            // upstream: hlink.c:finish_hard_link() - final pass
+            let (linked, errors) = tracker.resolve_deferred();
+            if linked > 0 {
+                debug_log!(Recv, 2, "resolved {} deferred hardlink followers", linked);
+            }
+            for (path, err) in errors {
+                debug_log!(
+                    Recv,
+                    1,
+                    "failed to resolve deferred hardlink {}: {}",
+                    path.display(),
+                    err
+                );
+            }
+
+            self.hardlink_tracker = Some(tracker);
+        }
+
+        // Protocol 28-29 hardlinks are normalized to hardlink_idx/hlink_first
+        // during file list reception (normalize_pre30_hardlinks), so the
+        // protocol 30+ path above handles both versions uniformly.
+        Ok(())
+    }
+}
+
+/// Sanitizes a received symlink target so it cannot resolve above the module
+/// root, for daemon modules that disabled `munge symlinks`.
+///
+/// Mirrors upstream `flist.c:1329`, which applies `sanitize_path(...,
+/// SP_DEFAULT)` to the target whenever `sanitize_paths && !munge_symlinks`.
+/// `sanitize_paths` is set for a daemon module with a path
+/// (`clientserver.c:1068`), so the two transforms between them leave no daemon
+/// configuration in which a peer-supplied target reaches the disk verbatim.
+///
+/// This rewrite is what makes an absolute target relative, so a link to
+/// `/etc/hostname` becomes the in-tree `etc/hostname` and `--safe-links` no
+/// longer treats it as escaping. That is upstream's behaviour, measured against
+/// rsync 3.4.4 and 3.5.0 as daemon receivers under `use chroot = false` plus
+/// `munge symlinks = false`: both create the link with the rewritten target.
+///
+/// Byte-level like the munge sibling above: a symlink target is a raw byte
+/// string on the wire, and decoding it through `String` would rewrite the very
+/// value being made safe.
+///
+/// `entry_path` is the entry's own relative path; its parent supplies the
+/// depth budget upstream passes as `lastdir_depth`, so a target that walks back
+/// no further than the transfer root survives intact.
+#[cfg(unix)]
+fn sanitize_received_symlink_target(target: &Path, entry_path: &Path) -> std::path::PathBuf {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let sanitized = crate::sanitize_path::sanitize_path_bytes_default(
+        target.as_os_str().as_bytes(),
+        containing_dir_depth(entry_path),
+    );
+    std::path::PathBuf::from(OsString::from_vec(sanitized))
+}
+
+/// Number of directory levels the entry sits below the transfer root.
+///
+/// Mirrors upstream `util1.c:1015 count_dir_elements()` applied to `lastdir`,
+/// the entry's own directory (`flist.c:867`). `count_dir_elements` skips `.`
+/// elements, which is what filtering to `Component::Normal` reproduces; the
+/// received name is already sanitized by this point, so no `..` remains for the
+/// two to disagree about.
+#[cfg(unix)]
+fn containing_dir_depth(entry_path: &Path) -> usize {
+    entry_path.parent().map_or(0, |parent| {
+        parent
+            .components()
+            .filter(|component| matches!(component, std::path::Component::Normal(_)))
+            .count()
+    })
+}
+
+/// Prepends the `/rsyncd-munged/` prefix to a symlink target.
+///
+/// Mirrors upstream `flist.c:1150-1154` where the receiver prepends
+/// `SYMLINK_PREFIX` to the wire target so the on-disk symlink cannot resolve
+/// outside the module root when followed. Only invoked when the daemon module
+/// has `munge symlinks = yes` (or the `!use_chroot` auto default).
+///
+/// The transform is a pure byte-level prepend so a non-UTF-8 target still
+/// receives the ASCII prefix without any lossy decode. The matching strip
+/// happens on the sender via `strip_symlink_munge_prefix` in
+/// `crate::generator::file_list::entry`.
+#[cfg(unix)]
+pub(in crate::receiver) fn apply_symlink_munge_prefix(target: &Path) -> std::path::PathBuf {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let mut bytes = ::metadata::SYMLINK_MUNGE_PREFIX.as_bytes().to_vec();
+    bytes.extend_from_slice(target.as_os_str().as_bytes());
+    std::path::PathBuf::from(OsString::from_vec(bytes))
+}
+
+/// Creates a symbolic link at `link_path` pointing to `target` on Windows.
+///
+/// Resolves `target` against the link's parent directory to decide whether the
+/// link refers to a directory: a directory link goes through
+/// [`fast_io::create_directory_symlink_or_junction`] (real symlink, falling
+/// back to a junction on a privilege refusal), while a file link uses
+/// [`fast_io::create_file_symlink`], which surfaces `ERROR_PRIVILEGE_NOT_HELD`
+/// so the caller can skip the entry. A target that does not resolve to an
+/// existing directory (including a dangling link) is treated as a file link.
+///
+/// Mirrors the local-copy executor's `create_symlink`, which distinguishes
+/// directory from file links via the source's metadata.
+#[cfg(windows)]
+fn create_windows_symlink(target: &Path, link_path: &Path) -> std::io::Result<()> {
+    let resolved = match link_path.parent() {
+        Some(parent) => parent.join(target),
+        None => target.to_path_buf(),
+    };
+    let is_dir = matches!(fs::metadata(&resolved), Ok(meta) if meta.file_type().is_dir());
+    if is_dir {
+        fast_io::create_directory_symlink_or_junction(target, link_path).map(|_| ())
+    } else {
+        fast_io::create_file_symlink(target, link_path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    /// The receiver honours `-J`/`--omit-link-times`: a received symlink's mtime
+    /// is preserved only when `--times` is set AND `--omit-link-times` is not.
+    ///
+    /// This is the transfer-side honoring decision fed to every
+    /// `apply_symlink_metadata_from_entry` call in `create_symlinks`. It mirrors
+    /// the local copy executor, which builds symlink options as
+    /// `metadata_options.clone().preserve_times(false)` when
+    /// `omit_link_times_enabled()`.
+    ///
+    /// upstream: rsync.c:583 - `set_file_attrs()` adds `ATTRS_SKIP_MTIME` for a
+    /// symlink when `omit_link_times`. options.c:2648-2649 packs the compact 'J'
+    /// only on a push (`am_sender`), so on a pull the receiver applies it itself.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn omit_link_times_controls_symlink_mtime_preservation() {
+        use std::ffi::OsString;
+
+        use protocol::ProtocolVersion;
+
+        use crate::config::ServerConfig;
+        use crate::flags::ParsedServerFlags;
+        use crate::handshake::HandshakeResult;
+        use crate::receiver::ReceiverContext;
+        use crate::role::ServerRole;
+
+        let handshake = HandshakeResult {
+            protocol: ProtocolVersion::try_from(32u8).unwrap(),
+            buffered: Vec::new(),
+            compat_exchanged: false,
+            client_args: None,
+            io_timeout: None,
+            negotiated_algorithms: None,
+            compat_flags: None,
+            checksum_seed: 0,
+        };
+        let make = |times: bool, omit: bool| ServerConfig {
+            role: ServerRole::Receiver,
+            protocol: ProtocolVersion::try_from(32u8).unwrap(),
+            flag_string: "-r".to_owned(),
+            flags: ParsedServerFlags {
+                times,
+                omit_link_times: omit,
+                recursive: true,
+                ..ParsedServerFlags::default()
+            },
+            args: vec![OsString::from(".")],
+            ..Default::default()
+        };
+
+        let ctx = ReceiverContext::new_for_test(&handshake, make(true, false));
+        assert!(
+            ctx.preserve_symlink_times(),
+            "-t without -J must preserve the symlink mtime"
+        );
+
+        let ctx = ReceiverContext::new_for_test(&handshake, make(true, true));
+        assert!(
+            !ctx.preserve_symlink_times(),
+            "-J must suppress the symlink mtime even under -t"
+        );
+
+        let ctx = ReceiverContext::new_for_test(&handshake, make(false, false));
+        assert!(
+            !ctx.preserve_symlink_times(),
+            "without -t there is no source mtime to preserve"
+        );
+    }
+
+    /// A symlink whose only difference from the sender is its mtime still
+    /// itemizes: upstream's up-to-date branch calls `itemize(fname, file, ndx,
+    /// 0, &sx, 0, 0, NULL)` (`generator.c:1573-1577`), and inside `itemize()`
+    /// `keep_time` is true for a symlink under `-t` without `-J`
+    /// (`generator.c:513-517`), so `mtime_differs()` lights `ITEM_REPORT_TIME`
+    /// (`generator.c:526-530`) and the row renders `.L..t......`. `--omit-link-times`
+    /// and a run without `--times` both drop `keep_time`, suppressing the row.
+    #[cfg(unix)]
+    #[test]
+    fn mtime_only_symlink_change_itemizes_dot_l_dot_t() {
+        use std::ffi::OsString;
+        use std::os::unix::fs::symlink;
+        use std::path::PathBuf;
+
+        use protocol::ProtocolVersion;
+        use protocol::flist::FileEntry;
+
+        use crate::config::ServerConfig;
+        use crate::flags::ParsedServerFlags;
+        use crate::generator::ItemFlags;
+        use crate::generator::itemize::{ItemizeContext, format_iflags};
+        use crate::handshake::HandshakeResult;
+        use crate::receiver::ReceiverContext;
+        use crate::role::ServerRole;
+
+        let handshake = HandshakeResult {
+            protocol: ProtocolVersion::try_from(32u8).unwrap(),
+            buffered: Vec::new(),
+            compat_exchanged: false,
+            client_args: None,
+            io_timeout: None,
+            negotiated_algorithms: None,
+            compat_flags: None,
+            checksum_seed: 0,
+        };
+        let config = |times: bool, omit: bool| ServerConfig {
+            role: ServerRole::Receiver,
+            protocol: ProtocolVersion::try_from(32u8).unwrap(),
+            flag_string: "-r".to_owned(),
+            flags: ParsedServerFlags {
+                times,
+                omit_link_times: omit,
+                recursive: true,
+                ..ParsedServerFlags::default()
+            },
+            args: vec![OsString::from(".")],
+            ..Default::default()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let link_path = dir.path().join("link");
+        symlink("target", &link_path).unwrap();
+
+        // Sender's view: same target, but an mtime far from the freshly created
+        // on-disk link (which carries ~now). Same target routes through the
+        // up-to-date branch; the differing mtime is the only change.
+        let mut entry = FileEntry::new_symlink(PathBuf::from("link"), PathBuf::from("target"));
+        entry.set_mtime(1_000_000_000, 0);
+
+        // -t without -J: keep_time is true, so the mtime difference lights `t`.
+        let ctx = ReceiverContext::new_for_test(&handshake, config(true, false));
+        let raw = ctx.existing_symlink_iflags(&entry, &link_path);
+        assert_ne!(
+            raw & ItemFlags::ITEM_REPORT_TIME,
+            0,
+            "an mtime-only symlink change must set ITEM_REPORT_TIME"
+        );
+        let row = format_iflags(
+            &ItemFlags::from_raw(raw),
+            &entry,
+            false,
+            &ItemizeContext::default(),
+        );
+        assert_eq!(
+            row, ".L..t......",
+            "upstream itemizes an mtime-only symlink change as .L..t......"
+        );
+
+        // -J drops the symlink mtime leg, so no significant flag survives.
+        let ctx = ReceiverContext::new_for_test(&handshake, config(true, true));
+        assert_eq!(
+            ctx.existing_symlink_iflags(&entry, &link_path) & ItemFlags::SIGNIFICANT_ITEM_FLAGS,
+            0,
+            "--omit-link-times must suppress the mtime-only symlink row"
+        );
+
+        // Without -t there is no mtime comparison at all.
+        let ctx = ReceiverContext::new_for_test(&handshake, config(false, false));
+        assert_eq!(
+            ctx.existing_symlink_iflags(&entry, &link_path) & ItemFlags::SIGNIFICANT_ITEM_FLAGS,
+            0,
+            "without --times there is no mtime comparison for the symlink"
+        );
+    }
+
+    /// Verifies `fast_io::hard_link` creates a valid hard link regardless of
+    /// whether io_uring handles it or `std::fs::hard_link` does.
+    #[test]
+    fn hard_link_via_io_uring_or_fallback_creates_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("link_src.txt");
+        let dst = dir.path().join("link_dst.txt");
+
+        fs::write(&src, b"hardlink payload").unwrap();
+
+        fast_io::hard_link(&src, &dst).unwrap();
+
+        assert!(src.exists());
+        assert!(dst.exists());
+        assert_eq!(fs::read(&dst).unwrap(), b"hardlink payload");
+
+        // Verify they share the same inode (both point to same data).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let src_meta = fs::metadata(&src).unwrap();
+            let dst_meta = fs::metadata(&dst).unwrap();
+            assert_eq!(src_meta.ino(), dst_meta.ino());
+        }
+    }
+
+    /// Verifies that attempting to hard link to an existing destination fails
+    /// with an appropriate error (io_uring or fallback path).
+    #[test]
+    fn hard_link_via_io_uring_or_fallback_fails_when_dst_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("link_src_exists.txt");
+        let dst = dir.path().join("link_dst_exists.txt");
+
+        fs::write(&src, b"source").unwrap();
+        fs::write(&dst, b"existing").unwrap();
+
+        let result = fast_io::hard_link(&src, &dst);
+        assert!(result.is_err());
+    }
+
+    /// Verifies the hardlink `%s => %s` and `%s is uptodate` emission shapes
+    /// match upstream rsync byte-for-byte.
+    ///
+    /// upstream: log.c log_item / send_directory NAME emissions
+    /// upstream: hlink.c:223 (`"is uptodate"`) and hlink.c:236 (`"=>"`).
+    #[test]
+    fn hardlink_name_level_emission_shape_matches_upstream() {
+        use logging::{DiagnosticEvent, InfoFlag, VerbosityConfig, drain_events, info_log, init};
+
+        let mut cfg = VerbosityConfig::default();
+        cfg.info.name = 2;
+        init(cfg);
+        let _ = drain_events();
+
+        let follower = std::path::Path::new("dir/follower");
+        let leader = std::path::Path::new("dir/leader");
+        info_log!(Name, 1, "{} => {}", follower.display(), leader.display());
+        info_log!(Name, 2, "{} is uptodate", follower.display());
+
+        let messages: Vec<String> = drain_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                DiagnosticEvent::Info {
+                    flag: InfoFlag::Name,
+                    message,
+                    ..
+                } => Some(message),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            messages.iter().any(|m| m == "dir/follower => dir/leader"),
+            "missing upstream hardlink => emission: {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m == "dir/follower is uptodate"),
+            "missing upstream `is uptodate` emission: {messages:?}"
+        );
+    }
+
+    /// Verifies NAME emissions are suppressed when the flag level is below
+    /// the emission level.
+    #[test]
+    fn hardlink_name_emissions_suppressed_at_level_zero() {
+        use logging::{DiagnosticEvent, InfoFlag, VerbosityConfig, drain_events, info_log, init};
+
+        let cfg = VerbosityConfig::default();
+        init(cfg);
+        let _ = drain_events();
+
+        info_log!(Name, 1, "src => dst");
+        info_log!(Name, 2, "src is uptodate");
+
+        let messages: Vec<_> = drain_events()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    DiagnosticEvent::Info {
+                        flag: InfoFlag::Name,
+                        ..
+                    }
+                )
+            })
+            .collect();
+
+        assert!(
+            messages.is_empty(),
+            "NAME emissions must be gated by InfoFlag::Name level: {messages:?}"
+        );
+    }
+
+    /// Verifies the receiver-side `--debug=HLINK` follower emission shape
+    /// matches upstream `hlink.c:hard_link_check()` byte-for-byte.
+    ///
+    /// upstream: hlink.c HLINK debug emissions
+    #[test]
+    fn hardlink_debug_hlink_leader_emission_matches_upstream() {
+        use logging::{DebugFlag, DiagnosticEvent, VerbosityConfig, drain_events, init};
+        use protocol::flist::{trace_leader_is, trace_looking_for_leader, trace_virtual_first};
+
+        let mut cfg = VerbosityConfig::default();
+        cfg.debug.hlink = 2;
+        init(cfg);
+        let _ = drain_events();
+
+        trace_looking_for_leader(4, "dir/follower", 1);
+        trace_leader_is(4, "dir/follower", 1, 1, "dest/leader");
+        trace_virtual_first(5, "dir/orphan", 2);
+
+        let msgs: Vec<String> = drain_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                DiagnosticEvent::Debug {
+                    flag: DebugFlag::Hlink,
+                    message,
+                    ..
+                } => Some(message),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            msgs.iter()
+                .any(|m| m == "hlink for 4 (dir/follower,1): looking for a leader")
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m == "hlink for 4 (dir/follower,1): leader is 1 (dest/leader)")
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m == "hlink for 5 (dir/orphan,2): virtual first")
+        );
+    }
+}
