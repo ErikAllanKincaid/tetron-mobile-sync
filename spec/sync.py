@@ -206,11 +206,25 @@ class SyncOcRsyncEmbedding(Requirement):
       and upstream status; upstreaming them as PRs is tracked follow-up, not
       bundled here.
     - **Feature set, Android build:** `--no-default-features --features
-      "openssl-vendored,zstd,lz4,parallel,xattr"` -- default features drag
-      io_uring/iocp/landlock/embedded-ssh and do not build on Android;
-      `zlib-rs` (pure Rust) replaces zlib-ng (cmake-rs/NDK ABI conflict).
-      `acl` and SSH transport stay excluded: no POSIX ACLs on Android
-      storage, and the addon uses the rsync daemon protocol only, never SSH.
+      "openssl-vendored,zstd,lz4,parallel,xattr"` was the spike's feature
+      string, measured against the fork's root `bin` package (spike harness
+      shape). It does NOT carry over to this crate's actual dependency, which
+      embeds only `vendor/oc-rsync/crates/core` -- **correction 2026-08-19,
+      already documented in `vendor/oc-rsync/PATCHES.md`'s "Embedded-build
+      note (SYNC-002)" but not previously reflected here:** on `core`, the
+      real feature string is `default-features = false, features = ["zstd",
+      "lz4", "xattr"]`. `openssl-vendored` does not apply -- `core`'s unix
+      dependency on `checksums` is feature-less, so no `openssl-sys` enters
+      the embedded tree regardless. `parallel` does not exist as a `core`
+      feature at all (it is a root-bin-only alias). `zlib-rs` (pure Rust,
+      replacing the C `zlib-ng` -- cmake-rs/NDK ABI conflict) is not a
+      feature flag to pass here either; it is the *default* backend
+      `crates/compress`/`crates/protocol` already select per patch group 2 in
+      `PATCHES.md`, so `core`'s default features already carry it. `acl` and
+      SSH transport stay excluded: no POSIX ACLs on Android storage, and the
+      addon uses the rsync daemon protocol only, never SSH. See
+      `vendor/oc-rsync/PATCHES.md` for the full explanation before changing
+      this crate's `Cargo.toml` feature list.
     - **Embedding surface:** the crate wraps oc-rsync's embedding API
       (`run_client`/`run_client_with`-style, caller-supplied writers) behind
       UniFFI. The transfer progress callback
@@ -226,6 +240,20 @@ class SyncOcRsyncEmbedding(Requirement):
       this app -- documented in FINDINGS.md, mitigation = never enable the
       SSH feature); the single-maintainer risk is accepted per route (a),
       with the vendored fork doubling as our maintenance surface.
+      Re-verified 2026-08-19 against the real embedded crate (not just the
+      spike): `cargo audit` reports exactly one vulnerability, this same
+      RUSTSEC-2023-0071 against `rsa`, plus two unrelated non-blocking
+      "unmaintained crate" warnings (bincode/RUSTSEC-2025-0141,
+      paste/RUSTSEC-2024-0436, both transitive, neither SSH-related) --
+      expected, not a regression, no action needed. **Correction:** the
+      root `Cargo.toml`'s `[workspace.dependencies]` comment on `russh`
+      claims 0.62.1 "retires" RUSTSEC-2023-0071 by moving to rsa 0.10 --
+      `cargo audit`'s own advisory record contradicts this
+      (`Solution: No fixed upgrade is available!`, i.e. no rsa release
+      resolves the underlying timing side-channel yet, independent of the
+      russh version pinned). Do not treat that comment as evidence the
+      advisory is handled; the actual mitigation is still "unused in this
+      app, SSH feature never enabled," as this bullet already said.
 
     ACCEPTANCE: `cargo ndk -t arm64-v8a` cross-compile of the crate with
     the engine embedded succeeds; a host-side integration test runs a real
@@ -233,10 +261,31 @@ class SyncOcRsyncEmbedding(Requirement):
     a seeded directory tree byte-identically, and an interrupted
     (kill-mid-transfer) run resumes with `--partial` on the next invocation;
     `cargo audit` shows only the known russh advisory.
+
+    **NOT YET MET, found 2026-08-19:** `tests/engine_rsyncd.rs`'s
+    `push_resumes_from_existing_partial_at_receiver` (a receiver-pre-seeded-
+    with-partial-bytes scenario, distinct from the kill-mid-transfer one
+    above) hangs indefinitely against a real local rsyncd -- reproduced
+    twice in isolation, single-threaded in `sigsuspend`, not blocked on
+    socket I/O. This test suite never reaches
+    `killed_push_keeps_partial_and_next_run_resumes` (the actual
+    kill-mid-transfer test this ACCEPTANCE line names) because the suite
+    hangs on the test before it -- so the kill-mid-transfer resume path
+    itself is UNVERIFIED against this embedding, not merely "spike-verified"
+    as the requirement's opening paragraph claims (that claim was true of
+    the spike harness, `~/code/oc-rsync-spike/FINDINGS.md`, not yet
+    re-confirmed for this crate's actual `run_client` embedding). Do not
+    mark SYNC-002 accepted until this is root-caused and both resume tests
+    pass. See `AGENTS.md`'s Roadmap/spec section for repro steps.
     ENFORCEMENT: reconcile.py cargo build/clippy/test/audit checks carry the
     crate; the wire-compat + resume integration test lives in `tests/`
     (host-side, gated on rsync being installed), an explicit `#[ignore]`
     default so a machine without rsyncd is not broken by `cargo test`.
+    `check_cargo_audit` allow-lists RUSTSEC-2023-0071 explicitly (fixed
+    2026-08-19 -- it previously required a hard zero-count, which the
+    accepted advisory above would always trip the moment this crate's
+    Cargo.lock included it); update that allow-list alongside this
+    docstring if a new advisory is ever accepted.
     """
     req_id = "SYNC-002"
 

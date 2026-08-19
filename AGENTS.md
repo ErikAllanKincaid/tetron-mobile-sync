@@ -14,7 +14,64 @@ tetron adds one thing: a mesh VPN. This repo is a product built on top of it: a 
 
 ## Roadmap / spec
 
-Status: SYNC-001 done (2026-08-18, `feat/sync-001-repo-scaffold`): crate + Gradle/Compose app scaffolded, host + Android cross-compile + UniFFI Kotlin bindings + debug APK all building, reconcile.py carries the cargo checks. Nothing transfers yet. The build is scoped as SYNC-001..SYNC-011 in `spec/sync.py`, which also records the decision register (consensus 2026-08-18) and the still-open items. Dependency ordering (also stated per-class in `spec/sync.py`):
+Status: SYNC-001 done (2026-08-18, `feat/sync-001-repo-scaffold`): crate + Gradle/Compose app scaffolded, host + Android cross-compile + UniFFI Kotlin bindings + debug APK all building, reconcile.py carries the cargo checks. **Correction 2026-08-19: NOT merged to `main`** -- `main` is missing SYNC-001's own scaffold commit (`79c1918`) entirely and sits one commit behind `feat/sync-001-repo-scaffold` (only `ebee5a3`, the pre-SYNC-001 spec-only scaffold commit). No remote is configured for this repo (`git remote -v` empty) -- everything so far is local-only.
+
+SYNC-002 (embedded oc-rsync engine) is functionally working but **still
+uncommitted** on `feat/sync-002-oc-rsync-embedding` as of 2026-08-19 -- a
+future agent picking up this branch should find real, uncommitted work in
+the tree, not a clean starting point. Current state: `vendor/oc-rsync/`
+(patched fork) is vendored and tracked; `src/lib.rs` implements
+`SyncEngine::run_client` against `oc-rsync-core`'s
+`run_client_with_observer`, with `SyncProgressListener` wired as a UniFFI
+callback interface; `src/bin/sync-test-helper.rs` (dev-only,
+`test-helper`-feature-gated) and `tests/engine_local.rs` +
+`tests/engine_rsyncd.rs` (the latter `#[ignore]`-gated on `rsync` being on
+PATH) exist. Verified 2026-08-19: `cargo -q check` clean, `cargo test`
+(5 unconditional: 1 lib unit test + 4 in `engine_local.rs`) passes.
+
+**Known bug, unresolved 2026-08-19: `tests/engine_rsyncd.rs`'s
+`push_resumes_from_existing_partial_at_receiver` hangs indefinitely**
+against a real local `rsync --daemon` -- reproduced twice, isolated by
+running each `#[ignore]`-gated test alone (`cargo test --test engine_rsyncd
+-- --ignored --test-threads 1 <name>`). `push_to_rsyncd_is_byte_identical_
+and_idempotent` passes cleanly (1.8s). The hung process sits single-threaded
+in `sigsuspend` (`cat /proc/<pid>/status`/`wchan`), not blocked on socket
+I/O, with an open connected socket fd -- consistent with a deadlock in
+`run_client`'s handling of the "receiver already holds a same-named file
+with matching leading bytes" case specifically (this test pre-seeds the
+daemon module directory with the first 256KiB of the file *before* the
+transfer starts, unlike the SIGKILL test which produces the partial by
+interrupting a real in-flight run). Never got to run
+`killed_push_keeps_partial_and_next_run_resumes` (third test) because the
+suite hangs on the second one first -- its own pass/fail status is unknown,
+not verified passing. This directly contradicts the fork's SYNC-002 spike
+claim ("`--partial` resume... spike-verified 2026-08-19") for at least this
+one code path; do not trust that claim without re-verifying it against
+*this* embedding, not just the spike. Needs a debugging session (`gdb -p
+<pid>`, or instrument `run_client_with_observer`/the basis-file matching
+path in `vendor/oc-rsync/crates/core`) before SYNC-002 can be called
+accepted -- kill any stuck test process and its child `rsync --daemon`
+before retrying (`pkill -9 -f engine_rsyncd; pkill -9 -f 'rsync --daemon'`).
+
+**Bug found + fixed 2026-08-19 (uncommitted, same branch):**
+`reconcile.py`'s `check_cargo_audit` required `count == 0` unconditionally,
+so the moment SYNC-002 landed real code, `python3 reconcile.py` would fail
+outright on the one advisory (RUSTSEC-2023-0071, rsa via russh) that
+spec/sync.py's own SYNC-002 ACCEPTANCE text explicitly says is expected and
+accepted -- a gate permanently red for a state the spec calls passing. Fixed
+by adding an `ACCEPTED_ADVISORIES` allow-set the check filters against
+before counting; re-run confirms `cargo_audit: {"installed": true, "count":
+0}` now. If you add a new accepted advisory, update spec/sync.py's own
+rationale for it AND this set together, same bar as the first one.
+
+Not yet done: no commit on this branch (code + the fixes/corrections here
+all still sit uncommitted in the working tree -- `git status` before
+assuming a clean start), and SYNC-002's own spec corrections below
+(feature-string, RUSTSEC comment note) need a `libspec diff`-clean commit
+alongside the code. Nothing past SYNC-002 has started. The build is scoped
+as SYNC-001..SYNC-011 in `spec/sync.py`, which also records the decision
+register (consensus 2026-08-18) and the still-open items. Dependency
+ordering (also stated per-class in `spec/sync.py`):
 
 - SYNC-001 repo scaffold (crate + Gradle/Compose app, GPL-3.0, mirror of tetron-mobile's proven pipeline) — no deps, first.
 - SYNC-002 embedded oc-rsync engine (vendored patched fork `vendor/oc-rsync/`, `--no-default-features --features "openssl-vendored,zstd,lz4,parallel,xattr"`, `--partial` resume, `TransferProgressCallback` through UniFFI) — after SYNC-001.
@@ -44,7 +101,21 @@ Same as core where applicable: `cargo -q check`/`clippy`/`test`, no authorship t
 
 ## Test devices
 
-LG V40 (real device, real camera roll) and the AORUS machine (headless receiver for a stock `rsyncd`). See tetron-mobile's `DO-NOT-COMMIT/TEST_PROCEDURE.md` for device roster/connection details. The xps-17-9720 emulator AVD has been broken (qemu/gfxstream crash 2026-08-18) -- use the LG V40 until it is fixed.
+LG V40 (real device, real camera roll) and the AORUS machine (headless receiver for a stock `rsyncd`). See tetron-mobile's `DO-NOT-COMMIT/TEST_PROCEDURE.md` for device roster/connection details.
+
+**Correction 2026-08-19:** the xps-17-9720 remote emulator AVD was logged
+here as broken ("qemu/gfxstream crash", 2026-08-18) -- this is almost
+certainly the same misdiagnosis tetron-mobile already hit and fixed
+2026-08-03: launching the emulator over a bare non-interactive SSH session
+with no `DISPLAY` set makes it silently exit, which reads like a GPU/
+gfxstream crash but is not one. See tetron-mobile's
+`DO-NOT-COMMIT/TEST_PROCEDURE.md` §3.5 for the real start command
+(`DISPLAY=:0 $REMOTE_SDK/emulator/emulator -avd $AVD_NAME`) and
+`TODO_DETAILS.md#emulator-display-misdiagnosis` for the postmortem. Before
+trusting "the emulator is broken" again, retry with `DISPLAY=:0` explicitly
+set; only re-file it as a real crash if that still fails. Use the LG V40 in
+the meantime regardless -- it is the actual SYNC-011 reference device, not
+just a fallback.
 
 ## Repo layout
 
