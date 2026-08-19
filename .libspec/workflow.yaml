@@ -1,0 +1,16 @@
+# Agent Workflow Hooks configuration file.
+# Uncomment any hooks below to configure project-specific commands.
+
+hooks:
+  # post-edit:
+  #   - "Run spec compiler validation: `uv run libspec diff`"
+  #
+  # pre-diff:
+  #   - "Compile spec if needed"
+  #
+  # post-implement:
+  #   - "Run tests: `npm run test`"
+  #   - "Run linter: `npm run lint`"
+  #
+  # pre-commit:
+  #   - "Verify code formatting: `npm run format`"

@@ -1,0 +1,40 @@
+/target
+/target-android
+/bindings-kotlin
+/DO-NOT-COMMIT
+
+# Android build outputs / local config
+android/.gradle/
+android/build/
+android/app/build/
+**/jniLibs/**
+# generated UniFFI Kotlin bindings, a build artifact -- never commit, it can
+# drift from the crate's actual FFI surface.
+android/app/src/main/java/uniffi/
+android/local.properties
+android/keystore.properties
+*.jks
+*.keystore
+**/.cxx/
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*.swo
+*~
+*.log
+
+# Local secrets -- never commit
+.env
+.env.local
+*.key
+secrets/
+
+# Android Studio / IntelliJ project settings
+android/.idea/
+*.iml
+
+# Python bytecode (libspec specs)
+__pycache__/
+*.pyc
+.venv/
