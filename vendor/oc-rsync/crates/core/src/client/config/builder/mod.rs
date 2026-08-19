@@ -1,0 +1,641 @@
+use std::ffi::OsString;
+use std::fmt;
+use std::num::{NonZeroU32, NonZeroUsize};
+use std::path::PathBuf;
+use std::time::SystemTime;
+
+/// Error returned when mutually exclusive options are combined.
+///
+/// Mirrors upstream rsync's `RERR_SYNTAX` (exit code 1) validation in `options.c`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigConflict {
+    /// The first conflicting option (e.g. `--inplace`).
+    pub option1: &'static str,
+    /// The second conflicting option (e.g. `--partial-dir`), or a sentinel such
+    /// as [`SSH_URL_OPERAND`] when the conflict is against an operand rather
+    /// than a second option.
+    pub option2: &'static str,
+}
+
+/// Sentinel [`ConfigConflict::option2`] value marking the `--rsh`/`ssh://`-URL
+/// transport-selection conflict. Its second half is a URL operand, not an
+/// option, so [`ConfigConflict`]'s `Display` gives it a bespoke message rather
+/// than the generic "--X cannot be used with --Y" phrasing.
+const SSH_URL_OPERAND: &str = "ssh-url-operand";
+
+impl fmt::Display for ConfigConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // oc-specific: an explicit --rsh/-e selects the external system ssh
+        // binary, which is honoured only for `host:path` operands; an `ssh://`
+        // URL instead selects the built-in SSH client, which ignores --rsh.
+        // The two are contradictory, so the message names the operand rather
+        // than a second option. No upstream analogue: upstream has no ssh://.
+        if matches!((self.option1, self.option2), ("rsh", SSH_URL_OPERAND)) {
+            return write!(
+                f,
+                "a remote shell (from --rsh/-e or the RSYNC_RSH environment variable) cannot be combined with an ssh:// URL operand (ssh:// uses the built-in SSH client); unset RSYNC_RSH or drop --rsh, or use a host:path source for the external ssh"
+            );
+        }
+        // upstream: options.c:1977 - the secluded/old-args conflict has a
+        // dedicated phrasing (and operand order) distinct from the generic
+        // "--X cannot be used with --Y" template used for other conflicts.
+        if matches!((self.option1, self.option2), ("old-args", "secluded-args")) {
+            return write!(f, "--secluded-args conflicts with --old-args.");
+        }
+        write!(
+            f,
+            "--{} cannot be used with --{}",
+            self.option1, self.option2
+        )
+    }
+}
+
+impl std::error::Error for ConfigConflict {}
+
+/// Generates chainable builder setter methods.
+///
+/// This macro reduces boilerplate for simple field setters that follow the
+/// pattern of assigning a value and returning `self`. Each generated method
+/// is marked `#[must_use]` and declared as `pub const fn`.
+///
+/// # Examples
+///
+/// Generate a simple setter with doc comment:
+///
+/// ```ignore
+/// builder_setter! {
+///     /// Sets the recursive flag.
+///     recursive: bool,
+/// }
+/// // Expands to:
+/// // /// Sets the recursive flag.
+/// // #[must_use]
+/// // pub const fn recursive(mut self, value: bool) -> Self {
+/// //     self.recursive = value;
+/// //     self
+/// // }
+/// ```
+///
+/// Generate multiple setters at once:
+///
+/// ```ignore
+/// builder_setter! {
+///     /// Sets the minimum file size to transfer.
+///     min_file_size: Option<u64>,
+///     /// Sets the maximum file size to transfer.
+///     max_file_size: Option<u64>,
+/// }
+/// ```
+#[macro_export]
+macro_rules! builder_setter {
+    // Single field with doc comments and attributes
+    ($(#[$attr:meta])* $field:ident: $ty:ty) => {
+        $(#[$attr])*
+        #[must_use]
+        pub const fn $field(mut self, value: $ty) -> Self {
+            self.$field = value;
+            self
+        }
+    };
+    // Multiple fields with doc comments
+    ($($(#[$attr:meta])* $field:ident: $ty:ty),+ $(,)?) => {
+        $(
+            builder_setter!($(#[$attr])* $field: $ty);
+        )+
+    };
+}
+
+use super::{
+    AddressMode, BandwidthLimit, BindAddress, ClientConfig, CompressionSetting, DeleteMode,
+    FilesFromSource, FilterRuleSpec, IconvSetting, ReferenceDirectory, ReferenceDirectoryKind,
+    StrongChecksumChoice, TcpFastOpenMode, TransferTimeout,
+};
+use ::metadata::{ChmodModifiers, GroupMapping, UserMapping};
+use compress::algorithm::CompressionAlgorithm;
+use compress::zlib::CompressionLevel;
+use engine::SkipCompressList;
+
+/// Builder used to assemble a [`ClientConfig`].
+///
+/// This type provides a fluent interface for constructing [`ClientConfig`] instances
+/// with incremental configuration of transfer settings. Methods are chainable and
+/// return `self` to allow multiple options to be set in a single expression.
+///
+/// The available options mirror the flags parsed by upstream `options.c`. Mutual
+/// exclusion constraints (e.g. `--inplace` vs `--partial-dir`) are validated at
+/// build time via [`ConfigConflict`].
+///
+/// Create a builder via [`ClientConfig::builder()`].
+///
+/// # Examples
+///
+/// ```ignore
+/// use core::client::ClientConfig;
+///
+/// let config = ClientConfig::builder()
+///     .transfer_args(["src/", "dest/"])
+///     .recursive(true)
+///     .preserve_times(true)
+///     .preserve_permissions(true)
+///     .dry_run(false)
+///     .build();
+/// ```
+///
+/// Compression and bandwidth limiting:
+///
+/// ```ignore
+/// use core::client::{ClientConfig, BandwidthLimit, CompressionSetting};
+/// use compress::zlib::CompressionLevel;
+/// use std::num::NonZeroU64;
+///
+/// let config = ClientConfig::builder()
+///     .transfer_args(["large_file", "backup/"])
+///     .compression_setting(CompressionSetting::level(CompressionLevel::Default))
+///     .bandwidth_limit(Some(BandwidthLimit::from_bytes_per_second(
+///         NonZeroU64::new(1024 * 1024).unwrap()
+///     )))
+///     .build();
+/// ```
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClientConfigBuilder {
+    transfer_args: Vec<OsString>,
+    dry_run: bool,
+    delete_mode: DeleteMode,
+    delete_excluded: bool,
+    delete_missing_args: bool,
+    ignore_errors: bool,
+    max_delete: Option<u64>,
+    recursive: bool,
+    dirs: bool,
+    dirs_explicit: bool,
+    min_file_size: Option<u64>,
+    max_file_size: Option<u64>,
+    block_size_override: Option<NonZeroU32>,
+    rayon_threads: Option<NonZeroUsize>,
+    tokio_threads: Option<NonZeroUsize>,
+    max_alloc: Option<u64>,
+    modify_window: Option<i64>,
+    remove_source_files: bool,
+    remove_sent_files: bool,
+    out_format_forwards_i: bool,
+    render_out_format_locally: bool,
+    out_format_has_operation: bool,
+    out_format_placeholder: bool,
+    bandwidth_limit: Option<BandwidthLimit>,
+    preserve_owner: bool,
+    preserve_group: bool,
+    preserve_executability: bool,
+    preserve_permissions: bool,
+    fake_super: bool,
+    super_user: bool,
+    preserve_times: bool,
+    preserve_atimes: u8,
+    preserve_crtimes: bool,
+    owner_override: Option<u32>,
+    group_override: Option<u32>,
+    copy_as: Option<OsString>,
+    chmod: Option<ChmodModifiers>,
+    user_mapping: Option<UserMapping>,
+    group_mapping: Option<GroupMapping>,
+    omit_dir_times: bool,
+    omit_link_times: bool,
+    compress: bool,
+    compression_algorithm: CompressionAlgorithm,
+    explicit_compress_choice: bool,
+    compress_choice_name: Option<String>,
+    compression_level: Option<CompressionLevel>,
+    compression_setting: CompressionSetting,
+    compression_threads: Option<std::num::NonZeroU8>,
+    skip_compress: SkipCompressList,
+    skip_compress_spec: Option<String>,
+    cvs_exclude: bool,
+    open_noatime: bool,
+    whole_file: Option<bool>,
+    checksum: bool,
+    checksum_choice: StrongChecksumChoice,
+    checksum_seed: Option<u32>,
+    size_only: bool,
+    ignore_times: bool,
+    ignore_existing: bool,
+    existing_only: bool,
+    ignore_missing_args: bool,
+    update: bool,
+    numeric_ids: bool,
+    preallocate: bool,
+    fsync: bool,
+    io_uring_policy: fast_io::IoUringPolicy,
+    io_uring_depth: Option<u32>,
+    cow_policy: fast_io::CowPolicy,
+    zero_copy_policy: fast_io::ZeroCopyPolicy,
+    parallel_delta_scan: bool,
+    preserve_hard_links: bool,
+    preserve_symlinks: bool,
+    filter_rules: Vec<FilterRuleSpec>,
+    debug_flags: Vec<OsString>,
+    info_flags: Vec<OsString>,
+    sparse: bool,
+    sparse_detect: engine::SparseDetectStrategy,
+    fuzzy_level: u8,
+    copy_links: bool,
+    copy_dirlinks: bool,
+    copy_unsafe_links: bool,
+    keep_dirlinks: bool,
+    safe_links: bool,
+    munge_links: bool,
+    trust_sender: bool,
+    copy_devices: bool,
+    write_devices: bool,
+    relative_paths: bool,
+    one_file_system: u8,
+    implied_dirs: Option<bool>,
+    mkpath: bool,
+    prune_empty_dirs: bool,
+    qsort: bool,
+    inc_recursive_send: Option<bool>,
+    verbosity: u8,
+    progress: bool,
+    stats: bool,
+    human_readable: bool,
+    partial: bool,
+    partial_dir: Option<PathBuf>,
+    temp_directory: Option<PathBuf>,
+    backup: bool,
+    backup_dir: Option<PathBuf>,
+    backup_suffix: Option<OsString>,
+    delay_updates: bool,
+    inplace: bool,
+    append: bool,
+    append_verify: bool,
+    force_replacements: bool,
+    itemize_changes: bool,
+    itemize_unchanged: bool,
+    force_event_collection: bool,
+    preserve_devices: bool,
+    preserve_specials: bool,
+    drop_devices: bool,
+    list_only: bool,
+    list_only_arg: bool,
+    quiet: bool,
+    msgs2stderr: Option<bool>,
+    address_mode: AddressMode,
+    timeout: TransferTimeout,
+    connect_timeout: TransferTimeout,
+    stop_deadline: Option<SystemTime>,
+    link_dest_paths: Vec<PathBuf>,
+    reference_directories: Vec<ReferenceDirectory>,
+    connect_program: Option<OsString>,
+    bind_address: Option<BindAddress>,
+    sockopts: Option<OsString>,
+    tcp_fastopen: TcpFastOpenMode,
+    #[cfg(feature = "quic")]
+    daemon_transport: crate::client::Transport,
+    #[cfg(feature = "quic")]
+    quic_ca: Option<PathBuf>,
+    blocking_io: Option<bool>,
+    iconv: IconvSetting,
+    remote_shell: Option<Vec<OsString>>,
+    rsync_path: Option<OsString>,
+    early_input: Option<PathBuf>,
+    prefer_aes_gcm: Option<bool>,
+    protect_args: Option<bool>,
+    old_args: Option<u8>,
+    jump_hosts: Option<OsString>,
+    batch_config: Option<engine::batch::BatchConfig>,
+    files_from: FilesFromSource,
+    from0: bool,
+    spill_dir: Option<PathBuf>,
+    spill_threshold_bytes: Option<u64>,
+    no_spill: bool,
+    no_motd: bool,
+    password_override: Option<Vec<u8>>,
+    remote_options: Vec<OsString>,
+    daemon_params: Vec<String>,
+    protocol_version: Option<protocol::ProtocolVersion>,
+    #[cfg(feature = "embedded-ssh")]
+    embedded_ssh_config: Option<super::client::EmbeddedSshOptions>,
+    #[cfg(all(any(unix, windows), feature = "acl"))]
+    preserve_acls: bool,
+    #[cfg(all(any(unix, windows), feature = "xattr"))]
+    preserve_xattrs: u8,
+}
+
+impl ClientConfigBuilder {
+    /// Applies the option implications upstream resolves after argument
+    /// parsing, before its conflict table runs.
+    ///
+    /// upstream: options.c:2410 - `if (append_mode) { ...; inplace = 1; }`.
+    /// From here on `inplace` is the only flag any consumer reads: the
+    /// receiver's write target (`receiver.c:968`), its closing truncate
+    /// (`receiver.c:496`), the pre-write backup copy (`generator.c:1862,1898`),
+    /// the basis switch to that backup (`receiver.c:872`), the
+    /// retained-vs-discarded branch (`receiver.c:1029`), the `keptstr` wording
+    /// (`receiver.c:1074`), the sender's `updating_basis_file`
+    /// (`sender.c:337`) and the protocol < 29 basis-dir refusal
+    /// (`compat.c:688`). Idempotent, so `validate` and `build` may both call it.
+    fn apply_implied_options(&mut self) {
+        if self.append {
+            self.inplace = true;
+        }
+    }
+
+    /// Resolves implied options, then checks for mutually exclusive
+    /// combinations.
+    ///
+    /// Mirrors upstream `options.c` in both content and order: the `--append`
+    /// implication lands first (`options.c:2410`), so the `inplace` conflict
+    /// table below fires for `--append` without naming the flag twice.
+    ///
+    /// - `--append` conflicts with `--whole-file`
+    ///   (upstream: options.c:2401 `if (append_mode) { if (whole_file > 0) ... }`)
+    /// - `--inplace` conflicts with `--partial-dir` and `--delay-updates`
+    ///   (upstream: options.c:2424-2432), reported against the option the user
+    ///   typed - upstream's `append_mode ? "append" : "inplace"` ternary
+    /// - `--rsh`/`-e` conflicts with an `ssh://` URL operand (oc-specific: the
+    ///   URL scheme selects the built-in SSH client, which ignores `--rsh`)
+    pub fn validate(&mut self) -> Result<(), ConfigConflict> {
+        // oc-specific: an explicit --rsh/-e (or RSYNC_RSH) selects the external
+        // system ssh binary, which is consulted only for `host:path` operands.
+        // An `ssh://` URL operand instead dispatches to the built-in SSH
+        // client, which never spawns an external shell and so silently drops
+        // the remote shell. The two select mutually exclusive transports, so
+        // reject the combination up front instead of dropping the shell without
+        // warning. This has no direct upstream analogue - upstream rsync has no
+        // `ssh://` scheme.
+        //
+        // Gated on `embedded-ssh` so feature-availability wins on a build
+        // without the built-in client: there `ssh://` has no transport at all,
+        // so this conflict must NOT pre-empt the clearer "ssh:// requires the
+        // embedded-ssh feature" diagnostic run_client raises later. A remote
+        // shell is often implicit (RSYNC_RSH in the environment), so surfacing
+        // the -e conflict there would blame an option the user never typed on a
+        // build that could not do ssh:// regardless.
+        #[cfg(feature = "embedded-ssh")]
+        if self.remote_shell.is_some()
+            && self
+                .transfer_args
+                .iter()
+                .any(|arg| arg.to_string_lossy().starts_with("ssh://"))
+        {
+            return Err(ConfigConflict {
+                option1: "rsh",
+                option2: SSH_URL_OPERAND,
+            });
+        }
+
+        // upstream: options.c:1974-1977 - --old-args conflicts with --protect-args.
+        // Any active level (>= 1) triggers the conflict, matching upstream's
+        // `else if (old_style_args)` truthiness test.
+        self.apply_implied_options();
+
+        if self.old_args.unwrap_or(0) >= 1 && self.protect_args == Some(true) {
+            return Err(ConfigConflict {
+                option1: "old-args",
+                option2: "secluded-args",
+            });
+        }
+
+        // upstream: options.c:2400 - --append cannot be used with --whole-file.
+        // Only an explicit `--whole-file` (Some(true)) conflicts; the default
+        // (None) and `--no-whole-file` (Some(false)) are accepted.
+        if self.append && self.whole_file == Some(true) {
+            return Err(ConfigConflict {
+                option1: "append",
+                option2: "whole-file",
+            });
+        }
+
+        if self.inplace {
+            let mode = if self.append { "append" } else { "inplace" };
+
+            if self.delay_updates {
+                return Err(ConfigConflict {
+                    option1: mode,
+                    option2: "delay-updates",
+                });
+            }
+
+            // upstream: options.c:2424-2432 - `--inplace`/`--append` cannot be
+            // used with `--partial-dir`. Upstream rejects this pair
+            // unconditionally, before any capability negotiation. The
+            // `CF_INPLACE_PARTIAL_DIR` capability (compat.c:777-778,
+            // receiver.c:910) only enables the receiver's internal one_inplace
+            // optimization for a basis file found in the partial directory; it
+            // never relaxes this user-facing option conflict.
+            if self.partial_dir.is_some() {
+                return Err(ConfigConflict {
+                    option1: mode,
+                    option2: "partial-dir",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Finalises the builder and constructs a [`ClientConfig`].
+    ///
+    /// Performs upstream-compatible promotions before materialising the
+    /// config:
+    ///
+    /// - `--checksum-choice=none` promotes `whole_file` to `Some(true)`.
+    ///   Mirrors upstream `checksum.c:197-198`, which assigns
+    ///   `whole_file = 1` whenever the negotiated transfer checksum is
+    ///   `CSUM_NONE`. The delta pipeline cannot run without a transfer
+    ///   checksum, so whole-file transfer is the only valid mode.
+    /// - `--append` promotes `inplace` to `true`. Mirrors upstream
+    ///   `options.c:2410`, which sets `inplace = 1` for any `append_mode`.
+    #[must_use]
+    pub fn build(mut self) -> ClientConfig {
+        // upstream: checksum.c:197-198 parse_checksum_choice() forces
+        // `whole_file = 1` unconditionally when `xfer_sum_nni->num == CSUM_NONE`.
+        if self.checksum_choice.transfer_is_none() {
+            self.whole_file = Some(true);
+        }
+        self.apply_implied_options();
+        // upstream: options.c:2336-2339 - inject `P *<suffix>` so files saved
+        // as backups beside the destination are protected from the delete pass.
+        self.push_backup_protect_filter();
+        // upstream: compat.c:791-797 - append the implicit `--partial-dir`
+        // exclude at the tail of the filter list, after every CLI rule.
+        self.push_implicit_partial_dir_filter();
+        ClientConfig {
+            transfer_args: self.transfer_args,
+            dry_run: self.dry_run,
+            delete_mode: self.delete_mode,
+            delete_excluded: self.delete_excluded,
+            delete_missing_args: self.delete_missing_args,
+            ignore_errors: self.ignore_errors,
+            max_delete: self.max_delete,
+            recursive: self.recursive,
+            dirs: self.dirs,
+            dirs_explicit: self.dirs_explicit,
+            min_file_size: self.min_file_size,
+            max_file_size: self.max_file_size,
+            block_size_override: self.block_size_override,
+            rayon_threads: self.rayon_threads,
+            tokio_threads: self.tokio_threads,
+            max_alloc: self.max_alloc,
+            modify_window: self.modify_window,
+            remove_source_files: self.remove_source_files,
+            remove_sent_files: self.remove_sent_files,
+            out_format_forwards_i: self.out_format_forwards_i,
+            render_out_format_locally: self.render_out_format_locally,
+            out_format_has_operation: self.out_format_has_operation,
+            out_format_placeholder: self.out_format_placeholder,
+            bandwidth_limit: self.bandwidth_limit,
+            preserve_owner: self.preserve_owner,
+            preserve_group: self.preserve_group,
+            preserve_executability: self.preserve_executability,
+            preserve_permissions: self.preserve_permissions,
+            fake_super: self.fake_super,
+            super_user: self.super_user,
+            preserve_times: self.preserve_times,
+            preserve_atimes: self.preserve_atimes,
+            preserve_crtimes: self.preserve_crtimes,
+            owner_override: self.owner_override,
+            group_override: self.group_override,
+            copy_as: self.copy_as,
+            chmod: self.chmod,
+            user_mapping: self.user_mapping,
+            group_mapping: self.group_mapping,
+            omit_dir_times: self.omit_dir_times,
+            omit_link_times: self.omit_link_times,
+            compress: self.compress,
+            compression_algorithm: self.compression_algorithm,
+            explicit_compress_choice: self.explicit_compress_choice,
+            compress_choice_name: self.compress_choice_name,
+            compression_level: self.compression_level,
+            compression_setting: self.compression_setting,
+            compression_threads: self.compression_threads,
+            skip_compress: self.skip_compress,
+            skip_compress_spec: self.skip_compress_spec,
+            cvs_exclude: self.cvs_exclude,
+            open_noatime: self.open_noatime,
+            whole_file: self.whole_file,
+            checksum: self.checksum,
+            checksum_choice: self.checksum_choice,
+            checksum_seed: self.checksum_seed,
+            size_only: self.size_only,
+            ignore_times: self.ignore_times,
+            ignore_existing: self.ignore_existing,
+            existing_only: self.existing_only,
+            ignore_missing_args: self.ignore_missing_args,
+            update: self.update,
+            numeric_ids: self.numeric_ids,
+            preallocate: self.preallocate,
+            fsync: self.fsync,
+            io_uring_policy: self.io_uring_policy,
+            io_uring_depth: self.io_uring_depth,
+            cow_policy: self.cow_policy,
+            zero_copy_policy: self.zero_copy_policy,
+            parallel_delta_scan: self.parallel_delta_scan,
+            preserve_hard_links: self.preserve_hard_links,
+            preserve_symlinks: self.preserve_symlinks,
+            filter_rules: self.filter_rules,
+            debug_flags: self.debug_flags,
+            info_flags: self.info_flags,
+            sparse: self.sparse,
+            sparse_detect: self.sparse_detect,
+            fuzzy_level: self.fuzzy_level,
+            copy_links: self.copy_links,
+            copy_dirlinks: self.copy_dirlinks,
+            copy_unsafe_links: self.copy_unsafe_links,
+            keep_dirlinks: self.keep_dirlinks,
+            safe_links: self.safe_links,
+            munge_links: self.munge_links,
+            trust_sender: self.trust_sender,
+            copy_devices: self.copy_devices,
+            write_devices: self.write_devices,
+            relative_paths: self.relative_paths,
+            one_file_system: self.one_file_system,
+            implied_dirs: self.implied_dirs.unwrap_or(true),
+            mkpath: self.mkpath,
+            prune_empty_dirs: self.prune_empty_dirs,
+            qsort: self.qsort,
+            // ISI.h: sender-side INC_RECURSE is default-on, matching
+            // upstream rsync 3.4.x. CLI `--no-inc-recursive` still overrides
+            // to `false`.
+            inc_recursive_send: self.inc_recursive_send.unwrap_or(true),
+            verbosity: self.verbosity,
+            progress: self.progress,
+            stats: self.stats,
+            human_readable: self.human_readable,
+            partial: self.partial,
+            partial_dir: self.partial_dir,
+            temp_directory: self.temp_directory,
+            backup: self.backup,
+            backup_dir: self.backup_dir,
+            backup_suffix: self.backup_suffix,
+            delay_updates: self.delay_updates,
+            inplace: self.inplace,
+            append: self.append,
+            append_verify: self.append_verify,
+            force_replacements: self.force_replacements,
+            itemize_changes: self.itemize_changes,
+            itemize_unchanged: self.itemize_unchanged,
+            force_event_collection: self.force_event_collection,
+            preserve_devices: self.preserve_devices,
+            preserve_specials: self.preserve_specials,
+            drop_devices: self.drop_devices,
+            list_only: self.list_only,
+            list_only_arg: self.list_only_arg,
+            quiet: self.quiet,
+            msgs2stderr: self.msgs2stderr,
+            address_mode: self.address_mode,
+            timeout: self.timeout,
+            connect_timeout: self.connect_timeout,
+            stop_at: self.stop_deadline,
+            link_dest_paths: self.link_dest_paths,
+            reference_directories: self.reference_directories,
+            connect_program: self.connect_program,
+            bind_address: self.bind_address,
+            sockopts: self.sockopts,
+            tcp_fastopen: self.tcp_fastopen,
+            #[cfg(feature = "quic")]
+            daemon_transport: self.daemon_transport,
+            #[cfg(feature = "quic")]
+            quic_ca: self.quic_ca,
+            blocking_io: self.blocking_io,
+            iconv: self.iconv,
+            remote_shell: self.remote_shell,
+            rsync_path: self.rsync_path,
+            early_input: self.early_input,
+            prefer_aes_gcm: self.prefer_aes_gcm,
+            protect_args: self.protect_args,
+            old_args: self.old_args,
+            jump_hosts: self.jump_hosts,
+            batch_config: self.batch_config,
+            files_from: self.files_from,
+            from0: self.from0,
+            spill_dir: self.spill_dir,
+            spill_threshold_bytes: self.spill_threshold_bytes,
+            no_spill: self.no_spill,
+            no_motd: self.no_motd,
+            password_override: self.password_override,
+            remote_options: self.remote_options,
+            daemon_params: self.daemon_params,
+            protocol_version: self.protocol_version,
+            #[cfg(feature = "embedded-ssh")]
+            embedded_ssh_config: self.embedded_ssh_config,
+            #[cfg(all(any(unix, windows), feature = "acl"))]
+            preserve_acls: self.preserve_acls,
+            #[cfg(all(any(unix, windows), feature = "xattr"))]
+            preserve_xattrs: self.preserve_xattrs,
+        }
+    }
+}
+
+mod arguments;
+mod deletion;
+mod filters;
+mod metadata;
+mod network;
+mod output;
+mod partials;
+mod paths;
+mod performance;
+mod preservation;
+mod selection;
+mod validation;
+
+#[cfg(test)]
+mod tests;

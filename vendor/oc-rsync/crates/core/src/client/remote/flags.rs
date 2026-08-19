@@ -1,0 +1,1708 @@
+//! Shared flag builder functions for remote transfer modules.
+//!
+//! Contains logic for building server flag strings and converting client filter
+//! rules to wire format, shared between SSH and daemon transfer orchestration.
+//! The flag ordering and encoding mirror upstream `options.c:server_options()`.
+//!
+//! # Upstream Reference
+//!
+//! - `options.c:server_options()` - Compact flag string generation
+//! - `options.c:parse_arguments()` - Server-side flag parsing
+//! - `exclude.c:send_rules()` - Filter rule wire format
+
+use protocol::filters::{FilterRuleWireFormat, RuleType};
+
+use super::super::config::{ClientConfig, DeleteMode, FilterRuleKind, FilterRuleSpec};
+use super::super::error::ClientError;
+use crate::client::DirMergeEnforcedKind;
+use crate::server::ServerConfig;
+
+/// Builds the compact server flag string from client configuration.
+///
+/// Constructs a single-character flag string (e.g., `-logDtpr`) encoding the
+/// transfer options negotiated between client and server. The flag order matches
+/// upstream `server_options()`.
+pub(crate) fn build_server_flag_string(config: &ClientConfig) -> String {
+    let mut flags = String::from("-");
+
+    // upstream: options.c:2625-2626 - `for (i = 0; i < verbose; i++)
+    // argstr[x++] = 'v';` packs one 'v' per verbosity level, first after the
+    // leading '-'. server_options() sends the count to the remote so its
+    // generator/receiver emits matching verbose diagnostics; the daemon wire
+    // path (build_full_daemon_args) carries this string verbatim. The
+    // in-process half re-parses the same string (from_flag_string_and_args)
+    // and honours the 'v' count too, redundantly with apply_common_server_flags.
+    for _ in 0..config.verbosity() {
+        flags.push('v');
+    }
+
+    // upstream: options.c:2646-2647 - `if (quiet && msgs2stderr) 'q'`. The
+    // default `msgs2stderr` is 2 (nonzero), so plain `-q` packs 'q';
+    // `--no-msgs2stderr` (msgs2stderr == 0) suppresses it. The local-half
+    // ServerConfig parser ignores 'q' (transfer/flags.rs), so packing it here
+    // is inert for the in-process receiver and meaningful only on the wire.
+    if config.quiet() && config.msgs2stderr() != Some(false) {
+        flags.push('q');
+    }
+
+    // upstream: options.c:2648-2649 - `make_backups` rides in the compact
+    // flag string as `b`. Emitting `--backup` as a separate long arg lands
+    // as a positional path on upstream server arg parsers that do not
+    // consult popt for long flags.
+    if config.backup() {
+        flags.push('b');
+    }
+    if config.update() {
+        flags.push('u');
+    }
+    // upstream: 'n' = dry_run (!do_xfers), NOT numeric_ids.
+    // numeric_ids is always sent as long-form --numeric-ids (options.c:2905-2906).
+    if config.dry_run() {
+        flags.push('n');
+    }
+    if config.links() {
+        flags.push('l');
+    }
+
+    // upstream: options.c:2188-2191 - `if (files_from) { if (recurse == 1)
+    // recurse = 0; if (xfer_dirs < 0) xfer_dirs = 1; }`. Only the recursion `-a`
+    // implies is cleared; an explicit `-r` (recurse == 2) survives --files-from.
+    // That resolution happens once at the CLI, so `config.recursive()` is
+    // already upstream's post-resolution `recurse != 0` and must not be
+    // re-cleared here - doing so dropped the compact `r` letter AND, because the
+    // local half re-parses this same string, stopped the sender from recursing
+    // into a directory named in the list at all.
+    // options.c:2205-2206 - --files-from defaults relative_paths=1.
+    let effective_recursive = config.recursive();
+    // upstream: options.c:2713-2714 - `if (relative_paths) argstr[x++] = 'R';`
+    // packs the compact `R` for the RESOLVED relative_paths. `relative_paths()`
+    // already folds in the --files-from default (options.c:2205-2206: relative
+    // defaults to 1 under --files-from) at the CLI layer, so it must NOT be
+    // re-forced with `|| files_from_active` - that wrongly packs `R` even when
+    // the user passed --no-relative, telling the remote peer relative is on and
+    // making the client-sender flatten (flist.c:2338-2349) diverge from the
+    // wire signal (`sub/file` implied dir instead of the flattened `file`).
+    let effective_relative = config.relative_paths();
+
+    // upstream: options.c:2638-2640 - `if ((xfer_dirs >= 2 && xfer_dirs < 4) ||
+    // (xfer_dirs && !recurse && (list_only || (delete_mode && am_sender))))
+    // argstr[x++] = 'd';`. The letter tracks an EXPLICIT `-d` (xfer_dirs == 2),
+    // not the `xfer_dirs = 1` that --files-from or recursion implies - packing
+    // it for the implied level told the peer `--dirs` for every --files-from
+    // transfer. `d` = --dirs; the delete variants always travel long-form
+    // (options.c:2818-2827).
+    if config.dirs_explicit()
+        || (config.dirs()
+            && !effective_recursive
+            && (config.list_only()
+                || (config.delete_mode().is_enabled() && config.is_local_sender())))
+    {
+        flags.push('d');
+    }
+
+    // upstream: options.c:2655-2660 - `if (am_sender) { ... } else { if
+    // (copy_links) 'L'; if (copy_dirlinks) 'k'; }`. The compact L/k letters are
+    // role-specific: server_options() emits them ONLY when the local side is
+    // NOT the sender (a pull), because copy_links/copy_dirlinks dereference
+    // symlinks on the SENDER, so they matter to the remote only when the remote
+    // is the sender. This role-agnostic builder therefore does NOT pack L/k -
+    // the daemon wire path (build_full_daemon_args) re-adds them gated on the
+    // pull direction, and the in-process half sets `flags.copy_links` /
+    // `flags.copy_dirlinks` directly in apply_common_server_flags so a push
+    // generator still dereferences.
+
+    // upstream: options.c:2662-2666 - only send 'W' when explicitly set
+    // (whole_file > 0). The default for remote transfers is no-whole-file
+    // (delta mode); upstream never sends --no-whole-file because it is the
+    // default. Sending 'W' unconditionally when the tri-state defaults to
+    // true forces the remote generator to skip basis-file checksums, so the
+    // sender falls back to whole-file even when a basis exists.
+    if config.whole_file_raw() == Some(true) && !config.append() {
+        flags.push('W');
+    }
+
+    if config.preserve_hard_links() {
+        flags.push('H');
+    }
+    if config.preserve_owner() {
+        flags.push('o');
+    }
+    if config.preserve_group() {
+        flags.push('g');
+    }
+    // upstream: options.c:2677-2678 - `if (preserve_devices) argstr[x++] = 'D';
+    // /* ignore preserve_specials here */`. The compact 'D' tracks devices only;
+    // specials ride as long-form --specials/--no-specials on the wire.
+    if config.preserve_devices() {
+        flags.push('D');
+    }
+    if config.preserve_times() {
+        flags.push('t');
+    }
+    // upstream: options.c:2681-2685 - `-UU` doubles the letter at level 2.
+    for _ in 0..config.preserve_atimes_level().min(2) {
+        flags.push('U');
+    }
+    if config.preserve_crtimes() {
+        flags.push('N');
+    }
+    if config.preserve_permissions() {
+        flags.push('p');
+    }
+    #[cfg(all(any(unix, windows), feature = "acl"))]
+    if config.preserve_acls() {
+        flags.push('A');
+    }
+    #[cfg(all(unix, feature = "xattr"))]
+    // upstream: options.c:2698-2704 - `-XX` doubles the letter at level 2.
+    for _ in 0..config.preserve_xattrs_level().min(2) {
+        flags.push('X');
+    }
+    if effective_recursive {
+        flags.push('r');
+    }
+    if config.checksum() {
+        flags.push('c');
+    }
+    // upstream: options.c:2709-2710 - `if (cvs_exclude) 'C'`. Forwarded so the
+    // remote peer runs get_cvs_excludes() itself; duplicate excludes are
+    // idempotent with the transmitted CVS filter rules.
+    if config.cvs_exclude() {
+        flags.push('C');
+    }
+    if config.ignore_times() {
+        flags.push('I');
+    }
+    if effective_relative {
+        flags.push('R');
+    }
+    for _ in 0..config.one_file_system_level() {
+        flags.push('x');
+    }
+    if config.sparse() {
+        flags.push('S');
+    }
+    // upstream: options.c:2722 - the compact 'z' is packed only when
+    // `do_compression == CPRES_ZLIB`. Plain `-z` defaults to zlib and explicit
+    // `--compress-choice=zlib` also packs 'z', but zlibx/zstd/lz4 are forwarded
+    // via the long-form `--new-compress`/`--compress-choice` instead and must
+    // NOT also pack 'z'. `CompressionAlgorithm` folds zlibx onto Zlib, so the
+    // raw choice name (not the enum) distinguishes it.
+    if config.compress()
+        && (!config.explicit_compress_choice()
+            || config
+                .compress_choice_name()
+                .unwrap_or_else(|| config.compression_algorithm().name())
+                == "zlib")
+    {
+        flags.push('z');
+    }
+
+    // upstream: options.c has NO compact 'P' letter. keep_partial rides as the
+    // long-form --partial (daemon: build_full_daemon_args; local ServerConfig:
+    // propagated via server_config.flags.partial in the *_server_config sites).
+
+    // upstream: options.c:2768-2780 - itemize-changes is forwarded via
+    // --log-format=%i in the long-form args, not as a compact flag.
+
+    flags
+}
+
+/// Sender-only `--super`/`--stats` server args, shared by the SSH and
+/// daemon-push argument builders.
+///
+/// upstream: options.c:3018-3023 server_options() - `args[ac++] = "--super"`
+/// when `am_root > 1` (an explicit `--super`, never mere root) and
+/// `args[ac++] = "--stats"` when `do_stats`, both inside the am_sender block.
+/// Both are forwarded only on a push,
+/// where the remote receiver/generator performs the privileged operations and
+/// computes the transfer statistics. Callers invoke this only from their sender
+/// branch so both transports emit the same trailer in the same order.
+/// `--fake-super` (am_root == -1) is receiver-local and is never forwarded.
+pub(crate) fn sender_super_stats_args(config: &ClientConfig) -> impl Iterator<Item = &'static str> {
+    [
+        config.super_user().then_some("--super"),
+        config.stats().then_some("--stats"),
+    ]
+    .into_iter()
+    .flatten()
+}
+
+/// Converts client filter rules to wire format.
+///
+/// Maps [`FilterRuleSpec`] (client-side representation) to [`FilterRuleWireFormat`]
+/// (protocol wire representation) for transmission to the remote server.
+///
+/// The `FilterRuleWireFormat::pattern` field stores the bare pattern with the
+/// leading `/` (anchored) and trailing `/` (directory-only) stripped. Those
+/// modifiers are encoded as separate flags and re-emitted by the wire
+/// serializer; leaving them in the pattern produces a double `/` on the wire
+/// (e.g. `*//` for `--include='*/'`) which upstream rsync misinterprets.
+///
+/// upstream: `exclude.c:1238-1240` - leading `/` is parsed as the
+/// `FILTRULE_ABS_PATH` modifier. `exclude.c:get_rule_prefix()` (and
+/// `serialize_rule` here) re-append the trailing `/` for directory-only rules.
+/// Maps a spec's two-sided applicability onto the wire's `FILTRULES_SIDES`
+/// encoding: a rule that applies to both sides carries *neither* side bit on
+/// the wire, while a one-sided rule carries the matching bit.
+///
+/// oc-rsync's [`FilterRuleSpec`] represents "applies to both sides" as
+/// `applies_to_sender() && applies_to_receiver()`, but upstream's wire format
+/// encodes that default as no side flag at all. A naive copy of both booleans
+/// would serialize a plain `--exclude` as `-sr` instead of `- `.
+///
+/// upstream: exclude.c:1566-1572 (`get_rule_prefix`) emits `s` iff
+/// `FILTRULE_SENDER_SIDE` and `r` iff `FILTRULE_RECEIVER_SIDE`; a both-sides
+/// rule has neither bit set (exclude.c:1331 masks `FILTRULES_SIDES`).
+fn wire_sender_side(spec: &FilterRuleSpec) -> bool {
+    spec.applies_to_sender() && !spec.applies_to_receiver()
+}
+
+/// Receiver-side counterpart of [`wire_sender_side`].
+fn wire_receiver_side(spec: &FilterRuleSpec) -> bool {
+    spec.applies_to_receiver() && !spec.applies_to_sender()
+}
+
+pub(crate) fn build_wire_format_rules(
+    client_rules: &[FilterRuleSpec],
+    delete_excluded: bool,
+) -> Result<Vec<FilterRuleWireFormat>, ClientError> {
+    let mut wire_rules = Vec::new();
+
+    for spec in client_rules {
+        // upstream: exclude.c:1330-1332 add_rule() applies an implicit
+        // FILTRULE_SENDER_SIDE when --delete-excluded is active and the
+        // rule carries neither FILTRULES_SIDES nor merge/dir-merge. The
+        // flag drives `get_rule_prefix()` (exclude.c:1566-1568) to emit
+        // the `s` modifier on the wire and `send_rules()` (line 1605) to
+        // elide the rule from the receiver's view because it has already
+        // been applied locally on the sender.
+        let mut spec_owned;
+        let spec_ref = if delete_excluded {
+            spec_owned = spec.clone();
+            spec_owned.apply_implicit_sender_side_for_delete_excluded();
+            &spec_owned
+        } else {
+            spec
+        };
+        let spec = spec_ref;
+        let rule_type = match spec.kind() {
+            FilterRuleKind::Include => RuleType::Include,
+            FilterRuleKind::Exclude => RuleType::Exclude,
+            FilterRuleKind::Clear => RuleType::Clear,
+            FilterRuleKind::Protect => RuleType::Protect,
+            FilterRuleKind::Risk => RuleType::Risk,
+            FilterRuleKind::DirMerge => RuleType::DirMerge,
+            FilterRuleKind::ExcludeIfPresent => {
+                // upstream: ExcludeIfPresent is transmitted as Exclude with 'e' flag
+                // (FILTRULE_EXCLUDE_SELF).
+                let (pattern, anchored, directory_only) = split_pattern_modifiers(spec.pattern());
+                wire_rules.push(FilterRuleWireFormat {
+                    rule_type: RuleType::Exclude,
+                    pattern: pattern.into(),
+                    anchored,
+                    directory_only,
+                    // upstream: 'e' flag = FILTRULE_EXCLUDE_SELF.
+                    exclude_from_merge: true,
+                    xattr_only: spec.is_xattr_only(),
+                    sender_side: wire_sender_side(spec),
+                    receiver_side: wire_receiver_side(spec),
+                    perishable: spec.is_perishable(),
+                    negate: spec.is_negated(),
+                    ..FilterRuleWireFormat::default()
+                });
+                continue;
+            }
+        };
+
+        let (pattern, anchored, directory_only) = split_pattern_modifiers(spec.pattern());
+        let mut wire_rule = FilterRuleWireFormat {
+            rule_type,
+            pattern: pattern.into(),
+            anchored,
+            directory_only,
+            xattr_only: spec.is_xattr_only(),
+            sender_side: wire_sender_side(spec),
+            receiver_side: wire_receiver_side(spec),
+            perishable: spec.is_perishable(),
+            negate: spec.is_negated(),
+            // upstream: exclude.c:1652-1668 send_filter_list() gates `-C` rules
+            // on the sending role and protocol; carry the origin so the wire
+            // projection (transfer::wire_rule_crosses_wire) can reproduce it.
+            cvs_origin: spec.is_cvs_origin(),
+            ..FilterRuleWireFormat::default()
+        };
+
+        if let Some(options) = spec.dir_merge_options() {
+            wire_rule.no_inherit = !options.inherit_rules();
+            wire_rule.word_split = options.uses_whitespace();
+            wire_rule.exclude_from_merge = options.excludes_self();
+            // upstream: exclude.c:1227-1237 - the `-`/`+` modifier on a
+            // dir-merge rule sets FILTRULE_NO_PREFIXES (and FILTRULE_INCLUDE for
+            // `+`), so the per-directory file's bare lines are taken as literal
+            // excludes (or includes) rather than prefixed rules. Without
+            // carrying this on the wire, the remote sender parses the merge file
+            // with the strict short-form parser and rejects a bare pattern like
+            // `file3` as an unrecognised rule.
+            match options.enforced_kind() {
+                Some(DirMergeEnforcedKind::Exclude) => wire_rule.no_prefixes = true,
+                Some(DirMergeEnforcedKind::Include) => {
+                    wire_rule.no_prefixes = true;
+                    wire_rule.no_prefixes_include = true;
+                }
+                None => {}
+            }
+            // upstream: exclude.c:1248-1254 - the `C` modifier on a dir-merge
+            // rule sets FILTRULE_CVS_IGNORE on the wire. Without this, `-f:C`
+            // would round-trip through the remote shell as a bare dir-merge
+            // missing the CVS flag, so the remote sender could neither
+            // default the empty pattern to `.cvsignore` nor activate
+            // CVS-style whitespace parsing of the per-directory file.
+            wire_rule.cvs_exclude = options.is_cvs_mode();
+            // upstream: exclude.c:1566-1572 get_rule_prefix() emits `s`/`r` for a
+            // side-restricted dir-merge. A `:s`/`:r` dir-merge's side lives in
+            // DirMergeOptions, NOT in the spec's applies_to_* booleans that
+            // wire_sender_side()/wire_receiver_side() read (FilterRuleSpec::dir_merge
+            // hardcodes both true). Without carrying it here, a `:s .filt`
+            // serializes with no side flag, so the receiver's --delete pass loads
+            // it (and any nested dir-merge) as two-sided and wrongly protects
+            // flist-absent files from deletion. Mirror the both-sides==no-flag
+            // convention exactly.
+            let dm_sender = options.applies_to_sender();
+            let dm_receiver = options.applies_to_receiver();
+            wire_rule.sender_side = dm_sender && !dm_receiver;
+            wire_rule.receiver_side = dm_receiver && !dm_sender;
+        }
+
+        wire_rules.push(wire_rule);
+    }
+
+    Ok(wire_rules)
+}
+
+/// Separates anchor (`/`) and directory (`/`) modifiers from the pattern body.
+///
+/// Returns `(pattern, anchored, directory_only)` where `pattern` excludes both
+/// the leading and trailing `/` when present. Bare `/` (which represents both
+/// modifiers on the root) is preserved as the pattern so it round-trips through
+/// the wire correctly.
+fn split_pattern_modifiers(raw: &str) -> (String, bool, bool) {
+    if raw == "/" {
+        return (raw.to_owned(), true, false);
+    }
+    let anchored = raw.starts_with('/');
+    let directory_only = raw.len() > 1 && raw.ends_with('/');
+    let start = usize::from(anchored);
+    let end = raw.len() - usize::from(directory_only);
+    (raw[start..end].to_owned(), anchored, directory_only)
+}
+
+/// Carries `--only-write-batch` onto a remote-shell PUSH sender's config.
+///
+/// Upstream binds `f_xfer` once per `send_files()` run from the global
+/// `write_batch` (`sender.c:217`); oc's sender reads the same decision off its
+/// in-process `ServerConfig`, which is parsed from the compact flag string and
+/// so never sees this long-form-only option. Without it the sender would keep
+/// streaming tokens at a remote receiver that `--only-write-batch=X` has just
+/// put into `dry_run` and which therefore reads none of them.
+///
+/// Scoped to the remote-shell sender on purpose: `server_options()` emits the
+/// placeholder inside its `am_sender` block, so a pull sender-server never sees
+/// it, and the daemon path deliberately strips client-only batch flags from the
+/// module argument list - its receiver stays live and must keep reading tokens.
+///
+/// # Upstream Reference
+///
+/// - `options.c:2850-2851` - `if (write_batch < 0) "--only-write-batch=X"`
+/// - `main.c:1839` - `if (write_batch < 0) dry_run = 1`
+pub(crate) fn apply_only_write_batch_for_sender(
+    config: &ClientConfig,
+    server_config: &mut ServerConfig,
+) {
+    server_config.flags.only_write_batch = config.only_write_batch();
+}
+
+/// Carries `--only-write-batch` onto the LOCAL receiver's config on a PULL.
+///
+/// On a pull the local client IS the receiver, and upstream never forwards the
+/// option to the remote sender (`server_options()` emits the `X` placeholder
+/// inside its `am_sender` block, options.c:2850). Instead `main.c:1839` turns
+/// `write_batch < 0` into `dry_run = 1` on this side - suppressing every
+/// filesystem mutation via the `do_mkdir`/`do_open`/`do_unlink` guards - while
+/// `do_xfers` stays 1 (it was computed before that assignment), so the remote
+/// sender is an ordinary one that still streams sum head, delta and file
+/// checksum. The receiver logs the item and calls `discard_receive_data()` to
+/// drain that stream without writing anything (receiver.c:811-817).
+///
+/// Both flags are needed: `only_write_batch` selects the drain-and-discard loop
+/// (which is checked ahead of `dry_run` in the receiver's dispatch), and
+/// `dry_run` drives `TransferFlags::skip_dest_writes()` so no directory,
+/// symlink, special file or deletion is applied either. Without this the pull
+/// updated the destination in full, contradicting "like --write-batch but w/o
+/// updating destination".
+///
+/// # Upstream Reference
+///
+/// - `main.c:1839` - `if (write_batch < 0) dry_run = 1`
+/// - `options.c:2850-2851` - placeholder forwarded on a push only
+/// - `receiver.c:811-817` - log the item, `discard_receive_data()`, no write
+pub(crate) fn apply_only_write_batch_for_receiver(
+    config: &ClientConfig,
+    server_config: &mut ServerConfig,
+) {
+    if config.only_write_batch() {
+        server_config.flags.only_write_batch = true;
+        server_config.flags.dry_run = true;
+    }
+}
+
+/// Applies common server flags from client configuration to a server config.
+///
+/// Sets the fields that are shared across both SSH and daemon transfer paths
+/// for both receiver and generator roles: `trust_sender`, `qsort`, `inplace`,
+/// `min_file_size`, `max_file_size`, `do_stats`, `late_delete`, and `itemize`.
+pub(crate) fn apply_common_server_flags(config: &ClientConfig, server_config: &mut ServerConfig) {
+    // upstream: options.c:846 / compat.c:604-607 - `--protocol=N` lowers the
+    // advertised `protocol_version`, capping the negotiated version. Carry the
+    // requested ceiling onto the in-process ServerConfig so the SSH handshake
+    // clamps to it (the daemon path reads config.protocol_version() directly).
+    // Defaults to NEWEST when unset, reproducing the uncapped negotiation.
+    server_config.protocol = config
+        .protocol_version()
+        .unwrap_or(protocol::ProtocolVersion::NEWEST);
+    server_config.trust_sender = config.trust_sender();
+    server_config.qsort = config.qsort();
+    // upstream: generator.c:720-721 - `-B` is honoured by whichever side runs
+    // the generator, so the client half needs it for a pull exactly as the
+    // server half needs the forwarded `-B%u` for a push. Both roles share this
+    // function, so one assignment covers SSH, daemon and embedded-SSH.
+    server_config.block_size = config.block_size_override();
+    // upstream: options.c:2190-2203 - `xfer_dirs` is resolved locally by each
+    // side (`--files-from`, recursion and `--list-only` all imply level 1), and
+    // the compact `d` letter is packed only for an EXPLICIT `-d`
+    // (options.c:2638-2640), so the peer re-derives the implied level itself and
+    // it never needs to ride the wire.
+    //
+    // oc's in-process half is parsed back out of that same flag string, so the
+    // implied level would otherwise be lost: an `-a --files-from` transfer packs
+    // neither `d` nor `r`, leaving the local sender at xfer_dirs = 0 with no
+    // directory in the file list at all. Carry the resolved value directly.
+    server_config.flags.dirs = config.dirs();
+    server_config.write.inplace = config.inplace();
+    // upstream: receiver.c:968 - append mode implies inplace; the sum_head
+    // block-skip (generator.c:786) and flength derivation (sender.c:89) on both
+    // the local sender (push) and receiver (pull) roles gate on these flags, so
+    // they must be carried onto the in-process ServerConfig for SSH and daemon.
+    server_config.flags.append = config.append();
+    server_config.flags.append_verify = config.append_verify();
+    // upstream: receiver.c:320 - `--preallocate` (preallocate_files) is a
+    // long-form-only flag with no compact letter, so build_server_flag_string
+    // never packs it into the capability string this local ServerConfig is
+    // parsed from. On a remote-shell/daemon pull the LOCAL client is the
+    // receiver, so carry the flag directly onto its config; without this the
+    // receiver never fallocate()s its destination files. Inert on a push (the
+    // remote receiver picks it up from the forwarded --preallocate arg).
+    server_config.flags.preallocate = config.preallocate();
+    // upstream: options.c:730-731 - `--remove-source-files` is a long-form-only
+    // flag with no compact letter, so build_server_flag_string never packs it
+    // into the capability string this local ServerConfig is parsed from. It
+    // governs the local half of BOTH roles: on a push the local client is the
+    // sender and must run the deferred unlink of its own sources once the remote
+    // receiver confirms each commit with MSG_SUCCESS (sender.c:131-182); on a
+    // pull the local client is the generator/receiver and must emit MSG_SUCCESS
+    // to the remote sender so it can unlink the remote sources (receiver.c:1063-1069).
+    // Without carrying it here the removal is silently skipped for every remote
+    // transfer, so it must ride onto the local config exactly like `--preallocate`.
+    server_config.flags.remove_source_files = config.remove_source_files();
+    server_config.has_partial_dir = config.partial_directory().is_some();
+    server_config.partial_dir = config.partial_directory().map(std::path::Path::to_path_buf);
+    server_config.file_selection.min_file_size = config.min_file_size();
+    server_config.file_selection.max_file_size = config.max_file_size();
+    // upstream: generator.c:quick_check_ok() -> same_time() applies the
+    // `--modify-window` tolerance on the receiver. For a remote-shell pull the
+    // local client IS the receiver, so carry the window onto its config; the
+    // server-side receiver (push) picks it up from the forwarded
+    // `--modify-window=NUM` arg. `modify_window()` is None when unset (window 0).
+    server_config.file_selection.modify_window = config.modify_window().map_or(
+        ::metadata::ModifyWindow::ZERO,
+        ::metadata::ModifyWindow::from_secs,
+    );
+    // upstream: options.c:2064-2066 - do_stats sets INFO_STATS to level 2+
+    server_config.do_stats = config.stats();
+    // upstream: generator.c:124 - EARLY_DELETE_DONE_MSG = !(delete_during==2 || delete_after)
+    server_config.deletion.late_delete =
+        matches!(config.delete_mode(), DeleteMode::Delay | DeleteMode::After);
+    // upstream: generator.c:2427-2428 - only --delete-after defers the delete
+    // *decision* to after the transfer (so a per-dir `.rsync-filter` protects at
+    // delete time). --delete-delay decides during the walk (generator.c:2315),
+    // deferring only the unlink, so it is NOT flagged here.
+    server_config.deletion.delete_after = matches!(config.delete_mode(), DeleteMode::After);
+    // upstream: options.c `delete_excluded` - the receiver's delete pass must
+    // treat filter-excluded (non-protected) entries as deletable. For a
+    // remote-shell pull the receiver builds its deletion chain from the local
+    // CLI filter rules, so the flag has to be carried onto this local receiver
+    // config (the wire-side sender conversion in build_wire_format_rules only
+    // affects what the remote sender hides, not local delete protection).
+    server_config.deletion.delete_excluded = config.delete_excluded();
+    // upstream: generator.c:304 delete_in_dir() - `io_error & IOERR_GENERAL &&
+    // !ignore_errors` skips the whole delete pass, so `--ignore-errors` is what
+    // lets deletions proceed after a source-scan error. Like `--preallocate` and
+    // `--remove-source-files` above, it is long-form-only with no compact letter,
+    // so build_server_flag_string never packs it and the local ServerConfig
+    // parsed from that string never sees it. On a pull the LOCAL client is the
+    // receiver and owns the delete pass, so the flag has to be carried here; on
+    // a push the remote receiver picks it up from the forwarded `--ignore-errors`
+    // arg (options.c:3062), which is why only the pull direction was affected.
+    server_config.deletion.ignore_errors = config.ignore_errors();
+    // upstream: delete.c:156 - `--max-delete` is enforced by the generator,
+    // which for a remote-shell pull runs on the local client (the receiver).
+    // The `--max-delete=NUM` server arg is forwarded to the remote sender too,
+    // but a pull sender never deletes, so the cap must be carried onto this
+    // local receiver config or it is silently ignored (unbounded deletion).
+    server_config.deletion.max_delete = config.max_delete();
+    logging::debug_log!(
+        Del,
+        2,
+        "receiver config: delete_excluded={} delete_mode={:?} max_delete={:?}",
+        config.delete_excluded(),
+        config.delete_mode(),
+        config.max_delete()
+    );
+    // upstream: flist.c:2257-2258 / options.c:2976 - `--no-implied-dirs` is
+    // forwarded to the remote peer, but the in-process sender half (SSH/daemon
+    // push) builds the wire flist locally and must honour the flag too. Its
+    // generator emits implied parent dirs only when implied_dirs is on OR the
+    // protocol >= 30 forces them. `implied_dirs()` defaults true, so this stays
+    // false (implied dirs on) unless the client passed --no-implied-dirs.
+    server_config.flags.no_implied_dirs = !config.implied_dirs();
+    // upstream: options.c:2655-2660 - `if (!am_sender) { if (copy_links) 'L';
+    // if (copy_dirlinks) 'k'; }`. The compact L/k letters are wire-role-gated
+    // (see build_server_flag_string, which no longer packs them). The in-process
+    // half still needs the flags set directly: on a push the LOCAL generator IS
+    // the sender and must dereference symlinks (copy_links) and dir-symlinks
+    // (copy_dirlinks) while building its flist. Setting them unconditionally is
+    // inert on a pull, where the local half is the receiver and the remote
+    // sender does the dereferencing.
+    server_config.flags.copy_links = config.copy_links();
+    server_config.flags.copy_dirlinks = config.copy_dirlinks();
+    // upstream: options.c:2899-2903 - copy_unsafe_links and safe_links are long-form only
+    server_config.flags.copy_unsafe_links = config.copy_unsafe_links();
+    server_config.flags.safe_links = config.safe_links();
+    // upstream: flist.c:1419 / options.c:2987 - `--copy-devices` converts device
+    // entries into regular files on the SENDER so their contents stream like a
+    // file. The flag is long-form only; on a push the local client IS the sender
+    // and never sends `--copy-devices` over the wire (`if (copy_devices &&
+    // !am_sender)`), so the in-process sender must carry it here. On a pull the
+    // local half is the receiver, where the flag is inert (the remote sender does
+    // the conversion), so setting it unconditionally is safe.
+    server_config.flags.copy_devices = config.copy_devices();
+    // upstream: syscall.c do_open / do_open_nofollow propagate O_NOATIME when set.
+    server_config.write.open_noatime = config.open_noatime();
+    // upstream: options.c:2768-2780 - itemize_changes is forwarded to the remote
+    // as --log-format=%i, but the local ServerConfig also needs the flag set so
+    // the generator's maybe_emit_itemize() produces client-side output via callback.
+    server_config.flags.info_flags.itemize = config.itemize_changes();
+    // upstream: generator.c:575-576 - `-ii` (stdout_format_has_i > 1) and
+    // `--info=name2` make the generator emit itemize rows for unchanged
+    // entries too; the local receiver-generator needs the same gate.
+    server_config.flags.info_flags.itemize_unchanged = config.itemize_unchanged();
+    // upstream: the in-process local receiver/generator (SSH pull/push) needs
+    // the client's verbose level so per-file `info_log!(Name)` rows and the
+    // `receiving incremental file list` banner fire - both gated on
+    // `flags.verbose && client_mode` (receiver pipeline.rs / setup.rs).
+    // `build_server_flag_string` never sends 'v' to the remote and this local
+    // ServerConfig is built from that same string, so `verbose` stays false
+    // without this. Mirrors the daemon path (daemon_transfer server_config.rs).
+    server_config.flags.verbose = config.verbosity() > 0;
+    server_config.flags.verbose_level = config.verbosity();
+    // upstream: options.c msgs2stderr - FINFO (`-v` names) go to stderr when
+    // `--msgs2stderr` is set. The in-process client receiver emits `-v` names
+    // in flist order directly (interleaved with `--progress`), so it needs the
+    // routing decision here; the default (None) and `--no-msgs2stderr` keep
+    // names on stdout.
+    server_config.flags.msgs_to_stderr = config.msgs2stderr() == Some(true);
+    // upstream: flist.c::iconv_for_local and options.c::recv_iconv_settings -
+    // when --iconv is configured, the local process must transcode file-list
+    // entries between the local and remote charsets. Without this bridge the
+    // CLI parses --iconv, validates it, and forwards it to the remote peer
+    // over SSH/daemon, but the in-process file-list reader and writer never
+    // see a converter and silently pass raw bytes through.
+    server_config.connection.iconv = config.iconv().resolve_converter();
+    // upstream: flist.c:send_file_list() - missing_args controls ENOENT handling
+    // for top-level source paths and --files-from entries.
+    server_config.file_selection.ignore_missing_args = config.ignore_missing_args();
+    server_config.file_selection.delete_missing_args = config.delete_missing_args();
+    // upstream: options.c:89 do_compression_threads, token.c:701 ZSTD_c_nbWorkers
+    server_config.connection.compression_threads = config.compression_threads();
+    // upstream: compat.c:819 parse_checksum_choice(1) - an explicit
+    // --checksum-choice=ALGO forces the negotiated checksum for the transfer.
+    // Carry it onto this local ServerConfig so the in-process generator/receiver
+    // half (SSH and daemon transfers alike) forwards it into the capability
+    // negotiator's checksum_override; without this the choice is silently
+    // dropped at protocol >= 30 (binary negotiation).
+    server_config.checksum_choice = config.checksum_protocol_override();
+    // upstream: compat.c:543-544 - `if (do_compression && !compress_choice)`
+    // gates the compression vstring list, so an explicit --compress-choice (also
+    // its --new-compress/--old-compress aliases) sets compress_choice and
+    // suppresses the list. Carry that explicit choice onto the local half here so
+    // the client-sender's TransferConfig has connection.compress_choice = Some(..)
+    // and transfer/src/lib.rs's send_compression gate stays false; without this
+    // the client sent an extra vstring the peer never expected and desynced the
+    // stream. Non-explicit `-z`/`-zz` leaves compress_choice None (vstring
+    // negotiation), matching the daemon-push path in daemon_transfer.
+    if config.explicit_compress_choice()
+        && let Ok(algo) =
+            protocol::CompressionAlgorithm::parse(config.compression_algorithm().name())
+    {
+        server_config.connection.compress_choice = Some(algo);
+    }
+    // upstream: options.c set_fake_super() -> am_root = -1. rsync.1: "The
+    // --fake-super option only affects the side where the option is used. To
+    // affect the remote side of a remote-shell connection, use the
+    // --remote-option (-M) option." It is therefore never sent over the wire
+    // (see fake_super_not_forwarded_on_pull/push in invocation/tests.rs), but
+    // the local client itself plays one of the two roles in-process for both
+    // SSH and daemon transfers, exactly like preallocate/remove_source_files
+    // above. Without this, --fake-super was a silent no-op on every
+    // remote-shell/daemon transfer even though the local-copy path (and the
+    // daemon's own `fake super = yes` module directive) honoured it.
+    server_config.fake_super = config.fake_super();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::filters::RuleType;
+
+    // upstream: options.c has NO compact 'P' letter; keep_partial is conveyed
+    // long-form (--partial) or via propagated ServerConfig.flags.partial.
+    // build_server_flag_string must never pack 'P'.
+    #[test]
+    fn server_flag_string_never_packs_partial_p() {
+        let config = ClientConfig::builder().partial(true).build();
+        let flags = build_server_flag_string(&config);
+        assert!(!flags.contains('P'), "must not pack compact 'P': {flags}");
+    }
+
+    // upstream: options.c:2677-2678 - the compact 'D' tracks preserve_devices
+    // only. specials-only must NOT pack 'D' (it rides as --specials long-form).
+    #[test]
+    fn server_flag_string_specials_only_omits_d() {
+        let config = ClientConfig::builder().specials(true).build();
+        let flags = build_server_flag_string(&config);
+        assert!(
+            !flags.contains('D'),
+            "specials-only must not pack 'D': {flags}"
+        );
+    }
+
+    #[test]
+    fn server_flag_string_devices_packs_d() {
+        let config = ClientConfig::builder().devices(true).build();
+        let flags = build_server_flag_string(&config);
+        assert!(flags.contains('D'), "devices must pack 'D': {flags}");
+    }
+
+    #[test]
+    fn server_flag_string_includes_recursive() {
+        let config = ClientConfig::builder().recursive(true).build();
+        let flags = build_server_flag_string(&config);
+        assert!(flags.contains('r'), "expected 'r' in flags: {flags}");
+    }
+
+    #[test]
+    fn server_flag_string_includes_preservation_flags() {
+        let config = ClientConfig::builder()
+            .times(true)
+            .permissions(true)
+            .owner(true)
+            .group(true)
+            .build();
+
+        let flags = build_server_flag_string(&config);
+        assert!(flags.contains('t'), "expected 't' in flags: {flags}");
+        assert!(flags.contains('p'), "expected 'p' in flags: {flags}");
+        assert!(flags.contains('o'), "expected 'o' in flags: {flags}");
+        assert!(flags.contains('g'), "expected 'g' in flags: {flags}");
+    }
+
+    #[test]
+    fn server_flag_string_includes_z_for_default_compression() {
+        // upstream: options.c:2722 - plain `-z` (no explicit --compress-choice)
+        // defaults to zlib, so the compact 'z' is packed. Note default_algorithm()
+        // is the best-available codec (zstd), which is NOT zlib - an explicit
+        // choice of it would omit 'z' (see the zstd test) - so the default case
+        // must be expressed as plain compress() with no explicit choice.
+        let config = ClientConfig::builder().compress(true).build();
+        let flags = build_server_flag_string(&config);
+        assert!(
+            flags.contains('z'),
+            "expected 'z' for default (plain -z) compression: {flags}"
+        );
+    }
+
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn server_flag_string_omits_z_for_lz4() {
+        // upstream: options.c:2722 - 'z' NOT sent for non-default algorithms.
+        // LZ4 uses --compress-choice=lz4 as a long-form arg instead.
+        let config = ClientConfig::builder()
+            .compress(true)
+            .compression_algorithm(compress::algorithm::CompressionAlgorithm::Lz4)
+            .build();
+        let flags = build_server_flag_string(&config);
+        assert!(!flags.contains('z'), "should not send 'z' for lz4: {flags}");
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn server_flag_string_omits_z_for_zstd() {
+        // upstream: options.c:2722 - 'z' NOT sent for zstd; the codec rides as
+        // the long-form --compress-choice=zstd instead.
+        let config = ClientConfig::builder()
+            .compress(true)
+            .compression_algorithm(compress::algorithm::CompressionAlgorithm::Zstd)
+            .build();
+        let flags = build_server_flag_string(&config);
+        assert!(
+            !flags.contains('z'),
+            "should not send 'z' for zstd: {flags}"
+        );
+    }
+
+    #[test]
+    fn server_flag_string_omits_z_for_zlibx() {
+        // zlibx folds onto Zlib in the enum, but the raw choice name keeps it
+        // distinct; upstream sends --new-compress, never the compact 'z'.
+        let config = ClientConfig::builder()
+            .compress(true)
+            .compression_algorithm(compress::algorithm::CompressionAlgorithm::Zlib)
+            .compress_choice_name(Some("zlibx".to_owned()))
+            .build();
+        let flags = build_server_flag_string(&config);
+        assert!(
+            !flags.contains('z'),
+            "should not send 'z' for zlibx: {flags}"
+        );
+    }
+
+    // upstream: options.c:2625-2626 - `for (i = 0; i < verbose; i++)
+    // argstr[x++] = 'v';` packs one 'v' per verbosity level, and none at all
+    // when verbose == 0. server_options() sends the count to the remote so its
+    // half emits matching verbose diagnostics; a builder that dropped 'v'
+    // silenced the remote generator's output relative to upstream.
+    #[test]
+    fn server_flag_string_emits_one_v_per_verbosity_level() {
+        let config = ClientConfig::builder().verbosity(3).build();
+        let flags = build_server_flag_string(&config);
+        // 'v' is the ONLY letter that can repeat here; the leading '-' plus
+        // exactly three 'v's must lead the string in upstream source order.
+        assert!(
+            flags.starts_with("-vvv"),
+            "verbosity 3 must pack 'vvv' first: {flags}"
+        );
+        assert_eq!(
+            flags.matches('v').count(),
+            3,
+            "exactly one 'v' per level: {flags}"
+        );
+    }
+
+    #[test]
+    fn server_flag_string_omits_v_at_zero_verbosity() {
+        let config = ClientConfig::builder().build();
+        let flags = build_server_flag_string(&config);
+        assert!(
+            !flags.contains('v'),
+            "default (verbose 0) must pack no 'v': {flags}"
+        );
+    }
+
+    // upstream: options.c:2655-2660 - L/k live in the `!am_sender` (else) branch
+    // of server_options(), so they are role-specific and must NOT be packed by
+    // this role-agnostic builder. Packing them unconditionally sent 'L'/'k' to a
+    // remote RECEIVER on a push, diverging from upstream which only sends them to
+    // a remote SENDER (pull). The daemon wire path re-adds them role-gated.
+    #[test]
+    fn server_flag_string_never_packs_copy_links_or_dirlinks() {
+        let config = ClientConfig::builder()
+            .copy_links(true)
+            .copy_dirlinks(true)
+            .build();
+        let flags = build_server_flag_string(&config);
+        assert!(
+            !flags.contains('L'),
+            "role-agnostic builder must not pack 'L' (copy-links): {flags}"
+        );
+        assert!(
+            !flags.contains('k'),
+            "role-agnostic builder must not pack 'k' (copy-dirlinks): {flags}"
+        );
+    }
+
+    // upstream: options.c:2655-2660 - the in-process half no longer learns
+    // copy_links/copy_dirlinks from the compact string (build_server_flag_string
+    // dropped L/k), so apply_common_server_flags must carry them directly. On a
+    // push the local generator IS the sender and must dereference symlinks.
+    #[test]
+    fn apply_common_server_flags_sets_copy_links_and_dirlinks() {
+        let config = ClientConfig::builder()
+            .copy_links(true)
+            .copy_dirlinks(true)
+            .build();
+        let mut server_config = ServerConfig::default();
+        apply_common_server_flags(&config, &mut server_config);
+        assert!(server_config.flags.copy_links);
+        assert!(server_config.flags.copy_dirlinks);
+    }
+
+    #[test]
+    fn apply_common_server_flags_copy_links_default_false() {
+        let config = ClientConfig::default();
+        let mut server_config = ServerConfig::default();
+        apply_common_server_flags(&config, &mut server_config);
+        assert!(!server_config.flags.copy_links);
+        assert!(!server_config.flags.copy_dirlinks);
+    }
+
+    // upstream: rsync.1 "--fake-super ... only affects the side where the
+    // option is used." The local client plays one of the two roles in-process
+    // for both SSH and daemon transfers, so its own --fake-super must land on
+    // the local ServerConfig even though it is never forwarded to the remote
+    // peer (see fake_super_not_forwarded_on_pull/push in invocation/tests.rs).
+    #[test]
+    fn apply_common_server_flags_propagates_fake_super() {
+        let config = ClientConfig::builder().fake_super(true).build();
+        let mut server_config = ServerConfig::default();
+        apply_common_server_flags(&config, &mut server_config);
+        assert!(server_config.fake_super);
+    }
+
+    #[test]
+    fn apply_common_server_flags_fake_super_default_false() {
+        let config = ClientConfig::default();
+        let mut server_config = ServerConfig::default();
+        apply_common_server_flags(&config, &mut server_config);
+        assert!(!server_config.fake_super);
+    }
+
+    #[test]
+    fn server_flag_string_omits_itemize_compact_flag() {
+        // upstream: options.c:2768-2780 - itemize is sent via --log-format=%i,
+        // not as a compact flag character in the flag string.
+        let config = ClientConfig::builder().itemize_changes(true).build();
+        let flags = build_server_flag_string(&config);
+        assert!(
+            !flags.contains(".i"),
+            "itemize should not appear as compact flag: {flags}"
+        );
+    }
+
+    #[test]
+    fn apply_common_server_flags_sets_itemize() {
+        let config = ClientConfig::builder().itemize_changes(true).build();
+        let mut server_config = ServerConfig::default();
+        apply_common_server_flags(&config, &mut server_config);
+        assert!(server_config.flags.info_flags.itemize);
+    }
+
+    #[test]
+    fn apply_common_server_flags_itemize_default_false() {
+        let config = ClientConfig::default();
+        let mut server_config = ServerConfig::default();
+        apply_common_server_flags(&config, &mut server_config);
+        assert!(!server_config.flags.info_flags.itemize);
+    }
+
+    /// `--ignore-errors` governs the receiver's delete pass
+    /// (upstream: generator.c:304 `io_error & IOERR_GENERAL && !ignore_errors`).
+    /// On a pull the LOCAL client is the receiver, and the flag is long-form-only
+    /// so it never rides the compact flag string this config is parsed from -
+    /// exactly like `--preallocate` and `--remove-source-files`. Without this the
+    /// receiver keeps a destination file the operator asked to have deleted.
+    #[test]
+    fn apply_common_server_flags_propagates_ignore_errors() {
+        let config = ClientConfig::builder().ignore_errors(true).build();
+        let mut server_config = ServerConfig::default();
+        apply_common_server_flags(&config, &mut server_config);
+        assert!(
+            server_config.deletion.ignore_errors,
+            "--ignore-errors must reach the local receiver on a pull"
+        );
+    }
+
+    /// GROUP guard: every `DeletionConfig` field must survive the bridge.
+    ///
+    /// ⚠ This is NOT a guard for the defect class. The class is "long-form-only
+    /// flag with no compact letter, so it never rides the flag string this
+    /// config is parsed from and MUST be bridged explicitly". `ignore_errors`
+    /// is its third member; the first two, `--preallocate` and
+    /// `--remove-source-files`, land in `ServerConfig.flags`, NOT in
+    /// `DeletionConfig` - so this guard would have caught one of the three.
+    /// It stops the next missing DELETION field and nothing wider. Closing the
+    /// class needs the long-form-only set enumerated, which is not derivable
+    /// from `build_server_flag_string` by inspection; that is tracked separately.
+    ///
+    /// Within its group the completeness half is enforced by the COMPILER, not
+    /// by a hand-kept list: the exhaustive destructure below stops building the
+    /// moment a field is added to `DeletionConfig`, forcing whoever adds it to
+    /// decide how it crosses the bridge instead of silently inheriting `Default`.
+    #[test]
+    fn apply_common_server_flags_carries_every_deletion_config_field() {
+        let config = ClientConfig::builder()
+            .delete_after(true)
+            .delete_excluded(true)
+            .ignore_errors(true)
+            .max_delete(Some(7))
+            .build();
+        let mut server_config = ServerConfig::default();
+        apply_common_server_flags(&config, &mut server_config);
+
+        let ::transfer::config::DeletionConfig {
+            max_delete,
+            ignore_errors,
+            late_delete,
+            delete_after,
+            delete_excluded,
+        } = server_config.deletion;
+
+        assert_eq!(max_delete, Some(7), "max_delete");
+        assert!(ignore_errors, "ignore_errors");
+        assert!(late_delete, "late_delete");
+        assert!(delete_after, "delete_after");
+        assert!(delete_excluded, "delete_excluded");
+    }
+
+    #[test]
+    fn apply_common_server_flags_propagates_ignore_missing_args() {
+        let config = ClientConfig::builder().ignore_missing_args(true).build();
+        let mut server_config = ServerConfig::default();
+        apply_common_server_flags(&config, &mut server_config);
+        assert!(server_config.file_selection.ignore_missing_args);
+    }
+
+    #[test]
+    fn apply_common_server_flags_propagates_delete_missing_args() {
+        let config = ClientConfig::builder().delete_missing_args(true).build();
+        let mut server_config = ServerConfig::default();
+        apply_common_server_flags(&config, &mut server_config);
+        assert!(server_config.file_selection.delete_missing_args);
+    }
+
+    #[test]
+    fn apply_common_server_flags_missing_args_default_false() {
+        let config = ClientConfig::default();
+        let mut server_config = ServerConfig::default();
+        apply_common_server_flags(&config, &mut server_config);
+        assert!(!server_config.file_selection.ignore_missing_args);
+        assert!(!server_config.file_selection.delete_missing_args);
+    }
+
+    #[test]
+    fn apply_common_server_flags_propagates_compression_threads() {
+        let threads = std::num::NonZeroU8::new(4).unwrap();
+        let config = ClientConfig::builder()
+            .compression_threads(Some(threads))
+            .build();
+        let mut server_config = ServerConfig::default();
+        apply_common_server_flags(&config, &mut server_config);
+        assert_eq!(server_config.connection.compression_threads, Some(threads));
+    }
+
+    #[test]
+    fn apply_common_server_flags_compression_threads_default_none() {
+        let config = ClientConfig::default();
+        let mut server_config = ServerConfig::default();
+        apply_common_server_flags(&config, &mut server_config);
+        assert_eq!(server_config.connection.compression_threads, None);
+    }
+
+    #[test]
+    fn apply_common_server_flags_wires_explicit_compress_choice() {
+        // upstream: compat.c:543-544 - an explicit --compress-choice sets
+        // compress_choice, which suppresses the compression vstring list. Carry
+        // it onto the local half so the client-sender's send_compression gate
+        // (transfer/src/lib.rs: do_compression && compress_choice.is_none())
+        // stays false and no stray vstring desyncs the stream.
+        let config = ClientConfig::builder()
+            .compress(true)
+            .compression_algorithm(compress::algorithm::CompressionAlgorithm::Zlib)
+            .build();
+        assert!(config.explicit_compress_choice());
+        let mut server_config = ServerConfig::default();
+        apply_common_server_flags(&config, &mut server_config);
+        assert_eq!(
+            server_config.connection.compress_choice,
+            Some(protocol::CompressionAlgorithm::Zlib),
+            "explicit --compress-choice must land on connection.compress_choice"
+        );
+    }
+
+    #[test]
+    fn apply_common_server_flags_default_compress_leaves_choice_none() {
+        // Plain `-z` (no explicit choice) must leave compress_choice None so the
+        // sender still negotiates via the vstring list, matching upstream.
+        let config = ClientConfig::builder().compress(true).build();
+        assert!(!config.explicit_compress_choice());
+        let mut server_config = ServerConfig::default();
+        apply_common_server_flags(&config, &mut server_config);
+        assert_eq!(server_config.connection.compress_choice, None);
+    }
+
+    #[test]
+    fn converts_empty_filter_list() {
+        let rules = build_wire_format_rules(&[], false).expect("should convert empty list");
+        assert_eq!(rules.len(), 0);
+    }
+
+    #[test]
+    fn converts_simple_exclude_rule() {
+        let spec = FilterRuleSpec::exclude("*.log");
+        let rules = build_wire_format_rules(&[spec], false).expect("should convert exclude rule");
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].rule_type, RuleType::Exclude);
+        assert_eq!(rules[0].pattern, "*.log");
+        assert!(!rules[0].anchored);
+        assert!(!rules[0].directory_only);
+    }
+
+    #[test]
+    fn converts_simple_include_rule() {
+        let spec = FilterRuleSpec::include("*.txt");
+        let rules = build_wire_format_rules(&[spec], false).expect("should convert include rule");
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].rule_type, RuleType::Include);
+        assert_eq!(rules[0].pattern, "*.txt");
+        assert!(!rules[0].anchored);
+        assert!(!rules[0].directory_only);
+    }
+
+    #[test]
+    fn detects_anchored_pattern() {
+        let spec = FilterRuleSpec::exclude("/tmp");
+        let rules = build_wire_format_rules(&[spec], false).expect("should convert anchored rule");
+
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].anchored);
+        // The leading `/` becomes the `anchored` flag and is stripped from
+        // the pattern body so that the wire serializer does not emit it
+        // twice (once as the prefix modifier and once as a literal).
+        assert_eq!(rules[0].pattern, "tmp");
+    }
+
+    #[test]
+    fn detects_directory_only_pattern() {
+        let spec = FilterRuleSpec::exclude("cache/");
+        let rules =
+            build_wire_format_rules(&[spec], false).expect("should convert directory-only rule");
+
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].directory_only);
+        // Trailing `/` becomes the `directory_only` flag; the pattern body
+        // is the bare name so that serialization appends a single slash on
+        // the wire (otherwise upstream sees `cache//` and misparses it).
+        assert_eq!(rules[0].pattern, "cache");
+    }
+
+    #[test]
+    fn directory_only_wildcard_round_trips_without_double_slash() {
+        // upstream: `--include='*/'` produces wire bytes `+ */` with one
+        // trailing slash. Storing the slash both in the pattern and via
+        // the `directory_only` flag would double-encode it on the wire and
+        // cause upstream rsync to treat the rule as `*/` instead of `*`,
+        // matching only at depth 1 and breaking deeper directory traversal
+        // when combined with a trailing `--exclude='*'`.
+        let spec = FilterRuleSpec::include("*/");
+        let rules = build_wire_format_rules(&[spec], false).expect("should convert dir wildcard");
+
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].directory_only);
+        assert_eq!(rules[0].pattern, "*");
+    }
+
+    #[test]
+    fn anchored_directory_only_preserves_both_flags() {
+        let spec = FilterRuleSpec::exclude("/build/");
+        let rules = build_wire_format_rules(&[spec], false)
+            .expect("should convert anchored directory rule");
+
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].anchored);
+        assert!(rules[0].directory_only);
+        assert_eq!(rules[0].pattern, "build");
+    }
+
+    #[test]
+    fn bare_root_slash_is_preserved() {
+        // `/` is the rare degenerate case where the slash is both anchored
+        // and (formally) directory-only. Keep the slash in the pattern so
+        // the wire is not empty after stripping.
+        let spec = FilterRuleSpec::exclude("/");
+        let rules =
+            build_wire_format_rules(&[spec], false).expect("should convert bare slash rule");
+
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].anchored);
+        assert!(!rules[0].directory_only);
+        assert_eq!(rules[0].pattern, "/");
+    }
+
+    #[test]
+    fn preserves_sender_receiver_flags() {
+        let spec = FilterRuleSpec::exclude("*.tmp")
+            .with_sender(true)
+            .with_receiver(false);
+        let rules = build_wire_format_rules(&[spec], false).expect("should convert side flags");
+
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].sender_side);
+        assert!(!rules[0].receiver_side);
+    }
+
+    #[test]
+    fn preserves_perishable_flag() {
+        let spec = FilterRuleSpec::exclude("*.swp").with_perishable(true);
+        let rules =
+            build_wire_format_rules(&[spec], false).expect("should convert perishable flag");
+
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].perishable);
+    }
+
+    #[test]
+    fn preserves_xattr_only_flag() {
+        let spec = FilterRuleSpec::exclude("user.*").with_xattr_only(true);
+        let rules =
+            build_wire_format_rules(&[spec], false).expect("should convert xattr_only flag");
+
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].xattr_only);
+    }
+
+    #[test]
+    fn converts_all_rule_types() {
+        use engine::local_copy::DirMergeOptions;
+
+        let specs = vec![
+            FilterRuleSpec::include("*.txt"),
+            FilterRuleSpec::exclude("*.log"),
+            FilterRuleSpec::clear(),
+            FilterRuleSpec::protect("important"),
+            FilterRuleSpec::risk("temp"),
+            FilterRuleSpec::dir_merge(".rsync-filter", DirMergeOptions::new()),
+        ];
+
+        let rules = build_wire_format_rules(&specs, false).expect("should convert all rule types");
+
+        assert_eq!(rules.len(), 6);
+        assert_eq!(rules[0].rule_type, RuleType::Include);
+        assert_eq!(rules[1].rule_type, RuleType::Exclude);
+        assert_eq!(rules[2].rule_type, RuleType::Clear);
+        assert_eq!(rules[3].rule_type, RuleType::Protect);
+        assert_eq!(rules[4].rule_type, RuleType::Risk);
+        assert_eq!(rules[5].rule_type, RuleType::DirMerge);
+    }
+
+    #[test]
+    fn transmits_exclude_if_present_rules() {
+        let specs = vec![
+            FilterRuleSpec::exclude("*.log"),
+            FilterRuleSpec::exclude_if_present(".git"),
+            FilterRuleSpec::include("*.txt"),
+        ];
+
+        let rules =
+            build_wire_format_rules(&specs, false).expect("should transmit ExcludeIfPresent");
+
+        assert_eq!(rules.len(), 3);
+        assert_eq!(rules[0].rule_type, RuleType::Exclude);
+        assert_eq!(rules[0].pattern, "*.log");
+        assert!(!rules[0].exclude_from_merge);
+
+        assert_eq!(rules[1].rule_type, RuleType::Exclude);
+        assert_eq!(rules[1].pattern, ".git");
+        assert!(rules[1].exclude_from_merge);
+
+        assert_eq!(rules[2].rule_type, RuleType::Include);
+        assert_eq!(rules[2].pattern, "*.txt");
+    }
+
+    #[test]
+    fn handles_dir_merge_options() {
+        use engine::local_copy::DirMergeOptions;
+
+        let options = DirMergeOptions::new()
+            .inherit(false)
+            .exclude_filter_file(true)
+            .use_whitespace();
+
+        let spec = FilterRuleSpec::dir_merge(".rsync-filter", options);
+        let rules =
+            build_wire_format_rules(&[spec], false).expect("should convert dir_merge options");
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].rule_type, RuleType::DirMerge);
+        assert!(rules[0].no_inherit);
+        assert!(rules[0].exclude_from_merge);
+        assert!(rules[0].word_split);
+    }
+
+    /// `-f:C` (and `--filter=:C`) is parsed locally into a DirMerge spec with
+    /// the `cvs_mode` option set. The wire encoder must forward that as
+    /// `cvs_exclude=true` so the remote sender can default the empty pattern
+    /// to `.cvsignore` (upstream `exclude.c:1404-1408`) and enable CVS-style
+    /// whitespace parsing of the merge file. Without this, `-f:C` reached the
+    /// remote rsync with the `C` modifier stripped, producing an empty merge
+    /// filename and silently disabling per-directory `.cvsignore` lookup.
+    #[test]
+    fn dir_merge_cvs_mode_forwards_cvs_exclude_flag() {
+        use engine::local_copy::DirMergeOptions;
+
+        let options = DirMergeOptions::new()
+            .use_whitespace()
+            .allow_comments(false)
+            .allow_list_clearing(true)
+            .inherit(false)
+            .cvs_mode(true);
+
+        let spec = FilterRuleSpec::dir_merge(".cvsignore", options);
+        let rules = build_wire_format_rules(&[spec], false)
+            .expect("should forward cvs_mode to wire format");
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].rule_type, RuleType::DirMerge);
+        assert!(rules[0].cvs_exclude);
+        assert!(rules[0].no_inherit);
+        assert!(rules[0].word_split);
+    }
+
+    /// upstream: exclude.c:1652-1668 send_filter_list() - `-C` rules are gated by
+    /// the sending role and protocol. build_wire_format_rules must forward the
+    /// spec's cvs-origin marker onto the wire rule so transfer::wire_rule_crosses_wire
+    /// can keep them local on a receiving client (and gate `:C` on protocol >= 29).
+    #[test]
+    fn cvs_origin_marker_propagates_to_wire_rule() {
+        let plain = FilterRuleSpec::exclude("*.o").with_cvs_origin(true);
+        let normal = FilterRuleSpec::exclude("*.tmp");
+        let rules = build_wire_format_rules(&[plain, normal], false)
+            .expect("should forward cvs_origin to wire format");
+
+        assert_eq!(rules.len(), 2);
+        assert!(rules[0].cvs_origin, "cvs-origin exclude must be marked");
+        assert!(
+            !rules[1].cvs_origin,
+            "an ordinary --exclude must not be marked cvs-origin"
+        );
+    }
+
+    /// upstream: exclude.c:1330-1332 - --delete-excluded applies an implicit
+    /// FILTRULE_SENDER_SIDE to bare include/exclude rules. The wire encoder
+    /// is the user-visible surface for this: `get_rule_prefix()` emits an
+    /// `s` modifier in the rule prefix. Without this, oc-rsync's wire output
+    /// would diverge from upstream's `- *.tmp` vs `-s *.tmp` byte stream.
+    #[test]
+    fn delete_excluded_marks_bare_exclude_sender_side() {
+        let spec = FilterRuleSpec::exclude("*.tmp");
+        let rules = build_wire_format_rules(&[spec], true)
+            .expect("delete_excluded should apply implicit sender_side");
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].rule_type, RuleType::Exclude);
+        assert!(
+            rules[0].sender_side,
+            "implicit FILTRULE_SENDER_SIDE must be applied"
+        );
+        assert!(
+            !rules[0].receiver_side,
+            "receiver_side must be cleared by the implicit flag"
+        );
+    }
+
+    #[test]
+    fn delete_excluded_marks_bare_include_sender_side() {
+        let spec = FilterRuleSpec::include("keep/**");
+        let rules = build_wire_format_rules(&[spec], true).expect("delete_excluded include");
+
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].sender_side);
+        assert!(!rules[0].receiver_side);
+    }
+
+    /// A rule that explicitly carries a side hint (`s`, `r`, `show`, `hide`)
+    /// must be left untouched - upstream `exclude.c:1331` masks against
+    /// `FILTRULES_SIDES` and only applies the implicit flag when neither
+    /// side bit is set.
+    #[test]
+    fn delete_excluded_leaves_explicit_sender_rule_alone() {
+        let spec = FilterRuleSpec::hide("*.tmp");
+        let rules = build_wire_format_rules(&[spec], true).expect("hide rule with delete_excluded");
+
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].sender_side);
+        assert!(!rules[0].receiver_side);
+    }
+
+    #[test]
+    fn delete_excluded_leaves_explicit_receiver_rule_alone() {
+        let spec = FilterRuleSpec::exclude("keep.txt").with_sender(false);
+        let rules =
+            build_wire_format_rules(&[spec], true).expect("receiver-only with delete_excluded");
+
+        assert_eq!(rules.len(), 1);
+        assert!(!rules[0].sender_side);
+        assert!(rules[0].receiver_side);
+    }
+
+    /// Protect/Risk and DirMerge rules must not gain the implicit flag.
+    /// `exclude.c:1331` excludes merge rules from the mask; Protect/Risk
+    /// already restrict to the receiver side, so neither match the
+    /// "no FILTRULES_SIDES bit" precondition.
+    #[test]
+    fn delete_excluded_leaves_protect_rule_alone() {
+        let spec = FilterRuleSpec::protect("keep");
+        let rules = build_wire_format_rules(&[spec], true).expect("protect with delete_excluded");
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].rule_type, RuleType::Protect);
+        assert!(!rules[0].sender_side);
+        assert!(rules[0].receiver_side);
+    }
+
+    #[test]
+    fn delete_excluded_leaves_dir_merge_rule_alone() {
+        use engine::local_copy::DirMergeOptions;
+
+        let spec = FilterRuleSpec::dir_merge(".rsync-filter", DirMergeOptions::new());
+        let rules = build_wire_format_rules(&[spec], true).expect("dir_merge with delete_excluded");
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].rule_type, RuleType::DirMerge);
+        // DirMerge defaults apply to both sides, which upstream encodes as
+        // neither FILTRULES_SIDES bit (no `s`/`r` modifier on the wire).
+        assert!(!rules[0].sender_side);
+        assert!(!rules[0].receiver_side);
+    }
+
+    /// Without --delete-excluded the implicit flag must not be applied even
+    /// for bare include/exclude rules. A plain exclude applies to both sides,
+    /// which upstream serializes with neither FILTRULES_SIDES bit (`- *.tmp`,
+    /// not `-sr *.tmp`); the wire encoder must carry no side flag.
+    ///
+    /// upstream: exclude.c:1566-1572 - a both-sides rule emits no `s`/`r`.
+    #[test]
+    fn no_delete_excluded_leaves_bare_rule_untouched() {
+        let spec = FilterRuleSpec::exclude("*.tmp");
+        let rules = build_wire_format_rules(&[spec], false).expect("no delete_excluded");
+
+        assert_eq!(rules.len(), 1);
+        assert!(!rules[0].sender_side);
+        assert!(!rules[0].receiver_side);
+    }
+
+    /// Wire-byte parity: when `--delete-excluded` is active, the rule must
+    /// serialize through `build_rule_prefix()` with the `s` modifier on the
+    /// wire. This is the byte stream upstream rsync 3.4.4 emits for the same
+    /// CLI input.
+    ///
+    /// upstream: exclude.c:1566-1568 `get_rule_prefix()` emits `s` when
+    /// `FILTRULE_SENDER_SIDE` is set and (`!for_xfer` or proto >= 29).
+    #[test]
+    fn delete_excluded_wire_prefix_carries_s_modifier() {
+        use protocol::ProtocolVersion;
+        use protocol::filters::build_rule_prefix;
+
+        let spec = FilterRuleSpec::exclude("*.tmp");
+        let rules = build_wire_format_rules(&[spec], true)
+            .expect("delete_excluded should apply implicit sender_side");
+
+        let proto = ProtocolVersion::from_supported(32).unwrap();
+        let prefix = build_rule_prefix(&rules[0], proto).expect("prefix must serialize");
+
+        // Upstream 3.4.4 emits `-s ` for `--exclude *.tmp` under
+        // `--delete-excluded`. Without the implicit flag, the prefix would
+        // be `- `, diverging from the upstream wire.
+        assert_eq!(prefix, "-s ");
+    }
+
+    /// Wire-byte parity: a plain `--exclude` (applies to both sides) must
+    /// serialize as `- pattern` with no `s`/`r` modifier. oc-rsync's spec
+    /// encodes "both sides" as both `applies_to_*` booleans, but upstream
+    /// carries neither FILTRULES_SIDES bit, so a naive copy would emit the
+    /// divergent `-sr ` prefix instead of `- `.
+    ///
+    /// upstream: exclude.c:1566-1572 - `get_rule_prefix()` emits no side
+    /// modifier when neither `FILTRULE_SENDER_SIDE` nor `FILTRULE_RECEIVER_SIDE`
+    /// is set.
+    #[test]
+    fn plain_exclude_wire_prefix_has_no_side_modifier() {
+        use protocol::ProtocolVersion;
+        use protocol::filters::build_rule_prefix;
+
+        let spec = FilterRuleSpec::exclude("*.tmp");
+        let rules = build_wire_format_rules(&[spec], false).expect("plain exclude");
+
+        let proto = ProtocolVersion::from_supported(32).unwrap();
+        let prefix = build_rule_prefix(&rules[0], proto).expect("prefix must serialize");
+
+        assert_eq!(prefix, "- ");
+    }
+
+    #[test]
+    fn server_flag_string_files_from_keeps_explicit_r_and_omits_d() {
+        // upstream: options.c:2188-2191 - `if (files_from) { if (recurse == 1)
+        // recurse = 0; if (xfer_dirs < 0) xfer_dirs = 1; }`. Only the recursion
+        // `-a` implies (recurse == 1) is cleared; an explicit `-r` sets
+        // recurse == 2 (options.c:621) and survives, so the compact `r` is still
+        // packed (options.c:2705). The implied `xfer_dirs = 1` is NOT the
+        // explicit `-d` level (xfer_dirs >= 2), so no `d` is packed
+        // (options.c:2638-2640). `--files-from` defaults relative_paths=1
+        // (options.c:2205-2206), resolved by the CLI before this stage.
+        //
+        // `recursive(true)` here models the post-resolution `recurse != 0` the
+        // CLI hands over for an explicit `-r --files-from`.
+        use crate::client::config::FilesFromSource;
+
+        let config = ClientConfig::builder()
+            .recursive(true)
+            .times(true)
+            .relative_paths(true)
+            .files_from(FilesFromSource::LocalFile("/tmp/list.txt".into()))
+            .build();
+        let flags = build_server_flag_string(&config);
+        assert!(
+            flags.contains('r'),
+            "explicit -r survives --files-from: {flags}"
+        );
+        assert!(
+            !flags.contains('d'),
+            "implied xfer_dirs=1 must not pack 'd': {flags}"
+        );
+        assert!(
+            flags.contains('R'),
+            "should add 'R' (relative) with --files-from: {flags}"
+        );
+    }
+
+    #[test]
+    fn server_flag_string_files_from_without_recursion_omits_r_and_d() {
+        // upstream: a bare `--files-from` (no `-r`, no `-d`) resolves recurse=0
+        // and xfer_dirs=1, so neither letter is packed - `d` needs the explicit
+        // level (xfer_dirs >= 2) or `list_only`/`delete_mode && am_sender`
+        // (options.c:2638-2640).
+        use crate::client::config::FilesFromSource;
+
+        // `ClientConfig::builder()` presets `recursive(true)`, so a bare
+        // --files-from (the CLI having cleared the `-a`-implied recursion) is
+        // modelled by turning it back off here.
+        let config = ClientConfig::builder()
+            .recursive(false)
+            .times(true)
+            .relative_paths(true)
+            .files_from(FilesFromSource::LocalFile("/tmp/list.txt".into()))
+            .build();
+        let flags = build_server_flag_string(&config);
+        assert!(!flags.contains('r'), "no recursion requested: {flags}");
+        assert!(
+            !flags.contains('d'),
+            "implied xfer_dirs=1 must not pack 'd': {flags}"
+        );
+    }
+
+    #[test]
+    fn server_flag_string_explicit_dirs_packs_d() {
+        // upstream: options.c:628 `-d` sets xfer_dirs = 2, and options.c:2638
+        // packs `d` for `xfer_dirs >= 2 && xfer_dirs < 4`.
+        use crate::client::config::FilesFromSource;
+
+        // `-d` without `-r`: builder() presets recursion, so clear it to model
+        // upstream's recurse=0, xfer_dirs=2.
+        let config = ClientConfig::builder()
+            .recursive(false)
+            .times(true)
+            .dirs(true)
+            .dirs_explicit(true)
+            .relative_paths(true)
+            .files_from(FilesFromSource::LocalFile("/tmp/list.txt".into()))
+            .build();
+        let flags = build_server_flag_string(&config);
+        assert!(flags.contains('d'), "explicit -d packs 'd': {flags}");
+        assert!(!flags.contains('r'), "no recursion requested: {flags}");
+    }
+
+    #[test]
+    fn server_flag_string_files_from_no_relative_omits_r_upper() {
+        // upstream: options.c:2713-2714 - `if (relative_paths) argstr[x++] =
+        // 'R';` packs the compact `R` only for the RESOLVED relative_paths.
+        // Under --no-relative --files-from the CLI resolves relative_paths=0
+        // (options.c:368-369, 693), so no `R` is packed even though files-from
+        // is active. This is the PUSH client-sender wire signal: without `R`
+        // the peer knows relative is off and no implied `sub` parent dir is
+        // expected, matching the client-sender flatten (flist.c:2338-2349) that
+        // splits each entry on its last `/` down to the basename.
+        use crate::client::config::FilesFromSource;
+
+        let config = ClientConfig::builder()
+            .recursive(true)
+            .times(true)
+            .relative_paths(false)
+            .files_from(FilesFromSource::LocalFile("/tmp/list.txt".into()))
+            .build();
+        assert!(
+            !config.relative_paths(),
+            "--no-relative must resolve relative_paths=false"
+        );
+        let flags = build_server_flag_string(&config);
+        assert!(
+            !flags.contains('R'),
+            "should omit 'R' under --no-relative --files-from: {flags}"
+        );
+        // The `d`/`r` letters are independent of `--no-relative`: the implied
+        // `xfer_dirs = 1` never packs `d`, and the explicit `-r` modelled here
+        // survives --files-from (options.c:2189, 2638-2640, 2705).
+        assert!(
+            !flags.contains('d'),
+            "implied xfer_dirs=1 must not pack 'd': {flags}"
+        );
+        assert!(
+            flags.contains('r'),
+            "explicit -r survives --files-from: {flags}"
+        );
+    }
+
+    #[test]
+    fn server_flag_string_no_files_from_keeps_r() {
+        let config = ClientConfig::builder().recursive(true).build();
+        let flags = build_server_flag_string(&config);
+        assert!(
+            flags.contains('r'),
+            "should keep 'r' without files-from: {flags}"
+        );
+        assert!(
+            !flags.contains('d'),
+            "should not add 'd' without files-from: {flags}"
+        );
+    }
+
+    #[test]
+    fn server_flag_string_explicit_dirs_with_recursion_packs_d_and_r() {
+        // upstream: options.c:2638-2639 - clause 1 `(xfer_dirs >= 2 && xfer_dirs
+        // < 4)` packs `d` for an explicit `-d` (xfer_dirs == 2) regardless of
+        // recursion, so `-d -r` (xfer_dirs == 2, recurse == 1) emits BOTH letters.
+        // The `!recurse` guard belongs only to clause 2, not to clause 1; gating
+        // the whole condition on `!recurse` would wrongly suppress `d` here.
+        let config = ClientConfig::builder()
+            .recursive(true)
+            .dirs(true)
+            .dirs_explicit(true)
+            .build();
+        let flags = build_server_flag_string(&config);
+        assert!(
+            flags.contains('d'),
+            "explicit -d packs 'd' even with -r: {flags}"
+        );
+        assert!(flags.contains('r'), "-r still packs 'r': {flags}");
+    }
+
+    #[test]
+    fn server_flag_string_files_from_delete_sender_packs_d() {
+        // upstream: options.c:2639 - clause 2 `(xfer_dirs && !recurse &&
+        // (list_only || (delete_mode && am_sender)))` packs `d` when the implied
+        // `xfer_dirs = 1` (here from --files-from) rides with a delete sweep on
+        // the sender. A plain --files-from omits `d`, but --files-from --delete on
+        // a push must emit it.
+        use crate::client::config::FilesFromSource;
+        use std::ffi::OsString;
+
+        let config = ClientConfig::builder()
+            .recursive(false)
+            .delete(true)
+            .files_from(FilesFromSource::LocalFile("/tmp/list.txt".into()))
+            .transfer_args([OsString::from("src/"), OsString::from("host:dst/")])
+            .build();
+        assert!(
+            config.is_local_sender(),
+            "push must report the local side as sender"
+        );
+        let flags = build_server_flag_string(&config);
+        assert!(
+            flags.contains('d'),
+            "--files-from --delete (sender) packs 'd': {flags}"
+        );
+    }
+
+    // upstream: options.c:2662-2666 - 'W' is only sent when whole_file > 0
+    // (explicitly forced). The default for remote transfers is auto (-1),
+    // which does NOT send 'W'. Sending 'W' unconditionally causes the
+    // remote generator to skip basis-file checksums, defeating delta.
+    #[test]
+    fn server_flag_string_omits_w_when_whole_file_not_set() {
+        let config = ClientConfig::builder().build();
+        let flags = build_server_flag_string(&config);
+        assert!(
+            !flags.contains('W'),
+            "default config must not include 'W' (whole-file): {flags}"
+        );
+    }
+
+    #[test]
+    fn server_flag_string_includes_w_when_whole_file_explicit() {
+        let config = ClientConfig::builder().whole_file(true).build();
+        let flags = build_server_flag_string(&config);
+        assert!(
+            flags.contains('W'),
+            "explicit whole_file(true) must include 'W': {flags}"
+        );
+    }
+
+    #[test]
+    fn server_flag_string_omits_w_when_whole_file_false() {
+        let config = ClientConfig::builder().whole_file(false).build();
+        let flags = build_server_flag_string(&config);
+        assert!(
+            !flags.contains('W'),
+            "explicit whole_file(false) must not include 'W': {flags}"
+        );
+    }
+
+    /// Golden byte-order test: a real rsync server dispatches each compact
+    /// flag independently (`parse_arguments()` switches on one byte at a
+    /// time), so the LETTER ORDER within the bundle has no effect on how a
+    /// peer parses it. But wire-fidelity requires oc-rsync's client to be a
+    /// drop-in replacement whose argv is indistinguishable from upstream's
+    /// own client - packet captures, `--server` invocation logs, and
+    /// interop diffing all compare this string byte-for-byte. Exercising one
+    /// flag from each upstream `server_options()` grouping pins the full
+    /// emission sequence (options.c:2619-2723) so a future edit cannot
+    /// silently reorder it back out of parity.
+    #[test]
+    fn server_flag_string_matches_upstream_letter_order() {
+        let config = ClientConfig::builder()
+            .verbosity(1)
+            .backup(true)
+            .update(true)
+            .dry_run(true)
+            .links(true)
+            .whole_file(true)
+            .hard_links(true)
+            .owner(true)
+            .group(true)
+            .devices(true)
+            .times(true)
+            .crtimes(true)
+            .permissions(true)
+            .recursive(true)
+            .checksum(true)
+            .cvs_exclude(true)
+            .ignore_times(true)
+            .relative_paths(true)
+            .one_file_system(1)
+            .sparse(true)
+            .compress(true)
+            .build();
+
+        let flags = build_server_flag_string(&config);
+        assert_eq!(flags, "-vbunlWHogDtNprcCIRxSz");
+    }
+}

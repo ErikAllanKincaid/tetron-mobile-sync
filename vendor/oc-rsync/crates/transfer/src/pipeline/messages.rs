@@ -1,0 +1,245 @@
+//! Channel messages for the decoupled receiver architecture.
+//!
+//! Defines the streaming protocol between the network ingest thread and the
+//! disk commit thread. Each file follows the sequence:
+//! `Begin -> N x Chunk -> Commit` (or `Abort` on error).
+//!
+//! The `Shutdown` message terminates the disk thread after all files are
+//! processed.
+
+use std::path::PathBuf;
+
+use protocol::xattr::XattrList;
+
+use crate::delta_apply::ChecksumVerifier;
+
+/// Messages from the network thread to the disk commit thread.
+///
+/// Follows a per-file protocol: `Begin -> Chunk* -> Commit | Abort`.
+/// Small single-chunk files may use the coalesced `WholeFile` variant.
+/// The `Shutdown` variant terminates the disk thread.
+pub enum FileMessage {
+    /// Start writing a new file.
+    Begin(Box<BeginMessage>),
+    /// A chunk of file data to write.
+    Chunk(Vec<u8>),
+    /// Matched basis bytes for an in-place update that already sit at the same
+    /// offset in the destination as where they would be written.
+    ///
+    /// The disk thread folds these bytes into the per-file checksum (upstream
+    /// hashes matched blocks via `sum_update` regardless) but seeks past them
+    /// instead of rewriting identical data, avoiding a needless write and
+    /// leaving the pages clean.
+    ///
+    /// Only produced when the basis file IS the destination being updated
+    /// (`--inplace` with `fnamecmp == fname`) and the matched block's basis
+    /// offset equals the current output position.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `receiver.c:468-474` - `updating_basis_or_equiv && offset == offset2`
+    ///   dispatches to `skip_matched()` instead of `write_file()`.
+    /// - `fileio.c:192-211` - `skip_matched()` flushes then `lseek`s past the
+    ///   in-place bytes (or feeds the sparse processor with the seek flag).
+    SkipMatched(Vec<u8>),
+    /// Matched basis bytes that must be written, but that are not literal data
+    /// received from the sender.
+    ///
+    /// Written exactly like [`FileMessage::Chunk`]; the variants differ only in
+    /// what they mean for `--partial` retention. Upstream sets the
+    /// `cleanup_got_literal` latch only in the literal branch, so a temp file
+    /// containing nothing but basis copies is unlinked on abort rather than
+    /// renamed over a complete destination. Routing matched blocks through
+    /// `Chunk` made a byte counter that was standing in for that latch non-zero
+    /// with zero literal data received.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `receiver.c:392-403` - `if (i > 0) { ...; cleanup_got_literal = 1; }`;
+    ///   the matched branch at `receiver.c:413+` deliberately does not.
+    /// - `cleanup.c:159` - retention is gated on `cleanup_got_literal`;
+    ///   `cleanup.c:199-200` unlinks the temp otherwise.
+    MatchedChunk(Vec<u8>),
+    /// Finalize the current file: compute the whole-file checksum, verify it
+    /// against the sender's trailing sum, and only then flush, fsync, and
+    /// rename into place.
+    ///
+    /// The expected checksum travels with this message so the disk thread can
+    /// verify BEFORE committing, mirroring upstream `receiver.c:505-519` where
+    /// `receive_data()` compares `sum_end()` against the sender's sum before
+    /// `recv_files()` calls `finish_transfer()`.
+    Commit {
+        /// Sender's trailing whole-file checksum for pre-commit verification.
+        expected_checksum: ExpectedChecksum,
+    },
+    /// Coalesced message for single-chunk files: combines Begin + one Chunk +
+    /// Commit into a single channel send, reducing futex overhead from 3+
+    /// sends to 1. Used when the sender transmits the entire file as a single
+    /// literal token (common for small files).
+    WholeFile {
+        /// File metadata and configuration.
+        begin: Box<BeginMessage>,
+        /// Complete file data.
+        data: Vec<u8>,
+        /// Sender's trailing whole-file checksum for pre-commit verification.
+        expected_checksum: ExpectedChecksum,
+    },
+    /// Abort the current file due to an error.
+    Abort {
+        /// Human-readable reason for the abort.
+        reason: String,
+    },
+    /// Shut down the disk commit thread.
+    Shutdown,
+}
+
+/// Metadata for starting a new file write on the disk thread.
+///
+/// Per-transfer invariants (`use_sparse`, `temp_dir`) live in
+/// `DiskCommitConfig` to avoid per-file cloning.
+pub struct BeginMessage {
+    /// Destination path for the file.
+    pub file_path: PathBuf,
+    /// Target file size (used for adaptive buffer sizing).
+    pub target_size: u64,
+    /// Index into the file list (for metadata application).
+    pub file_entry_index: usize,
+    /// Checksum verifier for computing per-file integrity digest on the disk
+    /// thread. When `Some`, the disk thread hashes every chunk it writes and
+    /// returns the final digest in [`CommitResult::computed_checksum`].
+    /// When `None`, no checksum is computed (legacy path).
+    pub checksum_verifier: Option<ChecksumVerifier>,
+    /// When true, the target is a device file opened with `O_WRONLY`.
+    ///
+    /// Device files cannot use temp file + rename (you cannot rename onto a
+    /// device node) and should not have permissions/ownership changed after
+    /// writing. Metadata application is skipped for device targets.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `receiver.c`: `write_devices && IS_DEVICE(st.st_mode)`
+    pub is_device_target: bool,
+    /// When true, writes directly to the destination file (`--inplace`).
+    ///
+    /// Bypasses temp-file + rename: the destination is opened for writing
+    /// (created if absent) and truncated to target size after delta
+    /// application. Preserves the destination inode.
+    pub is_inplace: bool,
+    /// Byte offset at which to start writing in append mode.
+    ///
+    /// When non-zero, the output file is seeked to this offset before writing
+    /// delta data. The sender only sends bytes beyond this offset.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `receiver.c:372-373` - `offset = sum.flength; do_lseek(fd, offset, SEEK_SET)`
+    pub append_offset: u64,
+    /// Xattr list resolved from the wire protocol cache for this file.
+    ///
+    /// When `Some`, the disk thread applies these xattrs after metadata
+    /// application. Populated by looking up the file entry's `xattr_ndx` in
+    /// the `XattrCache` during begin message construction.
+    ///
+    /// # Upstream Reference
+    ///
+    /// Mirrors `xattrs.c:set_xattr()` called from `set_file_attrs()` in
+    /// `receiver.c` after file transfer completes.
+    pub xattr_list: Option<XattrList>,
+    /// Basis (`fnamecmp`) file whose xattrs an abbreviated entry references.
+    ///
+    /// Carries the exact basis the delta request selected
+    /// (`find_basis_file_with_config`), so an abbreviated value the generator
+    /// left unrequested - because it matched the basis - resolves at apply time
+    /// against that same `--fuzzy` / `--link-dest` / `--compare-dest` /
+    /// `--partial-dir` file rather than only the primary destination. `None`
+    /// falls back to the pre-transfer destination path (`file_path`).
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `xattrs.c:944-1009` `rsync_xal_set(fname, ..., fnamecmp, ...)` - the
+    ///   abbreviated resolution re-reads `fnamecmp`, the basis actually used.
+    pub xattr_basis: Option<PathBuf>,
+    /// Flist entry whose metadata (permissions, ownership, timestamps, ACL
+    /// indices) the disk thread applies after committing this file.
+    ///
+    /// Carried per-file so the disk thread never has to index a shared copy of
+    /// the whole receiver file list. Previously the disk thread read
+    /// `DiskCommitConfig.file_list[file_entry_index]`, which forced the receiver
+    /// to hand it an `Arc<Vec<FileEntry>>` clone of the entire flist that stayed
+    /// resident for the whole transfer (a second full name-heap copy). A single
+    /// cloned entry per in-flight file is transient (dropped once the file
+    /// commits) and window-bounded, and it is immune to the receiver
+    /// progressively reclaiming its own flist segments (`reclaim_heap_data`
+    /// zeroes the very fields - mode/uid/gid/mtime and the `acl_ndx` in
+    /// `extras` - that this apply path reads).
+    ///
+    /// `None` means no metadata is applied (matches the former behavior when the
+    /// index did not resolve in the shared list).
+    pub file_entry: Option<protocol::flist::FileEntry>,
+}
+
+/// Sender's trailing whole-file checksum, carried to the disk thread for
+/// pre-commit verification.
+///
+/// A `len` of 0 means the caller supplied no checksum, so verification is
+/// skipped and the file always commits. This mirrors the `fd == -1`
+/// short-circuit at upstream `receiver.c:518` where the memcmp is not
+/// performed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExpectedChecksum {
+    /// Digest bytes (only `len` bytes are valid).
+    pub bytes: [u8; ChecksumVerifier::MAX_DIGEST_LEN],
+    /// Number of valid bytes in `bytes`. Zero disables verification.
+    pub len: usize,
+}
+
+/// Computed checksum digest returned by the disk thread.
+#[derive(Debug)]
+pub struct ComputedChecksum {
+    /// Digest bytes (only `len` bytes are valid).
+    pub bytes: [u8; ChecksumVerifier::MAX_DIGEST_LEN],
+    /// Number of valid bytes in `bytes`.
+    pub len: usize,
+}
+
+/// Destination-relative paths for a successful `--backup` rename.
+///
+/// Carried back from the disk commit thread so the receiver's main thread
+/// can emit upstream's `INFO_GTE(BACKUP, 1)` line. The disk thread cannot
+/// emit directly because its thread-local [`logging::VerbosityConfig`] is
+/// never seeded, so `info_gte(Backup, 1)` would always be false there.
+///
+/// upstream: backup.c:433 - `rprintf(FINFO, "backed up %s to %s\n", fname, buf)`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupNotice {
+    /// Destination-relative path of the original file before the rename.
+    pub original: PathBuf,
+    /// Destination-relative path of the renamed backup file.
+    pub backup: PathBuf,
+}
+
+/// Result of committing a file to disk, sent back from the disk thread.
+pub struct CommitResult {
+    /// Number of bytes written to the file.
+    pub bytes_written: u64,
+    /// Index into the file list (correlates with `BeginMessage::file_entry_index`).
+    pub file_entry_index: usize,
+    /// Non-fatal metadata error, if any (path, description).
+    pub metadata_error: Option<(PathBuf, String)>,
+    /// Computed per-file checksum, if verification was deferred to the disk thread.
+    pub computed_checksum: Option<ComputedChecksum>,
+    /// When `--delay-updates` is active, the staging path where the file was
+    /// placed instead of its final destination. The receiver collects these
+    /// and performs a bulk rename sweep at the phase 2 boundary.
+    ///
+    /// `None` when delay-updates is off or for inplace/device writes.
+    ///
+    /// # Upstream Reference
+    ///
+    /// - `receiver.c:1050-1051`: `bitbag_set_bit(delayed_bits, ndx)`
+    pub delayed_path: Option<PathBuf>,
+    /// Backup notice when `--backup` renamed a pre-existing file. The main
+    /// thread emits this as `INFO_GTE(BACKUP, 1)` so the `--info=backup`
+    /// line surfaces during pipelined wire transfers.
+    pub backup_notice: Option<BackupNotice>,
+}

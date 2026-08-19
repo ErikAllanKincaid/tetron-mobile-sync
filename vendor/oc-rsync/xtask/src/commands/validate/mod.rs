@@ -1,0 +1,646 @@
+//! `cargo xtask validate` - drop-in fidelity matrix.
+//!
+//! Runs oc-rsync and upstream rsync as the pulling client over every client
+//! transport (local, ssh subprocess, embedded russh, daemon) and asserts the
+//! results are identical across content, metadata, ACLs, xattrs, and verbose /
+//! progress output. Optionally benchmarks a 10k-file workload across the same
+//! transports to feed performance work.
+//!
+//! Each check is a self-contained [`Check`] strategy that owns its fixture and
+//! comparison and reports one [`CheckOutcome`] per matrix cell; the runner just
+//! aggregates. This keeps checks independent and individually testable.
+//!
+//! The upstream side of every comparison is the pinned rsync build the interop
+//! harness installs, verified by its `--version` banner; see [`oracle`] for the
+//! resolution rules and the `OC_RSYNC_VALIDATE_UPSTREAM` override.
+
+use std::collections::HashSet;
+use std::path::Path;
+
+use crate::error::TaskResult;
+
+/// A group a [`Check`] belongs to, used to select subsets of the matrix from
+/// the CLI. A check may belong to several categories.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum Category {
+    /// Core drop-in fidelity checks (the default set).
+    Validation,
+    /// Checks that exercise enriched, adversarial fixtures.
+    EdgeCases,
+    /// Security-sensitive behaviours (path escapes, privilege handling).
+    Security,
+    /// Wire-format and protocol-level fidelity.
+    Wire,
+}
+
+impl Category {
+    /// Every category, in display order.
+    pub const ALL: [Category; 4] = [
+        Category::Validation,
+        Category::EdgeCases,
+        Category::Security,
+        Category::Wire,
+    ];
+
+    /// Stable lowercase label matching the CLI flag that selects it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Category::Validation => "validation",
+            Category::EdgeCases => "edge-cases",
+            Category::Security => "security",
+            Category::Wire => "wire",
+        }
+    }
+}
+
+/// Platform-agnostic options parsed from the CLI.
+///
+/// Transports are carried as labels so this type compiles on every platform;
+/// the Unix-only runner resolves them to concrete transports.
+#[derive(Debug, Default)]
+pub struct ValidateOptions {
+    /// Transport labels to exercise; empty means all transports.
+    pub transports: Vec<String>,
+    /// Ad-hoc rsync flag sets to validate for parity (each is one scenario).
+    pub flags: Vec<String>,
+    /// Run the 10k-file performance benchmark after the correctness matrix.
+    pub bench: bool,
+    /// File count for the benchmark workload.
+    pub bench_files: usize,
+    /// Select the [`Category::Validation`] checks.
+    pub validation: bool,
+    /// Enrich fixtures with edge cases and select [`Category::EdgeCases`].
+    pub edge_cases: bool,
+    /// Select the [`Category::Security`] checks.
+    pub security: bool,
+    /// Select the [`Category::Wire`] checks.
+    pub wire: bool,
+    /// List the available checks grouped by category, then exit.
+    pub list: bool,
+    /// Run root-only validations (device nodes, id remaps) when actually root.
+    pub root: bool,
+    /// Print each transfer's command and stdout on failure.
+    pub verbose: bool,
+}
+
+impl From<crate::cli::ValidateMatrixArgs> for ValidateOptions {
+    fn from(args: crate::cli::ValidateMatrixArgs) -> Self {
+        ValidateOptions {
+            transports: args.transports,
+            flags: args.flags,
+            bench: args.bench,
+            bench_files: args.bench_files.unwrap_or(10_000),
+            validation: args.validation,
+            edge_cases: args.edge_cases,
+            security: args.security,
+            wire: args.wire,
+            list: args.list,
+            root: args.root,
+            verbose: args.verbose,
+        }
+    }
+}
+
+/// Resolve the set of categories to run from the parsed flags.
+///
+/// When no category flag is passed the harness defaults to the historical
+/// [`Category::Validation`] set, keeping a bare `cargo xtask validate`
+/// regression-safe. `--edge-cases` both enriches fixtures and selects
+/// [`Category::EdgeCases`].
+pub fn selected_categories(options: &ValidateOptions) -> HashSet<Category> {
+    let mut set = HashSet::new();
+    if options.validation {
+        set.insert(Category::Validation);
+    }
+    if options.edge_cases {
+        set.insert(Category::EdgeCases);
+    }
+    if options.security {
+        set.insert(Category::Security);
+    }
+    if options.wire {
+        set.insert(Category::Wire);
+    }
+    if set.is_empty() {
+        set.insert(Category::Validation);
+    }
+    set
+}
+
+#[cfg(unix)]
+mod bench;
+#[cfg(unix)]
+mod checks;
+#[cfg(unix)]
+mod comparison;
+#[cfg(unix)]
+mod oracle;
+#[cfg(unix)]
+mod skips;
+#[cfg(unix)]
+mod support;
+#[cfg(unix)]
+mod transport;
+
+#[cfg(unix)]
+pub use unix_impl::{Check, CheckOutcome, ValidateCtx, execute};
+
+#[cfg(unix)]
+mod unix_impl {
+    use super::*;
+    use transport::Transport;
+
+    /// One check's result for one matrix cell.
+    pub struct CheckOutcome {
+        /// Check name (e.g. `metadata`).
+        pub check: &'static str,
+        /// Cell label (usually a transport, e.g. `ssh-subprocess`).
+        pub cell: String,
+        /// Outcome of the cell.
+        pub status: Status,
+        /// One-line detail (diagnostic on failure, note otherwise).
+        pub detail: String,
+    }
+
+    /// Pass / fail / skip for one cell.
+    #[derive(PartialEq, Eq)]
+    pub enum Status {
+        /// oc matched upstream.
+        Pass,
+        /// oc diverged from upstream.
+        Fail,
+        /// Cell could not run (missing tool, unreachable sshd).
+        Skip,
+    }
+
+    impl CheckOutcome {
+        /// Construct a passing outcome.
+        pub fn pass(check: &'static str, cell: impl Into<String>) -> Self {
+            Self {
+                check,
+                cell: cell.into(),
+                status: Status::Pass,
+                detail: String::new(),
+            }
+        }
+        /// Construct a failing outcome with a diagnostic.
+        pub fn fail(
+            check: &'static str,
+            cell: impl Into<String>,
+            detail: impl Into<String>,
+        ) -> Self {
+            Self {
+                check,
+                cell: cell.into(),
+                status: Status::Fail,
+                detail: detail.into(),
+            }
+        }
+        /// Construct a skipped outcome with a reason.
+        pub fn skip(
+            check: &'static str,
+            cell: impl Into<String>,
+            reason: impl Into<String>,
+        ) -> Self {
+            Self {
+                check,
+                cell: cell.into(),
+                status: Status::Skip,
+                detail: reason.into(),
+            }
+        }
+    }
+
+    /// Shared context passed to every check.
+    pub struct ValidateCtx<'a> {
+        /// oc-rsync binary under test.
+        pub oc: &'a Path,
+        /// Upstream rsync binary (ground truth + remote sender).
+        pub upstream: &'a Path,
+        /// Scratch root; checks create subdirectories under it.
+        pub work: &'a Path,
+        /// Transports to exercise.
+        pub transports: &'a [Transport],
+        /// Ad-hoc rsync flag sets to validate for parity (each is one scenario).
+        pub flags: &'a [String],
+        /// Enrich fixtures with edge cases (opt-in).
+        pub edge_cases: bool,
+        /// Run root-only validations when the process is actually root.
+        pub root: bool,
+        /// Verbose diagnostics.
+        pub verbose: bool,
+    }
+
+    /// A single fidelity check. Owns its fixture and comparison; runs across the
+    /// transports (or directions) it cares about, honoring `ctx.transports`.
+    pub trait Check {
+        /// Stable check name for the report.
+        fn name(&self) -> &'static str;
+        /// Run the check, returning one outcome per matrix cell.
+        fn run(&self, ctx: &ValidateCtx) -> Vec<CheckOutcome>;
+        /// Categories this check belongs to. Defaults to
+        /// [`Category::Validation`] so existing checks need no changes.
+        fn categories(&self) -> &'static [Category] {
+            &[Category::Validation]
+        }
+    }
+
+    /// Resolve requested transport labels to concrete transports (all if empty).
+    fn resolve_transports(labels: &[String]) -> TaskResult<Vec<Transport>> {
+        if labels.is_empty() {
+            return Ok(Transport::ALL.to_vec());
+        }
+        labels
+            .iter()
+            .map(|l| {
+                Transport::parse(l).ok_or_else(|| {
+                    crate::error::TaskError::Validation(format!("unknown transport `{l}`"))
+                })
+            })
+            .collect()
+    }
+
+    /// Detect binaries, run every check, print the matrix, and fail if any cell
+    /// diverged.
+    pub fn execute(workspace: &Path, options: ValidateOptions) -> TaskResult<()> {
+        let all_checks = checks::all();
+        if options.list {
+            list_checks(&all_checks);
+            return Ok(());
+        }
+
+        let selected = super::selected_categories(&options);
+        let checks: Vec<Box<dyn Check>> = all_checks
+            .into_iter()
+            .filter(|c| c.categories().iter().any(|cat| selected.contains(cat)))
+            .collect();
+
+        let oc = crate::commands::interop::shared::oc_rsync::detect_oc_rsync_binary(workspace)?;
+        let upstream = super::oracle::resolve(workspace)?;
+        let transports = resolve_transports(&options.transports)?;
+
+        let work = workspace.join("target/validate");
+        if work.exists() {
+            let _ = std::fs::remove_dir_all(&work);
+        }
+        std::fs::create_dir_all(&work)
+            .map_err(|e| crate::error::TaskError::Validation(format!("create work dir: {e}")))?;
+
+        let mut cats: Vec<&'static str> = Category::ALL
+            .iter()
+            .filter(|c| selected.contains(c))
+            .map(|c| c.label())
+            .collect();
+        cats.sort_unstable();
+        // Print the oracle's path *and* its version banner before any result,
+        // so every PASS and FAIL below is attributable to a named upstream
+        // release rather than to whichever rsync the host happened to have.
+        eprintln!("[validate] upstream oracle: {}", upstream.banner);
+        eprintln!(
+            "[validate] oc-rsync={} vs upstream={} over [{}] categories [{}]",
+            oc.binary_path().display(),
+            upstream.path.display(),
+            transports
+                .iter()
+                .map(|t| t.label())
+                .collect::<Vec<_>>()
+                .join(", "),
+            cats.join(", ")
+        );
+
+        let ctx = ValidateCtx {
+            oc: oc.binary_path(),
+            upstream: &upstream.path,
+            work: &work,
+            transports: &transports,
+            flags: &options.flags,
+            edge_cases: options.edge_cases,
+            root: options.root,
+            verbose: options.verbose,
+        };
+
+        let mut outcomes = Vec::new();
+        for check in &checks {
+            outcomes.extend(check.run(&ctx));
+        }
+        report(&outcomes);
+
+        // Account for skipped cells before anything else can end the run: a
+        // skipped cell is not a passing cell, and a run that skipped most of
+        // the matrix must not be readable as success.
+        let ledger = skips::SkipLedger::from_outcomes(&outcomes, skips::ExpectedSkips::DEFAULT);
+        report_skips(&ledger);
+
+        // A cell that produced no outcome at all is invisible to the skip
+        // ledger, so the cell count is checked separately. Only a full,
+        // unnarrowed selection has a meaningful floor.
+        let full_selection = options.transports.is_empty() && options.flags.is_empty();
+        let shortfall =
+            skips::cell_shortfall(outcomes.len(), skips::EXPECTED_CELLS, full_selection);
+        eprintln!(
+            "cells accounted: {}{}",
+            outcomes.len(),
+            if full_selection {
+                format!(" (floor {})", skips::EXPECTED_CELLS)
+            } else {
+                " (narrowed run; floor not applied)".to_owned()
+            }
+        );
+        match ledger.write_artifact(&work) {
+            Ok(path) => eprintln!("skip detail: {}", path.display()),
+            Err(e) => eprintln!("warning: could not write skip detail: {e}"),
+        }
+
+        report_categories(&checks, &selected);
+
+        if options.bench {
+            bench::run(&ctx, options.bench_files)?;
+        }
+
+        // Cross-platform gate: reuse the shared cross-check (host
+        // `clippy -D warnings` + `x86_64-pc-windows-gnu` and
+        // `x86_64-unknown-linux-musl` `cargo check`) so `xtask validate` is the
+        // single full local pre-push verification entrypoint. Absent cross
+        // toolchains skip with an actionable hint, so validate still works on a
+        // dev box lacking mingw/musl. This runs after the fidelity matrix
+        // because it takes the workspace build lock.
+        eprintln!("\n=== cross-platform checks ===");
+        let cross_result = crate::commands::cross_check::run(workspace);
+
+        let failed = outcomes.iter().filter(|o| o.status == Status::Fail).count();
+        if failed > 0 {
+            return Err(crate::error::TaskError::Validation(format!(
+                "{failed} fidelity check(s) diverged from upstream"
+            )));
+        }
+        if let Some(msg) = shortfall {
+            return Err(crate::error::TaskError::Validation(msg));
+        }
+        if ledger.exceeds_budget() {
+            return Err(crate::error::TaskError::Validation(
+                ledger.budget_diagnostic(),
+            ));
+        }
+        cross_result
+    }
+
+    /// Print the matrix grouped by check, plus a summary line.
+    fn report(outcomes: &[CheckOutcome]) {
+        let (mut pass, mut fail, mut skip) = (0, 0, 0);
+        eprintln!("\n=== fidelity matrix ===");
+        let mut current = "";
+        for o in outcomes {
+            if o.check != current {
+                eprintln!("\n{}:", o.check);
+                current = o.check;
+            }
+            let (mark, count) = match o.status {
+                Status::Pass => ("PASS", &mut pass),
+                Status::Fail => ("FAIL", &mut fail),
+                Status::Skip => ("SKIP", &mut skip),
+            };
+            *count += 1;
+            if o.detail.is_empty() {
+                eprintln!("  [{mark}] {}", o.cell);
+            } else {
+                eprintln!("  [{mark}] {} - {}", o.cell, o.detail);
+            }
+        }
+        eprintln!("\n=== {pass} passed, {fail} failed, {skip} skipped ===");
+    }
+
+    /// Print the skip ledger: the count against its declared budget, and every
+    /// reason with how many cells it cost.
+    ///
+    /// Printed after the totals line and before the verdict so a run that
+    /// skipped most of the matrix cannot be read as a success by anyone who
+    /// looks at the tail of the output.
+    fn report_skips(ledger: &skips::SkipLedger) {
+        eprintln!("\n=== skipped cells ===");
+        eprintln!("{}", ledger.summary());
+    }
+
+    /// Summarize how many of the run checks fall in each selected category.
+    fn report_categories(checks: &[Box<dyn Check>], selected: &HashSet<Category>) {
+        eprintln!("\n=== categories ===");
+        for cat in Category::ALL {
+            if !selected.contains(&cat) {
+                continue;
+            }
+            let n = checks
+                .iter()
+                .filter(|c| c.categories().contains(&cat))
+                .count();
+            eprintln!("  {}: {n} check(s)", cat.label());
+        }
+    }
+
+    /// Print every check grouped by category (name plus its categories) to
+    /// stdout. A check appears under each category it belongs to.
+    fn list_checks(checks: &[Box<dyn Check>]) {
+        for cat in Category::ALL {
+            let mut members = checks
+                .iter()
+                .filter(|c| c.categories().contains(&cat))
+                .peekable();
+            if members.peek().is_none() {
+                continue;
+            }
+            println!("{}:", cat.label());
+            for c in members {
+                let labels = c
+                    .categories()
+                    .iter()
+                    .map(|x| x.label())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("  {} [{labels}]", c.name());
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn execute(_workspace: &Path, options: ValidateOptions) -> TaskResult<()> {
+    // The transport matrix relies on Unix-only APIs (POSIX ids, symlinks, device
+    // nodes, ssh/daemon plumbing). Read each field so it is not reported as dead
+    // on non-Unix targets (a `_` destructure discards without counting as a
+    // read), then decline the command.
+    let _ = (
+        &options.transports,
+        &options.flags,
+        options.bench,
+        options.bench_files,
+        options.validation,
+        options.edge_cases,
+        options.security,
+        options.wire,
+        options.list,
+        options.root,
+        options.verbose,
+    );
+    let selected = selected_categories(&options);
+    let _ = Category::ALL
+        .iter()
+        .filter(|c| selected.contains(c))
+        .map(|c| c.label())
+        .collect::<Vec<_>>();
+    Err(crate::error::TaskError::Validation(
+        "`cargo xtask validate` is only supported on Unix hosts".into(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts(f: impl FnOnce(&mut ValidateOptions)) -> ValidateOptions {
+        let mut o = ValidateOptions::default();
+        f(&mut o);
+        o
+    }
+
+    #[test]
+    fn no_flags_defaults_to_validation() {
+        let set = selected_categories(&ValidateOptions::default());
+        assert_eq!(set, HashSet::from([Category::Validation]));
+    }
+
+    #[test]
+    fn security_flag_selects_only_security() {
+        let set = selected_categories(&opts(|o| o.security = true));
+        assert_eq!(set, HashSet::from([Category::Security]));
+    }
+
+    #[test]
+    fn edge_cases_flag_selects_edge_cases() {
+        let set = selected_categories(&opts(|o| o.edge_cases = true));
+        assert_eq!(set, HashSet::from([Category::EdgeCases]));
+    }
+
+    #[test]
+    fn multiple_flags_union() {
+        let set = selected_categories(&opts(|o| {
+            o.validation = true;
+            o.security = true;
+            o.wire = true;
+        }));
+        assert_eq!(
+            set,
+            HashSet::from([Category::Validation, Category::Security, Category::Wire])
+        );
+    }
+
+    #[test]
+    fn category_labels_are_stable() {
+        assert_eq!(Category::Validation.label(), "validation");
+        assert_eq!(Category::EdgeCases.label(), "edge-cases");
+        assert_eq!(Category::Security.label(), "security");
+        assert_eq!(Category::Wire.label(), "wire");
+    }
+
+    // Stub toolchain for the cross-check phase that `validate` runs, so the
+    // integration is exercised without shelling out to cargo or rustup.
+    struct StubEnv {
+        clippy_ok: bool,
+    }
+
+    impl crate::commands::cross_check::CheckEnv for StubEnv {
+        fn target_installed(&self, _triple: &str) -> TaskResult<bool> {
+            // No cross targets installed - the windows-gnu and musl gates skip.
+            Ok(false)
+        }
+
+        fn command_available(&self, _program: &str) -> bool {
+            false
+        }
+
+        fn run(&self, _args: &[&str], display: &str) -> TaskResult<()> {
+            if self.clippy_ok {
+                Ok(())
+            } else {
+                Err(crate::error::TaskError::CommandFailed {
+                    program: display.to_owned(),
+                    status: {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::process::ExitStatusExt;
+                            std::process::ExitStatus::from_raw(1 << 8)
+                        }
+                        #[cfg(windows)]
+                        {
+                            use std::os::windows::process::ExitStatusExt;
+                            std::process::ExitStatus::from_raw(1)
+                        }
+                    },
+                })
+            }
+        }
+    }
+
+    #[test]
+    fn validate_cross_check_phase_skips_absent_cross_toolchains() {
+        // The exact shared entrypoint `validate::execute` invokes. On a dev box
+        // lacking mingw/musl the two cross targets skip and the host clippy pass
+        // succeeds, so validate's cross-platform phase does not fail.
+        let env = StubEnv { clippy_ok: true };
+        crate::commands::cross_check::run_with_env(&env)
+            .expect("absent cross toolchains must skip, not fail validate");
+    }
+
+    #[test]
+    fn validate_cross_check_phase_propagates_gate_failure() {
+        // A real gate failure (e.g. clippy warnings) must fail validate too.
+        let env = StubEnv { clippy_ok: false };
+        assert!(
+            crate::commands::cross_check::run_with_env(&env).is_err(),
+            "a failing cross-check gate must propagate through validate"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_check_declares_known_nonempty_categories() {
+        for check in checks::all() {
+            let cats = check.categories();
+            assert!(
+                !cats.is_empty(),
+                "check `{}` declares no category",
+                check.name()
+            );
+            for cat in cats {
+                assert!(
+                    Category::ALL.contains(cat),
+                    "check `{}` declares an unknown category {cat:?}",
+                    check.name()
+                );
+            }
+        }
+    }
+
+    /// Names of the checks that carry a given category, mirroring the filter in
+    /// `execute()`.
+    #[cfg(unix)]
+    fn checks_in(cat: Category) -> Vec<&'static str> {
+        checks::all()
+            .iter()
+            .filter(|c| c.categories().contains(&cat))
+            .map(|c| c.name())
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn security_flag_selects_exactly_the_security_checks() {
+        assert_eq!(
+            checks_in(Category::Security),
+            ["safe-links", "protected-regular"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wire_flag_selects_exactly_the_wire_checks() {
+        assert_eq!(checks_in(Category::Wire), ["capability-string"]);
+    }
+}

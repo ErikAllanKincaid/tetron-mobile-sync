@@ -1,0 +1,328 @@
+//! Server configuration builders for daemon-mode transfers.
+//!
+//! Constructs `ServerConfig` instances for receiver (pull) and generator (push)
+//! roles, mapping `ClientConfig` options to server-side flags and settings.
+
+use std::ffi::OsString;
+
+use protocol::filters::FilterRuleWireFormat;
+
+use crate::client::config::ClientConfig;
+use crate::client::error::{ClientError, invalid_argument_error};
+use crate::client::remote::flags;
+
+use crate::server::{ServerConfig, ServerRole};
+
+/// Builds server configuration for receiver role (pull transfer).
+pub(crate) fn build_server_config_for_receiver(
+    config: &ClientConfig,
+    local_paths: &[OsString],
+    filter_rules: Vec<FilterRuleWireFormat>,
+) -> Result<ServerConfig, ClientError> {
+    let flag_string = flags::build_server_flag_string(config);
+    let args: Vec<OsString> = local_paths.to_vec();
+
+    let mut server_config =
+        ServerConfig::from_flag_string_and_args(ServerRole::Receiver, flag_string, args)
+            .map_err(|e| invalid_argument_error(&format!("invalid server config: {e}"), 1))?;
+
+    apply_common_daemon_config(config, &mut server_config, filter_rules);
+    server_config.reference_directories = config.reference_directories().to_vec();
+    // upstream: backup.c:make_backup() runs on the receiver, invoked from
+    // generator.c/receiver.c. `make_backups` rides in the compact flag string as
+    // 'b' (options.c:2648-2649), so flags.backup is already set here; but
+    // --backup-dir / --suffix are long-form values finalized in the local popt
+    // parse (options.c:2285-2298) and never delivered onto the receiver config.
+    // On a pull the local client IS the receiver, so carry backup_dir/backup_suffix
+    // here - otherwise effective_backup_suffix() falls back to "~" and the backup
+    // lands beside the file instead of in --backup-dir.
+    server_config.backup_dir = config.backup_directory().map(|p| p.display().to_string());
+    server_config.backup_suffix = config
+        .backup_suffix()
+        .map(|s| s.to_string_lossy().into_owned());
+    // upstream: --chmod is parsed into `chmod_modes` (options.c:1762) and is
+    // never placed in server_options, so it is never forwarded to the remote
+    // daemon. On a pull the local client IS the receiver and applies the
+    // modifiers itself as it reads each incoming flist entry (flist.c:905-906
+    // recv_file_entry() -> tweak_mode()). Carry them onto the local receiver
+    // config here; without this the rsync:// pull left every regular file at its
+    // source mode while local copies applied --chmod correctly. This is the
+    // client flag, distinct from the module `incoming chmod` the remote daemon
+    // applies on the far side.
+    server_config.chmod = config.chmod().cloned();
+    // upstream: options.c:2996-2997 - `--mkpath` is forwarded to the remote only
+    // inside the `if (am_sender)` server_options block, so on a pull it never
+    // rides the wire; the local client IS the receiver and creates the dest-arg
+    // path chain itself in get_local_name() (main.c:736 make_path under mkpath).
+    // Carry it onto the local receiver config here. Without this the rsync://
+    // pull to a missing deep destination failed with "failed to create
+    // destination root ... No such file or directory" while local copies honored
+    // --mkpath.
+    server_config.flags.mkpath = config.mkpath();
+    // upstream flist.c:flist_sort_and_clean prunes empty dirs on the receiver
+    // (prune_empty_dirs && !am_sender); on a pull the local client IS the receiver,
+    // and -m is never sent over the wire (options.c gates it on am_sender), so the
+    // flag must be carried onto the local receiver config here.
+    server_config.flags.prune_empty_dirs = config.prune_empty_dirs();
+    // upstream generator.c:1368-1383 never creates a directory absent at the
+    // destination under --existing (ignore_non_existing); on a pull the local
+    // client IS the receiver and --existing is a long-form-only flag absent from
+    // the compact letter string, so carry it onto the local receiver config here.
+    server_config.file_selection.existing_only = config.existing_only();
+    // upstream generator.c:1395 skips any file already present at the destination
+    // under --ignore-existing (`if (ignore_existing > 0 && statret == 0)` early
+    // goto cleanup). options.c:2911-2919 forwards --ignore-existing to the remote
+    // only inside the `if (am_sender)` server_options block, so on a pull it is
+    // never sent over the wire; the local client IS the receiver and applies it
+    // itself. Carry it onto the local receiver config here, mirroring
+    // existing_only above. Without this the daemon pull re-transferred and
+    // overwrote existing destination files instead of skipping them.
+    server_config.file_selection.ignore_existing = config.ignore_existing();
+    // upstream: options.c:2907-2909 forwards --temp-dir to the remote only inside
+    // the `if (am_sender)` server_options block, so on a pull it is never sent
+    // over the wire; the local client IS the receiver and stages the temp file
+    // itself (receiver.c:766 open_tmpfile() honours tmpdir). Carry it onto the
+    // local receiver config here - without this the daemon pull staged the temp
+    // file in the destination directory, ignoring --temp-dir. Distinct from the
+    // module `temp dir` directive the remote daemon applies on the far side.
+    server_config.temp_dir = config.temp_directory().map(std::path::Path::to_path_buf);
+    // upstream rsync.c:719 adds ATTRS_SKIP_MTIME for `omit_dir_times && S_ISDIR`,
+    // and generator.c:2271 gates need_retouch_dir_times on !omit_dir_times.
+    // options.c:2646-2647 packs the compact 'O' into server_options only when
+    // am_sender, so on a pull -O never rides the wire; the local client IS the
+    // receiver and must apply it itself. Carry it onto the local receiver config
+    // here - without this the daemon pull set directory mtimes from the source.
+    server_config.flags.omit_dir_times = config.omit_dir_times();
+    // upstream: options.c:2194 / generator.c:1249 - a single source operand with
+    // no destination implies --list-only. On a pull the local client IS the
+    // receiver and list_only is a long-form-only flag absent from the compact
+    // letter string, so carry it onto the local receiver config here. The
+    // receiver then renders the flist without issuing any per-file NDX request.
+    server_config.flags.list_only = config.list_only();
+    // upstream: options.c:777 / receiver.c:656,1029-1050 - --delay-updates is a
+    // plain receiver-side option (no am_sender gate) that stages updates into
+    // the partial dir and renames them in the phase-2 sweep. options.c:2886-2892
+    // forwards --delay-updates to the remote only on a push (partial_dir &&
+    // am_sender); on a pull the local client IS the receiver and the flag is
+    // never sent over the wire, so carry it onto the local receiver config here.
+    // Without this the receiver updates files in place, defeating --delay-updates.
+    server_config.write.delay_updates = config.delay_updates();
+    // upstream: options.c:2912-2913 - `if (am_sender) { if (usermap) ... }`
+    // forwards --usermap to the remote only on a push. On a pull the local
+    // client IS the receiver and applies the uid name-map itself as it reads
+    // the incoming id list (receiver/file_list/id_lists.rs). Carry it onto the
+    // local receiver config here; without this the daemon pull silently ignored
+    // --usermap while local pulls remapped ownership. This is the client flag,
+    // distinct from the module `uid`/`gid` the remote daemon applies far-side.
+    server_config.user_mapping = config.user_mapping().cloned();
+    // upstream: options.c:2915-2916 - `if (am_sender) { if (groupmap) ... }`
+    // is the gid counterpart of --usermap above; same pull rationale.
+    server_config.group_mapping = config.group_mapping().cloned();
+    // upstream: options.c:2979-2980 - `if (write_devices && am_sender)
+    // --write-devices`. --write-devices makes the receiver write file content
+    // in-place into an existing device node (receiver.c: write_devices &&
+    // IS_DEVICE), so on a pull the local client IS the receiver and must carry
+    // it; it rides the wire only on a push.
+    server_config.write.write_devices = config.write_devices();
+    // upstream: options.c:2641-2643 - `if (am_sender) { if (keep_dirlinks)
+    // argstr[x++] = 'K'; }`. -K makes the receiver follow a symlink-to-dir at
+    // the destination instead of clobbering it (receiver/directory/creation.rs),
+    // so on a pull the local client IS the receiver and must carry the flag; the
+    // compact 'K' letter is emitted only when the local side is the sender.
+    server_config.flags.keep_dirlinks = config.keep_dirlinks();
+    // upstream: options.c:2650-2655 - `if (am_sender) { if (fuzzy_basis) {
+    // argstr[x++] = 'y'; ... } }`. -y/--fuzzy lets the receiver pick a similar
+    // basis file for the delta, so on a pull the local client IS the receiver
+    // and must carry the fuzzy level; the compact 'y' letter is emitted only
+    // when the local side is the sender.
+    server_config.flags.fuzzy_level = config.fuzzy_level();
+    // upstream: options.c:2648-2649 - `if (am_sender) { ... if (omit_link_times)
+    // argstr[x++] = 'J'; }`. -J/--omit-link-times skips a received symlink's
+    // mtime (rsync.c:583 adds ATTRS_SKIP_MTIME for `omit_link_times &&
+    // S_ISLNK`), so on a pull the local client IS the receiver and must carry
+    // the flag; the compact 'J' letter is emitted only when the local side is
+    // the sender. Without this the daemon pull set symlink mtimes from the
+    // source while the local copy executor honoured -J.
+    server_config.flags.omit_link_times = config.omit_link_times();
+    // upstream: options.c:2692-2693 - `else if (preserve_executability &&
+    // am_sender) argstr[x++] = 'E';`. -E/--executability copies the source
+    // executability bits when perms are not otherwise preserved
+    // (rsync.c:457-465), so on a pull the local client IS the receiver and must
+    // carry the flag; the compact 'E' letter is emitted only when the local
+    // side is the sender. Without this the daemon pull left files at their
+    // existing mode while the local copy executor honoured -E.
+    server_config.flags.preserve_executability = config.preserve_executability();
+
+    flags::apply_only_write_batch_for_receiver(config, &mut server_config);
+    flags::apply_common_server_flags(config, &mut server_config);
+    Ok(server_config)
+}
+
+/// Builds server configuration for generator role (push transfer).
+pub(crate) fn build_server_config_for_generator(
+    config: &ClientConfig,
+    local_paths: &[OsString],
+    filter_rules: Vec<FilterRuleWireFormat>,
+) -> Result<ServerConfig, ClientError> {
+    let flag_string = flags::build_server_flag_string(config);
+    let args: Vec<OsString> = local_paths.to_vec();
+
+    let mut server_config =
+        ServerConfig::from_flag_string_and_args(ServerRole::Generator, flag_string, args)
+            .map_err(|e| invalid_argument_error(&format!("invalid server config: {e}"), 1))?;
+
+    // upstream: io.c:834-862 / main.c:1068 - on an rsync:// push the local
+    // client IS the sender and paces its own outbound socket writes. Carry the
+    // parsed `--bwlimit` rate onto the in-process generator config; the
+    // daemon receiver ignores its forwarded copy (main.c:1068).
+    server_config.connection.bwlimit = config
+        .bandwidth_limit()
+        .map(|limit| limit.into_components());
+
+    apply_common_daemon_config(config, &mut server_config, filter_rules);
+    server_config.reference_directories = config.reference_directories().to_vec();
+    // upstream: --chmod is parsed into `chmod_modes` (options.c:1762) and is
+    // never placed in server_options, so it is never forwarded to the remote
+    // daemon receiver. On a push the local client IS the sender and applies the
+    // modifiers itself as it builds each outgoing flist entry (flist.c:1580-1581
+    // send_file_name() -> tweak_mode()). Carry them onto the local generator
+    // config here; without this the daemon push left every file at its source
+    // mode while local copies and pulls applied --chmod correctly. The daemon
+    // module's own `incoming chmod` is applied separately on the daemon side.
+    server_config.chmod = config.chmod().cloned();
+
+    // upstream: options.c:2476-2501 / main.c:1322-1328 - the local sender
+    // resolves a single files-from fd. A local file (LocalFile/Stdin, or a
+    // localhost:path hostspec opened locally) is read directly; a remote-
+    // hosted list is forwarded from the daemon receiver over the wire and
+    // read here as `--files-from=-`.
+    let plan = config.files_from().resolve_for(true, config.from0());
+    if let Some(path) = plan.sender_files_from_path {
+        server_config.file_selection.files_from_path = Some(path);
+        server_config.file_selection.from0 = plan.sender_from0;
+    }
+
+    flags::apply_common_server_flags(config, &mut server_config);
+    Ok(server_config)
+}
+
+/// Applies daemon-specific configuration common to both receiver and generator roles.
+fn apply_common_daemon_config(
+    config: &ClientConfig,
+    server_config: &mut ServerConfig,
+    filter_rules: Vec<FilterRuleWireFormat>,
+) {
+    server_config.connection.client_mode = true;
+    server_config.connection.is_daemon_connection = true;
+    server_config.connection.filter_rules = filter_rules;
+
+    server_config.flags.verbose = config.verbosity() > 0;
+    // A custom `--out-format` makes the local sender/receiver emit one
+    // metadata-bearing itemize event per logged entry so the CLI renders the
+    // template (see InfoFlags::out_format_active). The daemon push/pull drivers
+    // drain and render these; keep the two wired together so a config that sets
+    // this always has a draining driver.
+    server_config.flags.info_flags.out_format_active = config.render_out_format_locally();
+    // upstream stdout_format_has_i - gates the receiver's `created directory`
+    // notice (main.c:807-808) on a dest-creating pull; see the SSH receiver
+    // builder. Set on both roles here; only the receiver consults it.
+    server_config.flags.info_flags.out_format_forwards_i = config.out_format_forwards_i();
+
+    // upstream: numeric_ids and delete are --numeric-ids / --delete-* long-form args only.
+    server_config.flags.numeric_ids = crate::server::NumericIds::from_client(config.numeric_ids());
+    server_config.flags.delete = config.delete_mode().is_enabled() || config.delete_excluded();
+    server_config.file_selection.size_only = config.size_only();
+    // upstream: build_server_flag_string no longer packs the compact 'P' letter,
+    // and 'D' now tracks devices only, so carry keep_partial and specials onto
+    // the local half here (mirrors --partial / --specials|--no-specials which the
+    // wire generator emits long-form).
+    server_config.flags.partial = config.partial();
+    server_config.flags.devices = config.preserve_devices();
+    server_config.flags.specials = config.preserve_specials();
+    server_config.flags.drop_devices = config.drop_devices();
+    // Local-only sender optimization; never emitted onto the wire, so it is
+    // carried directly onto the in-process generator's ParsedServerFlags.
+    server_config.flags.parallel_delta_scan = config.parallel_delta_scan();
+
+    server_config.write.fsync = config.fsync();
+    server_config.write.io_uring_policy = config.io_uring_policy();
+    server_config.write.io_uring_depth = config.io_uring_depth();
+    server_config.write.zero_copy_policy = config.zero_copy_policy();
+    // checksum_choice is set once in `apply_common_server_flags` (called above
+    // for both receiver and generator), shared with the SSH transfer paths.
+    server_config.connection.compression_level = config.compression_level();
+
+    // upstream: options.c:2722,2818-2823 - replicate the compress flag/option
+    // split the client would emit so the daemon-push Generator actually
+    // engages the codec. `do_compression` in the transfer layer
+    // (transfer/src/lib.rs) reads `flags.compress` for the compact `-z` case
+    // and `connection.compress_choice` for everything else. Without this the
+    // client-push `TransferConfig` carried neither (it only set compress_choice
+    // for explicit choices and never set flags.compress), so both `-z` and
+    // `-zz` pushes to a daemon were sent uncompressed.
+    if config.compress() {
+        let algo = config.compression_algorithm();
+        let is_default_zlib = !config.explicit_compress_choice()
+            && algo == compress::algorithm::CompressionAlgorithm::default_algorithm();
+        if is_default_zlib {
+            // upstream: options.c:2722 - the compact `-z` flag drives default
+            // zlib through vstring negotiation (no explicit compress_choice).
+            server_config.flags.compress = true;
+        } else if let Ok(proto_algo) = protocol::CompressionAlgorithm::parse(algo.name()) {
+            // upstream: compat.c:543,819 / options.c:2818-2823 - explicit or
+            // non-default algorithms (e.g. `-zz` -> zlibx) bypass vstring
+            // negotiation and travel as a compress_choice.
+            server_config.connection.compress_choice = Some(proto_algo);
+        }
+    }
+
+    // upstream: options.c:2755-2758 - compress_level defaults to 6 when -z is set.
+    if server_config.flags.compress && server_config.connection.compression_level.is_none() {
+        server_config.connection.compression_level =
+            Some(compress::zlib::CompressionLevel::Default);
+    }
+    server_config.stop_at = config.stop_at();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::SkipCompressList;
+
+    // WHY: `--skip-compress` on a `-z` sender must mirror upstream 3.4.4, where
+    // set_compression()'s per-file suffix lookup is compiled out (`#if 0`, "No
+    // compression algorithms currently allow mid-stream changing of the level.")
+    // and a non-daemon `--skip-compress` is discarded entirely: token.c:182 sets
+    // `f = ""` before building the match list, so the client sender never lowers
+    // its whole-stream deflate level. Even a bare `*` on the client side must NOT
+    // collapse the client sender's zlib stream to store - whole-stream store
+    // (`dont_compress_match_all`) is reachable ONLY through a daemon module's
+    // `dont compress = *` (token.c:206-211, applied server-side in loadparm). If a
+    // future change wired the client's own `--skip-compress=*` into
+    // `dont_compress_match_all`, every `-z --skip-compress=*` push would silently
+    // stop compressing, diverging from upstream's observable wire output. This
+    // pins that a client `-z --skip-compress=*` push keeps compression enabled and
+    // leaves whole-stream store off.
+    #[test]
+    fn client_skip_compress_match_all_never_stores_sender_stream() {
+        let config = ClientConfig::builder()
+            .compress(true)
+            .skip_compress(SkipCompressList::parse("*").expect("`*` parses"))
+            .skip_compress_spec(Some("*".to_owned()))
+            .build();
+
+        let server_config = build_server_config_for_generator(&config, &[], Vec::new())
+            .expect("generator config builds");
+
+        assert!(
+            server_config.flags.compress,
+            "a `-z` push must keep the sender compressing"
+        );
+        assert!(
+            !server_config.connection.dont_compress_match_all,
+            "a client `--skip-compress=*` must not collapse the sender's zlib \
+             stream to store (upstream token.c:182 discards it; whole-stream \
+             store is daemon `dont compress = *` only)"
+        );
+    }
+}

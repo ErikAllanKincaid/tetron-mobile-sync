@@ -1,0 +1,97 @@
+//! Platform-specific helpers for user and group identity lookups.
+
+#[cfg(all(unix, not(target_os = "android")))]
+use uzers::{get_group_by_name, get_user_by_name, gid_t as UsersGid, uid_t as UsersUid};
+
+#[cfg(all(unix, not(target_os = "android")))]
+#[allow(non_camel_case_types)]
+pub(crate) type gid_t = UsersGid;
+#[cfg(all(unix, not(target_os = "android")))]
+#[allow(non_camel_case_types)]
+pub(crate) type uid_t = UsersUid;
+
+#[cfg(any(not(unix), target_os = "android"))]
+#[allow(non_camel_case_types)]
+pub(crate) type gid_t = u32;
+#[cfg(any(not(unix), target_os = "android"))]
+#[allow(non_camel_case_types)]
+pub(crate) type uid_t = u32;
+
+/// Indicates whether the platform supports resolving user names.
+#[inline]
+pub(crate) const fn supports_user_name_lookup() -> bool {
+    cfg!(all(unix, not(target_os = "android")))
+}
+/// Indicates whether the platform supports resolving group names.
+#[inline]
+pub(crate) const fn supports_group_name_lookup() -> bool {
+    cfg!(all(unix, not(target_os = "android")))
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
+#[inline]
+pub(crate) fn lookup_user_by_name(name: &str) -> Option<uid_t> {
+    get_user_by_name(name).map(|user| user.uid())
+}
+
+#[cfg(any(not(unix), target_os = "android"))]
+#[inline]
+pub(crate) fn lookup_user_by_name(_name: &str) -> Option<uid_t> {
+    None
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
+#[inline]
+pub(crate) fn lookup_group_by_name(name: &str) -> Option<gid_t> {
+    get_group_by_name(name).map(|group| group.gid())
+}
+
+#[cfg(any(not(unix), target_os = "android"))]
+#[inline]
+pub(crate) fn lookup_group_by_name(_name: &str) -> Option<gid_t> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    use uzers::{get_current_gid, get_current_uid, get_group_by_gid, get_user_by_uid};
+
+    #[test]
+    fn support_flags_match_platform() {
+        assert_eq!(supports_user_name_lookup(), cfg!(all(unix, not(target_os = "android"))));
+        assert_eq!(supports_group_name_lookup(), cfg!(all(unix, not(target_os = "android"))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_lookup_round_trip_matches_current_identity() {
+        let uid = get_current_uid();
+        let user = get_user_by_uid(uid).expect("current user should exist");
+        let name = user.name().to_string_lossy().into_owned();
+        assert_eq!(lookup_user_by_name(&name), Some(uid));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn user_lookup_returns_none_on_non_unix() {
+        assert_eq!(lookup_user_by_name("any"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_lookup_round_trip_matches_current_identity() {
+        let gid = get_current_gid();
+        let group = get_group_by_gid(gid).expect("current group should exist");
+        let name = group.name().to_string_lossy().into_owned();
+        assert_eq!(lookup_group_by_name(&name), Some(gid));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn group_lookup_returns_none_on_non_unix() {
+        assert_eq!(lookup_group_by_name("any"), None);
+    }
+}

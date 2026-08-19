@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  pull_request:
+    paths:
+      - 'Formula/**'
+      - 'docs/**'
+      - '*.md'
+      - 'LICENSE'
+      - '.github/CODEOWNERS'
+      - '.github/dependabot.yml'
+      - '.github/FUNDING.yml'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - '.github/RELEASE_NOTES_BETA.md'
+      - '.github/RELEASE_TEMPLATE.md'
+      - '.github/release.yml'
+      - '.github/scripts/**'
+      - 'scripts/**'
+      - 'packaging/**'
+      - 'dist-workspace.toml'
+      - '.dockerignore'
+      - '.gitignore'
+      - '.gitattributes'
+      - 'deny.toml'
+      # Workflow-only changes need the same stand-in contexts. Without this, a
+      # pull request touching only a workflow matches neither ci.yml's paths
+      # nor this list, so none of the required checks ever report and the pull
+      # request can never become mergeable. The negations are exactly the files
+      # ci.yml itself watches: those changes run the real matrix, and letting
+      # both workflows fire would publish two check runs per required context.
+      - '.github/workflows/**'
+      - '!.github/workflows/ci.yml'
+      - '!.github/workflows/_test-features.yml'
+      - '!.github/workflows/_interop.yml'
+      - '!.github/workflows/_interop-macos.yml'
+      - '!.github/workflows/_interop-windows.yml'
+      - '!.github/workflows/_upstream-testsuite.yml'
+
+concurrency:
+  group: ci-skip-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Skipped — no code changes"
+
+  test:
+    name: nextest (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Skipped — no code changes"
+
+  windows-test:
+    name: Windows (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Skipped — no code changes"
+
+  macos-test:
+    name: macOS (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Skipped — no code changes"
+
+  musl-test:
+    name: Linux musl (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Skipped — no code changes"
+
+  interop:
+    name: interop
+    uses: ./.github/workflows/_ci-skip-interop.yml
+
+  interop-macos:
+    name: interop (macOS)
+    uses: ./.github/workflows/_ci-skip-interop-macos.yml
+
+  interop-windows:
+    name: interop (Windows, best-effort)
+    uses: ./.github/workflows/_ci-skip-interop-windows.yml
+
+  upstream-testsuite:
+    uses: ./.github/workflows/_ci-skip-upstream-testsuite.yml

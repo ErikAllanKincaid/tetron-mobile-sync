@@ -1,0 +1,178 @@
+//! Daemon-side filter rules applied from `daemon_filter_rules`. Verifies
+//! that the receiver builds a `FilterSet` from the wire-format rules
+//! prepended at daemon negotiation time and that include/exclude,
+//! anchored, and pure-exclude patterns match upstream rsync semantics.
+
+use super::super::super::ReceiverContext;
+use super::super::support::{test_config, test_handshake};
+
+#[test]
+fn daemon_filter_set_empty_when_no_rules() {
+    let handshake = test_handshake();
+    let config = test_config();
+    let ctx = ReceiverContext::new_for_test(&handshake, config);
+    assert!(ctx.daemon_filter_set().is_none());
+}
+
+#[test]
+fn daemon_filter_set_built_from_config_rules() {
+    use protocol::filters::{FilterRuleWireFormat, RuleType};
+
+    let handshake = test_handshake();
+    let mut config = test_config();
+    config.daemon_filter_rules = vec![FilterRuleWireFormat {
+        rule_type: RuleType::Exclude,
+        pattern: "*.tmp".into(),
+        ..FilterRuleWireFormat::default()
+    }];
+    let ctx = ReceiverContext::new_for_test(&handshake, config);
+
+    let filters = ctx.daemon_filter_set();
+    assert!(
+        filters.is_some(),
+        "daemon filter set should be built from rules"
+    );
+
+    let filters = filters.unwrap();
+    assert!(
+        !filters.allows(std::path::Path::new("test.tmp"), false),
+        "*.tmp should be excluded by daemon filter"
+    );
+    // *.txt should be allowed (no matching rule)
+    assert!(
+        filters.allows(std::path::Path::new("test.txt"), false),
+        "*.txt should be allowed through daemon filter"
+    );
+}
+
+#[test]
+fn daemon_filter_set_include_and_exclude() {
+    use protocol::filters::{FilterRuleWireFormat, RuleType};
+
+    let handshake = test_handshake();
+    let mut config = test_config();
+    config.daemon_filter_rules = vec![
+        FilterRuleWireFormat {
+            rule_type: RuleType::Include,
+            pattern: "*.rs".into(),
+            ..FilterRuleWireFormat::default()
+        },
+        FilterRuleWireFormat {
+            rule_type: RuleType::Exclude,
+            pattern: "*".into(),
+            ..FilterRuleWireFormat::default()
+        },
+    ];
+    let ctx = ReceiverContext::new_for_test(&handshake, config);
+
+    let filters = ctx.daemon_filter_set().unwrap();
+    // *.rs should be included (explicit include before wildcard exclude)
+    assert!(
+        filters.allows(std::path::Path::new("main.rs"), false),
+        "*.rs should be included by daemon filter"
+    );
+    // *.txt should be excluded (wildcard exclude)
+    assert!(
+        !filters.allows(std::path::Path::new("readme.txt"), false),
+        "*.txt should be excluded by daemon filter"
+    );
+}
+
+#[test]
+fn daemon_filter_set_anchored_pattern() {
+    use protocol::filters::{FilterRuleWireFormat, RuleType};
+
+    let handshake = test_handshake();
+    let mut config = test_config();
+    config.daemon_filter_rules = vec![FilterRuleWireFormat {
+        rule_type: RuleType::Exclude,
+        pattern: "/secret".into(),
+        anchored: true,
+        ..FilterRuleWireFormat::default()
+    }];
+    let ctx = ReceiverContext::new_for_test(&handshake, config);
+
+    let filters = ctx.daemon_filter_set().unwrap();
+    // /secret should be excluded (anchored)
+    assert!(
+        !filters.allows(std::path::Path::new("secret"), false),
+        "anchored /secret should be excluded"
+    );
+    // nested/secret should be allowed (anchored patterns only match at root)
+    assert!(
+        filters.allows(std::path::Path::new("nested/secret"), false),
+        "nested/secret should be allowed (anchored only matches root)"
+    );
+}
+
+#[test]
+fn daemon_filter_rules_prepended_to_receiver_deletion_chain() {
+    // Verify that daemon_filter_rules from config are prepended to
+    // wire rules when building the filter chain for deletion.
+    // This is tested indirectly by verifying the daemon_filter_set
+    // is available and that the setup_transfer code path handles
+    // the daemon_filter_rules field.
+    use protocol::filters::{FilterRuleWireFormat, RuleType};
+
+    let handshake = test_handshake();
+    let mut config = test_config();
+    config.daemon_filter_rules = vec![FilterRuleWireFormat {
+        rule_type: RuleType::Exclude,
+        pattern: "secret_*".into(),
+        ..FilterRuleWireFormat::default()
+    }];
+    let ctx = ReceiverContext::new_for_test(&handshake, config);
+
+    let filters = ctx.daemon_filter_set().unwrap();
+    assert!(
+        !filters.allows(std::path::Path::new("secret_data.bin"), false),
+        "secret_data.bin should be excluded by daemon filter"
+    );
+    assert!(
+        filters.allows(std::path::Path::new("public_data.bin"), false),
+        "public_data.bin should be allowed through daemon filter"
+    );
+}
+
+/// Upstream reports a refused directory once and then sets `skip_dir`, so every
+/// entry below it leaves `recv_generator()` before the filter check is reached
+/// (`generator.c:1258-1266`). The ancestor probe reproduces that: it is what
+/// keeps oc from emitting a second "daemon refused" line - one upstream never
+/// prints - for each file inside an already-refused directory.
+#[test]
+fn refused_directory_swallows_its_contents_without_a_second_report() {
+    use protocol::filters::{FilterRuleWireFormat, RuleType};
+
+    use crate::receiver::daemon_filter_refuses_ancestor;
+
+    let handshake = test_handshake();
+    let mut config = test_config();
+    config.daemon_filter_rules = vec![FilterRuleWireFormat {
+        rule_type: RuleType::Exclude,
+        pattern: "*.secret".into(),
+        ..FilterRuleWireFormat::default()
+    }];
+    let ctx = ReceiverContext::new_for_test(&handshake, config);
+    let filters = ctx.daemon_filter_set().unwrap();
+
+    assert!(
+        daemon_filter_refuses_ancestor(filters, "dir.secret/inner.txt"),
+        "a file under a refused directory is dropped silently, not reported again"
+    );
+    assert!(
+        daemon_filter_refuses_ancestor(filters, "dir.secret/deep/inner.txt"),
+        "the skip applies at every depth below the refused directory"
+    );
+    assert!(
+        !daemon_filter_refuses_ancestor(filters, "sub/nested.secret"),
+        "the entry's own name is the outer refusal's business, not the ancestor probe's"
+    );
+    assert!(
+        !daemon_filter_refuses_ancestor(filters, "top.secret"),
+        "a top-level entry has no ancestor to inherit a refusal from"
+    );
+    assert!(
+        !daemon_filter_refuses_ancestor(filters, "sub/fine.txt"),
+        "an allowed tree must not be swallowed"
+    );
+}

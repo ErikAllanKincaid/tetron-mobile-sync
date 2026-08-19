@@ -1,0 +1,154 @@
+//! Network and remote shell arguments: rsh, rsync-path, connect-program, port,
+//! remote-option, protect-args, old-args, ipv4/ipv6, address, and max-alloc.
+
+use super::{Arg, ArgAction, ClapCommand, OsStringValueParser};
+
+/// Adds network, remote shell, and connection flags to the command.
+pub(super) fn add_network_args(command: ClapCommand) -> ClapCommand {
+    let command = command
+        .arg(
+            Arg::new("rsh")
+                .long("rsh")
+                .short('e')
+                .value_name("COMMAND")
+                .help("Use remote shell COMMAND for remote transfers.")
+                .num_args(1)
+                .action(ArgAction::Set)
+                .value_parser(OsStringValueParser::new()),
+        )
+        .arg(
+            Arg::new("rsync-path")
+                .long("rsync-path")
+                .value_name("PROGRAM")
+                .help("Use PROGRAM as the remote rsync executable during remote transfers.")
+                .num_args(1)
+                .action(ArgAction::Set)
+                .value_parser(OsStringValueParser::new()),
+        )
+        .arg(
+            Arg::new("connect-program")
+                .long("connect-program")
+                .help_heading("oc-rsync extensions")
+                .value_name("COMMAND")
+                .help(
+                    "CLI equivalent of the RSYNC_CONNECT_PROG environment variable, which oc-rsync also honors (%H = host, %P = port). Runs COMMAND to reach rsync:// daemons; not a remote shell.",
+                )
+                .num_args(1)
+                .action(ArgAction::Set)
+                .allow_hyphen_values(true)
+                .value_parser(OsStringValueParser::new()),
+        )
+        .arg(
+            Arg::new("port")
+                .long("port")
+                .value_name("PORT")
+                .help("Use PORT as the default rsync:// daemon TCP port when none is specified.")
+                .num_args(1)
+                .action(ArgAction::Set)
+                .value_parser(clap::value_parser!(u16)),
+        )
+        .arg(
+            Arg::new("remote-option")
+                .long("remote-option")
+                .short('M')
+                .value_name("OPTION")
+                .help("Forward OPTION to the remote rsync command.")
+                .action(ArgAction::Append)
+                .num_args(1)
+                .allow_hyphen_values(true)
+                .value_parser(OsStringValueParser::new()),
+        )
+        .arg(
+            Arg::new("protect-args")
+                .long("protect-args")
+                .short('s')
+                .alias("secluded-args")
+                .help("Protect remote shell arguments from expansion.")
+                .action(ArgAction::SetTrue)
+                .overrides_with("no-protect-args"),
+        )
+        .arg(
+            Arg::new("no-protect-args")
+                .long("no-protect-args")
+                .visible_alias("no-s")
+                .alias("no-secluded-args")
+                .help("Allow the remote shell to expand wildcard arguments.")
+                .action(ArgAction::SetTrue)
+                .overrides_with("protect-args"),
+        )
+        .arg(
+            Arg::new("old-args")
+                .long("old-args")
+                .help("Use old-style argument handling (pre-3.2.4 behavior).")
+                // upstream: options.c:1642 OPT_OLD_ARGS - each `--old-args`
+                // increments `old_style_args` (level 1 = skip filename escaping,
+                // level 2 = skip all safe_arg escaping), so this is a counter.
+                .action(ArgAction::Count)
+                .overrides_with("no-old-args"),
+        )
+        .arg(
+            Arg::new("no-old-args")
+                .long("no-old-args")
+                .help("Use new-style argument handling (default).")
+                .action(ArgAction::SetTrue)
+                .overrides_with("old-args"),
+        )
+        .arg(
+            Arg::new("ipv4")
+                .long("ipv4")
+                .short('4')
+                .help("Prefer IPv4 when contacting remote hosts.")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("ipv6"),
+        )
+        .arg(
+            Arg::new("ipv6")
+                .long("ipv6")
+                .short('6')
+                .help("Prefer IPv6 when contacting remote hosts.")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("ipv4"),
+        )
+        .arg(
+            Arg::new("address")
+                .long("address")
+                .value_name("ADDRESS")
+                .help("Bind outgoing connections to ADDRESS when contacting remotes.")
+                .value_parser(OsStringValueParser::new()),
+        )
+        .arg(
+            Arg::new("max-alloc")
+                .long("max-alloc")
+                .value_name("SIZE")
+                .help(
+                    "Cap memory allocation at SIZE bytes. Supports K, M, G, T, P, E (powers of 1024), KB/MB/GB (powers of 1000), and KiB/MiB/GiB (explicit binary). Default 1G; zero is rejected.",
+                )
+                .num_args(1)
+                .value_parser(OsStringValueParser::new()),
+        );
+
+    // The `--quic`/`--quic-ca` modifiers (oc extension) upgrade a daemon target
+    // to the QUIC transport. They are recognised in every build - hidden from
+    // help when the `quic` feature is absent - so a default build can reject
+    // them with an actionable "requires the 'quic' feature" diagnostic (via
+    // `check_quic_feature`) instead of a bare "unknown option".
+    let quic_unavailable = cfg!(not(feature = "quic"));
+    command
+        .arg(
+            Arg::new("quic")
+                .long("quic")
+                .help("Carry the rsync daemon protocol over QUIC (873/udp); hard-fails if QUIC cannot be established.")
+                .hide(quic_unavailable)
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("quic-ca")
+                .long("quic-ca")
+                .value_name("PATH")
+                .help("Verify the QUIC daemon certificate against the CA bundle in PATH (PEM) instead of the system trust store.")
+                .hide(quic_unavailable)
+                .num_args(1)
+                .action(ArgAction::Set)
+                .value_parser(OsStringValueParser::new()),
+        )
+}

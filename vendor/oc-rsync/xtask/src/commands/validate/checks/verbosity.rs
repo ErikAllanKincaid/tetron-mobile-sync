@@ -1,0 +1,253 @@
+//! Verbose stdout parity across `-v`, `-vv`, and `-vvv` on every transport.
+//!
+//! Builds a tiny tree, pulls it with each client over every transport at all
+//! three verbosity levels, and asserts oc-rsync reproduces upstream's stable
+//! user-facing core. Upstream rsync is the ground truth.
+//!
+//! Only the stable core is compared: the "incremental file list" banner, the
+//! transferred-name lines (each source relative path, plus the `.`/`./` root),
+//! and the statistics summary. Volatile numerics inside those kept lines (byte
+//! counts, offsets, checksums, rates) are neutralized first - digit runs
+//! collapse to a placeholder - so timing and size jitter carry no weight.
+//!
+//! Everything else is dropped. `-vv` and `-vvv` only add implementation-specific
+//! diagnostics (connection traces like `opening connection using: ssh ...`,
+//! role-prefixed debug like `[sender] make_file(...)`, internal notes), which no
+//! independent implementation reproduces byte-for-byte. Ignoring them lets all
+//! three levels be exercised while the stable core must still match upstream at
+//! every level; a spurious extra name line (e.g. oc emitting `./` when upstream
+//! does not) is a real divergence the check still catches, because `.`/`./` name
+//! lines are kept.
+
+use std::path::Path;
+
+use crate::commands::validate::comparison::{self, VolatileNormalizer};
+use crate::commands::validate::support;
+use crate::commands::validate::transport::{Transport, pull_into};
+use crate::commands::validate::{Check, CheckOutcome, ValidateCtx};
+
+/// The verbose-output parity check.
+pub struct Verbosity;
+
+/// Verbosity levels exercised, one matrix cell each. Every level must reproduce
+/// the same stable core; `-vv`/`-vvv` only add ignored diagnostics on top.
+const LEVELS: &[&str] = &["-v", "-vv", "-vvv"];
+
+/// Base flags shared by every cell; the level is appended per run.
+const BASE_FLAGS: &[&str] = &["-rlptgoD", "--numeric-ids"];
+
+impl Check for Verbosity {
+    fn name(&self) -> &'static str {
+        "verbosity"
+    }
+
+    fn run(&self, ctx: &ValidateCtx) -> Vec<CheckOutcome> {
+        let root = ctx.work.join("verbosity");
+        let src = root.join("src");
+        // Shared fixture backdates the src root too, so the top `./` itemize row
+        // is deterministic; a local copy that stamped only the entries left the
+        // root at "now", racing the freshly-created dst root and intermittently
+        // dropping `./` from one client's output.
+        if let Err(e) = support::build_backdated_tree(&src) {
+            return vec![CheckOutcome::skip(self.name(), "fixture", e)];
+        }
+        let expected = support::entry_count(&src);
+        let names: std::collections::HashSet<String> = support::rel_entries(&src)
+            .iter()
+            .map(|entry| entry.to_string_lossy().to_string())
+            .collect();
+
+        let mut outcomes = Vec::new();
+        for &transport in ctx.transports {
+            for level in LEVELS {
+                outcomes.push(self.cell(ctx, transport, &root, level, expected, &names));
+            }
+        }
+        outcomes
+    }
+}
+
+impl Verbosity {
+    fn cell(
+        &self,
+        ctx: &ValidateCtx,
+        transport: Transport,
+        root: &Path,
+        level: &str,
+        expected: usize,
+        names: &std::collections::HashSet<String>,
+    ) -> CheckOutcome {
+        let src = root.join("src");
+        let label = transport.label();
+        let cell = format!("{label} {level}");
+        if transport.needs_ssh() && !support::ssh_ready() {
+            return CheckOutcome::skip(self.name(), cell, "no sshd on localhost:22");
+        }
+
+        let flags: Vec<String> = BASE_FLAGS
+            .iter()
+            .chain(std::iter::once(&level))
+            .map(|s| s.to_string())
+            .collect();
+        let slug = level.trim_start_matches('-');
+        let oc_dst = root.join(format!("oc-{label}-{slug}"));
+        let up_dst = root.join(format!("up-{label}-{slug}"));
+
+        let up = match pull_into(
+            transport.for_upstream(),
+            ctx.upstream,
+            ctx.upstream,
+            &src,
+            &up_dst,
+            &flags,
+            ctx.work,
+        ) {
+            Ok(out) if out.status.success() => out,
+            other => return comparison::classify_failure(self.name(), &cell, "upstream", other),
+        };
+        let oc = match pull_into(
+            transport,
+            ctx.oc,
+            ctx.upstream,
+            &src,
+            &oc_dst,
+            &flags,
+            ctx.work,
+        ) {
+            Ok(out) if out.status.success() => out,
+            other => return comparison::classify_failure(self.name(), &cell, "oc", other),
+        };
+
+        // Genuine-result guard: both trees must be fully populated.
+        if support::entry_count(&up_dst) != expected || support::entry_count(&oc_dst) != expected {
+            return CheckOutcome::fail(self.name(), cell, "destination entry count != source");
+        }
+
+        let oc_core = stable_core(&String::from_utf8_lossy(&oc.stdout), names);
+        let up_core = stable_core(&String::from_utf8_lossy(&up.stdout), names);
+
+        if oc_core != up_core {
+            if ctx.verbose {
+                eprintln!(
+                    "[verbosity/{cell}] oc={oc_core:?}\n[verbosity/{cell}] upstream={up_core:?}"
+                );
+            }
+            if let Some((i, a, b)) = comparison::first_line_diff(&oc_core, &up_core) {
+                return CheckOutcome::fail(
+                    self.name(),
+                    cell,
+                    format!("line {i}: oc {a:?} vs upstream {b:?}"),
+                );
+            }
+            return CheckOutcome::fail(self.name(), cell, "verbose stdout differs");
+        }
+        CheckOutcome::pass(self.name(), cell)
+    }
+}
+
+/// Reduce verbose stdout to its stable user-facing core for equality comparison.
+///
+/// Keeps only the non-empty, trimmed lines that a drop-in must reproduce at
+/// every verbosity level - the "incremental file list" banner, the transferred
+/// item names (each source relative path, plus the `.`/`./` root), and the
+/// statistics summary - and drops everything else. The dropped remainder is
+/// implementation-specific diagnostics that `-vv`/`-vvv` add: connection traces
+/// (`opening connection using: ssh ...`), role-prefixed debug (`[sender] ...`),
+/// and internal notes (`... make_file(...)`, `server_sender starting ...`).
+///
+/// Each kept line is normalized first, so volatile numerics inside it (byte
+/// counts, offsets, checksums, rates) collapse to a placeholder and carry no
+/// weight. `names` is the set of source relative-entry strings.
+pub fn stable_core(stdout: &str, names: &std::collections::HashSet<String>) -> Vec<String> {
+    let normalizer = VolatileNormalizer::rsync_verbose();
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && is_stable_core(line, names))
+        .map(|line| normalizer.normalize_line(line))
+        .collect()
+}
+
+/// True when a trimmed line belongs to the stable core kept by [`stable_core`].
+fn is_stable_core(line: &str, names: &std::collections::HashSet<String>) -> bool {
+    is_flist_banner(line) || is_transferred_name(line, names) || is_summary_line(line)
+}
+
+/// The file-list banner, e.g. `receiving incremental file list`.
+fn is_flist_banner(line: &str) -> bool {
+    line.contains("incremental file list")
+}
+
+/// A transferred-item line: the line with any single trailing `/` removed is the
+/// `.`/`./` root or a known source relative path. rsync prints the item's
+/// relative path at `-v`, so a spurious extra name (e.g. `./`) is caught here.
+fn is_transferred_name(line: &str, names: &std::collections::HashSet<String>) -> bool {
+    let stem = line.strip_suffix('/').unwrap_or(line);
+    stem == "." || stem == "./" || names.contains(stem)
+}
+
+/// A statistics/summary structural line (case-insensitive prefix match).
+fn is_summary_line(line: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "number of ",
+        "total ",
+        "file list ",
+        "sent ",
+        "total size",
+        "literal data",
+        "matched data",
+    ];
+    let lower = line.to_ascii_lowercase();
+    PREFIXES.iter().any(|prefix| lower.starts_with(prefix))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::stable_core;
+
+    #[test]
+    fn keeps_core_and_drops_diagnostics() {
+        let names: HashSet<String> = ["a.txt".to_string(), "sub/c.txt".to_string()]
+            .into_iter()
+            .collect();
+        // Banner, two names, and two summary lines survive; the `-vv`/`-vvv`
+        // connection trace and role-prefixed debug are dropped.
+        let out = "receiving incremental file list\n\
+                   opening connection using: ssh -l user host rsync --server\n\
+                   [sender] make_file(a.txt,*,2)\n\
+                   a.txt\n\
+                   sub/c.txt\n\
+                   Number of files: 5\n\
+                   sent 100 bytes  received 200 bytes  600.00 bytes/sec\n";
+        assert_eq!(
+            stable_core(out, &names),
+            vec![
+                "receiving incremental file list".to_string(),
+                "a.txt".to_string(),
+                "sub/c.txt".to_string(),
+                "Number of files: #".to_string(),
+                "sent #  received #  #/sec".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn spurious_dot_slash_name_diverges() {
+        let names: HashSet<String> = ["a.txt".to_string()].into_iter().collect();
+        let upstream = "receiving incremental file list\na.txt\n";
+        // oc emits an extra `./` the upstream did not: kept as a name line, so
+        // the two otherwise-equal cores differ.
+        let oc = "receiving incremental file list\n./\na.txt\n";
+        assert_ne!(stable_core(oc, &names), stable_core(upstream, &names));
+        assert_eq!(
+            stable_core(oc, &names),
+            vec![
+                "receiving incremental file list".to_string(),
+                "./".to_string(),
+                "a.txt".to_string(),
+            ]
+        );
+    }
+}

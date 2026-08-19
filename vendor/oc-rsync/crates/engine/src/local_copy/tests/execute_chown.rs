@@ -1,0 +1,722 @@
+
+#[cfg(unix)]
+#[test]
+fn execute_applies_owner_override() {
+    use rustix::fs::{AtFlags, chownat};
+    use std::os::unix::fs::MetadataExt;
+
+    if rustix::process::geteuid().as_raw() != 0 {
+        return;
+    }
+
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source.txt");
+    let destination = temp.path().join("dest.txt");
+    fs::write(&source, b"chown content").expect("write source");
+
+    let source_uid = 1234;
+    let source_gid = 5678;
+    chownat(
+        rustix::fs::CWD,
+        &source,
+        Some(unix_ids::uid(source_uid)),
+        Some(unix_ids::gid(source_gid)),
+        AtFlags::empty(),
+    )
+    .expect("assign source ownership");
+
+    let override_uid = 9999;
+    let operands = vec![
+        source.into_os_string(),
+        destination.clone().into_os_string(),
+    ];
+    let plan = LocalCopyPlan::from_operands(&operands).expect("plan");
+
+    let summary = plan
+        .execute_with_options(
+            LocalCopyExecution::Apply,
+            LocalCopyOptions::default().with_owner_override(Some(override_uid)),
+        )
+        .expect("copy succeeds");
+
+    let metadata = fs::metadata(&destination).expect("dest metadata");
+    assert_eq!(metadata.uid(), override_uid);
+    assert_eq!(summary.files_copied(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn execute_applies_group_override() {
+    use rustix::fs::{AtFlags, chownat};
+    use std::os::unix::fs::MetadataExt;
+
+    if rustix::process::geteuid().as_raw() != 0 {
+        return;
+    }
+
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source.txt");
+    let destination = temp.path().join("dest.txt");
+    fs::write(&source, b"chgrp content").expect("write source");
+
+    let source_uid = 1234;
+    let source_gid = 5678;
+    chownat(
+        rustix::fs::CWD,
+        &source,
+        Some(unix_ids::uid(source_uid)),
+        Some(unix_ids::gid(source_gid)),
+        AtFlags::empty(),
+    )
+    .expect("assign source ownership");
+
+    let override_gid = 8888;
+    let operands = vec![
+        source.into_os_string(),
+        destination.clone().into_os_string(),
+    ];
+    let plan = LocalCopyPlan::from_operands(&operands).expect("plan");
+
+    let summary = plan
+        .execute_with_options(
+            LocalCopyExecution::Apply,
+            LocalCopyOptions::default().with_group_override(Some(override_gid)),
+        )
+        .expect("copy succeeds");
+
+    let metadata = fs::metadata(&destination).expect("dest metadata");
+    assert_eq!(metadata.gid(), override_gid);
+    assert_eq!(summary.files_copied(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn execute_applies_both_owner_and_group_override() {
+    use rustix::fs::{AtFlags, chownat};
+    use std::os::unix::fs::MetadataExt;
+
+    if rustix::process::geteuid().as_raw() != 0 {
+        return;
+    }
+
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source.txt");
+    let destination = temp.path().join("dest.txt");
+    fs::write(&source, b"chown user:group content").expect("write source");
+
+    let source_uid = 1234;
+    let source_gid = 5678;
+    chownat(
+        rustix::fs::CWD,
+        &source,
+        Some(unix_ids::uid(source_uid)),
+        Some(unix_ids::gid(source_gid)),
+        AtFlags::empty(),
+    )
+    .expect("assign source ownership");
+
+    let override_uid = 9999;
+    let override_gid = 7777;
+    let operands = vec![
+        source.into_os_string(),
+        destination.clone().into_os_string(),
+    ];
+    let plan = LocalCopyPlan::from_operands(&operands).expect("plan");
+
+    let summary = plan
+        .execute_with_options(
+            LocalCopyExecution::Apply,
+            LocalCopyOptions::default()
+                .with_owner_override(Some(override_uid))
+                .with_group_override(Some(override_gid)),
+        )
+        .expect("copy succeeds");
+
+    let metadata = fs::metadata(&destination).expect("dest metadata");
+    assert_eq!(metadata.uid(), override_uid);
+    assert_eq!(metadata.gid(), override_gid);
+    assert_eq!(summary.files_copied(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn execute_owner_override_takes_precedence_over_preserve_owner() {
+    use rustix::fs::{AtFlags, chownat};
+    use std::os::unix::fs::MetadataExt;
+
+    if rustix::process::geteuid().as_raw() != 0 {
+        return;
+    }
+
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source.txt");
+    let destination = temp.path().join("dest.txt");
+    fs::write(&source, b"override precedence").expect("write source");
+
+    let source_uid = 1234;
+    chownat(
+        rustix::fs::CWD,
+        &source,
+        Some(unix_ids::uid(source_uid)),
+        None,
+        AtFlags::empty(),
+    )
+    .expect("assign source ownership");
+
+    let override_uid = 9999;
+    let operands = vec![
+        source.into_os_string(),
+        destination.clone().into_os_string(),
+    ];
+    let plan = LocalCopyPlan::from_operands(&operands).expect("plan");
+
+    let summary = plan
+        .execute_with_options(
+            LocalCopyExecution::Apply,
+            LocalCopyOptions::default()
+                .owner(true)
+                .with_owner_override(Some(override_uid)),
+        )
+        .expect("copy succeeds");
+
+    let metadata = fs::metadata(&destination).expect("dest metadata");
+    assert_eq!(
+        metadata.uid(),
+        override_uid,
+        "override should take precedence over preserve"
+    );
+    assert_ne!(metadata.uid(), source_uid);
+    assert_eq!(summary.files_copied(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn execute_group_override_takes_precedence_over_preserve_group() {
+    use rustix::fs::{AtFlags, chownat};
+    use std::os::unix::fs::MetadataExt;
+
+    if rustix::process::geteuid().as_raw() != 0 {
+        return;
+    }
+
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source.txt");
+    let destination = temp.path().join("dest.txt");
+    fs::write(&source, b"override precedence").expect("write source");
+
+    let source_gid = 5678;
+    chownat(
+        rustix::fs::CWD,
+        &source,
+        None,
+        Some(unix_ids::gid(source_gid)),
+        AtFlags::empty(),
+    )
+    .expect("assign source group");
+
+    let override_gid = 8888;
+    let operands = vec![
+        source.into_os_string(),
+        destination.clone().into_os_string(),
+    ];
+    let plan = LocalCopyPlan::from_operands(&operands).expect("plan");
+
+    let summary = plan
+        .execute_with_options(
+            LocalCopyExecution::Apply,
+            LocalCopyOptions::default()
+                .group(true)
+                .with_group_override(Some(override_gid)),
+        )
+        .expect("copy succeeds");
+
+    let metadata = fs::metadata(&destination).expect("dest metadata");
+    assert_eq!(
+        metadata.gid(),
+        override_gid,
+        "override should take precedence over preserve"
+    );
+    assert_ne!(metadata.gid(), source_gid);
+    assert_eq!(summary.files_copied(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn execute_applies_owner_override_to_directory() {
+    use rustix::fs::{AtFlags, chownat};
+    use std::os::unix::fs::MetadataExt;
+
+    if rustix::process::geteuid().as_raw() != 0 {
+        return;
+    }
+
+    let temp = tempdir().expect("tempdir");
+    let source_root = temp.path().join("source");
+    fs::create_dir_all(&source_root).expect("create source dir");
+
+    let source_uid = 1234;
+    let source_gid = 5678;
+    chownat(
+        rustix::fs::CWD,
+        &source_root,
+        Some(unix_ids::uid(source_uid)),
+        Some(unix_ids::gid(source_gid)),
+        AtFlags::empty(),
+    )
+    .expect("assign dir ownership");
+
+    let override_uid = 9999;
+    let dest_root = temp.path().join("dest");
+    let operands = vec![
+        source_root.into_os_string(),
+        dest_root.clone().into_os_string(),
+    ];
+    let plan = LocalCopyPlan::from_operands(&operands).expect("plan");
+
+    let summary = plan
+        .execute_with_options(
+            LocalCopyExecution::Apply,
+            LocalCopyOptions::default().with_owner_override(Some(override_uid)),
+        )
+        .expect("copy succeeds");
+
+    let metadata = fs::metadata(dest_root.join("source")).expect("dest metadata");
+    assert_eq!(metadata.uid(), override_uid);
+    assert!(summary.directories_created() >= 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn execute_applies_owner_override_to_symlink() {
+    use rustix::fs::{AtFlags, chownat};
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::symlink;
+
+    if rustix::process::geteuid().as_raw() != 0 {
+        return;
+    }
+
+    let temp = tempdir().expect("tempdir");
+    let source_root = temp.path().join("source");
+    fs::create_dir_all(&source_root).expect("create source dir");
+
+    let target_file = source_root.join("target.txt");
+    fs::write(&target_file, b"target content").expect("write target");
+
+    let symlink_path = source_root.join("link");
+    symlink("target.txt", &symlink_path).expect("create symlink");
+
+    let source_uid = 1234;
+    let source_gid = 5678;
+    chownat(
+        rustix::fs::CWD,
+        &symlink_path,
+        Some(unix_ids::uid(source_uid)),
+        Some(unix_ids::gid(source_gid)),
+        AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .expect("assign symlink ownership");
+
+    let override_uid = 9999;
+    let dest_root = temp.path().join("dest");
+    let operands = vec![
+        source_root.into_os_string(),
+        dest_root.clone().into_os_string(),
+    ];
+    let plan = LocalCopyPlan::from_operands(&operands).expect("plan");
+
+    let summary = plan
+        .execute_with_options(
+            LocalCopyExecution::Apply,
+            LocalCopyOptions::default()
+                .links(true)
+                .with_owner_override(Some(override_uid)),
+        )
+        .expect("copy succeeds");
+
+    let dest_link = dest_root.join("source").join("link");
+    let metadata = fs::symlink_metadata(&dest_link).expect("symlink metadata");
+    assert_eq!(metadata.uid(), override_uid);
+    assert!(summary.symlinks_copied() >= 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn execute_applies_group_override_to_multiple_files() {
+    use rustix::fs::{AtFlags, chownat};
+    use std::os::unix::fs::MetadataExt;
+
+    if rustix::process::geteuid().as_raw() != 0 {
+        return;
+    }
+
+    let temp = tempdir().expect("tempdir");
+    let source_root = temp.path().join("source");
+    fs::create_dir_all(&source_root).expect("create source dir");
+
+    let file1 = source_root.join("file1.txt");
+    let file2 = source_root.join("file2.txt");
+    fs::write(&file1, b"content1").expect("write file1");
+    fs::write(&file2, b"content2").expect("write file2");
+
+    let source_gid = 5678;
+    chownat(
+        rustix::fs::CWD,
+        &file1,
+        None,
+        Some(unix_ids::gid(source_gid)),
+        AtFlags::empty(),
+    )
+    .expect("assign file1 group");
+    chownat(
+        rustix::fs::CWD,
+        &file2,
+        None,
+        Some(unix_ids::gid(source_gid)),
+        AtFlags::empty(),
+    )
+    .expect("assign file2 group");
+
+    let override_gid = 8888;
+    let dest_root = temp.path().join("dest");
+    let operands = vec![
+        source_root.into_os_string(),
+        dest_root.clone().into_os_string(),
+    ];
+    let plan = LocalCopyPlan::from_operands(&operands).expect("plan");
+
+    let summary = plan
+        .execute_with_options(
+            LocalCopyExecution::Apply,
+            LocalCopyOptions::default().with_group_override(Some(override_gid)),
+        )
+        .expect("copy succeeds");
+
+    let dest1 = dest_root.join("source").join("file1.txt");
+    let dest2 = dest_root.join("source").join("file2.txt");
+    let metadata1 = fs::metadata(&dest1).expect("metadata1");
+    let metadata2 = fs::metadata(&dest2).expect("metadata2");
+
+    assert_eq!(metadata1.gid(), override_gid);
+    assert_eq!(metadata2.gid(), override_gid);
+    assert_eq!(summary.files_copied(), 2);
+}
+
+// GAP M8: upstream's `change_uid = am_root && ...` gate (rsync.c:526) applies
+// identically to `-o`/`-a` preserve and to an explicit `--chown`/`--usermap`
+// override - there is no "explicit overrides fail loud" path in upstream. A
+// non-root process must silently skip a uid chown it cannot perform and
+// finish the transfer, not surface the kernel's EPERM as a fatal error.
+#[cfg(unix)]
+#[test]
+fn execute_owner_override_without_privileges_is_skipped_not_fatal() {
+    use std::os::unix::fs::MetadataExt;
+
+    if rustix::process::geteuid().as_raw() == 0 {
+        return;
+    }
+
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source.txt");
+    let destination = temp.path().join("dest.txt");
+    fs::write(&source, b"unprivileged attempt").expect("write source");
+
+    let current_uid = fs::metadata(&source).expect("metadata").uid();
+    let different_uid = if current_uid == 0 { 1000 } else { 0 };
+
+    let operands = vec![
+        source.into_os_string(),
+        destination.clone().into_os_string(),
+    ];
+    let plan = LocalCopyPlan::from_operands(&operands).expect("plan");
+
+    let summary = plan
+        .execute_with_options(
+            LocalCopyExecution::Apply,
+            LocalCopyOptions::default().with_owner_override(Some(different_uid)),
+        )
+        .expect("a non-root --chown to an unreachable uid must be skipped, not fatal");
+
+    assert_eq!(summary.files_copied(), 1);
+    let dest_uid = fs::metadata(&destination).expect("dest metadata").uid();
+    assert_eq!(
+        dest_uid, current_uid,
+        "ownership must be unchanged when the chown was skipped for lack of privilege"
+    );
+}
+
+// GAP M8: upstream's `FLAG_SKIP_GROUP` gate (uidlist.c:284) applies
+// identically whether the target gid came from `-g`/`-a` preserve or an
+// explicit `--chown`/`--groupmap` override - a non-root process that is not a
+// member of the target group must skip the chgrp rather than fail.
+#[cfg(unix)]
+#[test]
+fn execute_group_override_to_non_member_group_without_privileges_is_skipped_not_fatal() {
+    use std::os::unix::fs::MetadataExt;
+
+    if rustix::process::geteuid().as_raw() == 0 {
+        return;
+    }
+
+    // Pick a gid the process is provably not a member of: neither its
+    // effective gid nor any supplementary group. A hardcoded "unlikely" gid is
+    // not robust on macOS/BSD, where the default group set and getgroups
+    // membership differ from Linux; probe the real group list via rustix
+    // (portable, no unsafe) instead.
+    let mut member_gids: Vec<u32> = rustix::process::getgroups()
+        .expect("getgroups")
+        .into_iter()
+        .map(|gid| gid.as_raw())
+        .collect();
+    member_gids.push(rustix::process::getegid().as_raw());
+    let foreign_gid = (1u32..=1_000_000)
+        .find(|candidate| !member_gids.contains(candidate))
+        .expect("must find a gid outside the process's groups");
+
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source.txt");
+    let destination = temp.path().join("dest.txt");
+    fs::write(&source, b"group test").expect("write source");
+
+    // Source and destination live in the same directory, so a plain copy
+    // leaves them with the same group (the process egid on Linux, the parent
+    // directory's group on macOS/BSD). With the chgrp skipped the destination
+    // keeps that natural group.
+    let original_gid = fs::metadata(&source).expect("metadata").gid();
+
+    let operands = vec![
+        source.into_os_string(),
+        destination.clone().into_os_string(),
+    ];
+    let plan = LocalCopyPlan::from_operands(&operands).expect("plan");
+
+    let summary = plan
+        .execute_with_options(
+            LocalCopyExecution::Apply,
+            LocalCopyOptions::default().with_group_override(Some(foreign_gid)),
+        )
+        .expect("a non-root chgrp to a non-member group must be skipped, not fatal");
+
+    assert_eq!(summary.files_copied(), 1);
+    let dest_gid = fs::metadata(&destination).expect("dest metadata").gid();
+    assert_ne!(
+        dest_gid, foreign_gid,
+        "the non-member group must never be applied - the chgrp must be skipped, not attempted"
+    );
+    assert_eq!(
+        dest_gid, original_gid,
+        "group must be unchanged when the chgrp was skipped for lack of privilege"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn execute_owner_override_only_leaves_group_unchanged() {
+    use rustix::fs::{AtFlags, chownat};
+    use std::os::unix::fs::MetadataExt;
+
+    if rustix::process::geteuid().as_raw() != 0 {
+        return;
+    }
+
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source.txt");
+    let destination = temp.path().join("dest.txt");
+    fs::write(&source, b"owner only").expect("write source");
+
+    let source_uid = 1234;
+    let source_gid = 5678;
+    chownat(
+        rustix::fs::CWD,
+        &source,
+        Some(unix_ids::uid(source_uid)),
+        Some(unix_ids::gid(source_gid)),
+        AtFlags::empty(),
+    )
+    .expect("assign source ownership");
+
+    let override_uid = 9999;
+    let operands = vec![
+        source.into_os_string(),
+        destination.clone().into_os_string(),
+    ];
+    let plan = LocalCopyPlan::from_operands(&operands).expect("plan");
+
+    let summary = plan
+        .execute_with_options(
+            LocalCopyExecution::Apply,
+            LocalCopyOptions::default().with_owner_override(Some(override_uid)),
+        )
+        .expect("copy succeeds");
+
+    let metadata = fs::metadata(&destination).expect("dest metadata");
+    assert_eq!(metadata.uid(), override_uid);
+    assert_ne!(
+        metadata.gid(),
+        source_gid,
+        "group should not be preserved when only owner override is set"
+    );
+    assert_eq!(summary.files_copied(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn execute_group_override_only_leaves_owner_unchanged() {
+    use rustix::fs::{AtFlags, chownat};
+    use std::os::unix::fs::MetadataExt;
+
+    if rustix::process::geteuid().as_raw() != 0 {
+        return;
+    }
+
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source.txt");
+    let destination = temp.path().join("dest.txt");
+    fs::write(&source, b"group only").expect("write source");
+
+    let source_uid = 1234;
+    let source_gid = 5678;
+    chownat(
+        rustix::fs::CWD,
+        &source,
+        Some(unix_ids::uid(source_uid)),
+        Some(unix_ids::gid(source_gid)),
+        AtFlags::empty(),
+    )
+    .expect("assign source ownership");
+
+    let override_gid = 8888;
+    let operands = vec![
+        source.into_os_string(),
+        destination.clone().into_os_string(),
+    ];
+    let plan = LocalCopyPlan::from_operands(&operands).expect("plan");
+
+    let summary = plan
+        .execute_with_options(
+            LocalCopyExecution::Apply,
+            LocalCopyOptions::default().with_group_override(Some(override_gid)),
+        )
+        .expect("copy succeeds");
+
+    let metadata = fs::metadata(&destination).expect("dest metadata");
+    assert_eq!(metadata.gid(), override_gid);
+    assert_ne!(
+        metadata.uid(),
+        source_uid,
+        "owner should not be preserved when only group override is set"
+    );
+    assert_eq!(summary.files_copied(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn execute_applies_owner_override_with_existing_destination() {
+    use rustix::fs::{AtFlags, chownat};
+    use std::os::unix::fs::MetadataExt;
+
+    if rustix::process::geteuid().as_raw() != 0 {
+        return;
+    }
+
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source.txt");
+    let destination = temp.path().join("dest.txt");
+    fs::write(&source, b"new content").expect("write source");
+    fs::write(&destination, b"old content").expect("write dest");
+    // Backdate destination to prevent quick-check skip (same size files)
+    let one_hour_ago = FileTime::from_system_time(
+        std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+    );
+    set_file_mtime(&destination, one_hour_ago).expect("backdate dest");
+
+    let existing_uid = 2000;
+    let existing_gid = 3000;
+    chownat(
+        rustix::fs::CWD,
+        &destination,
+        Some(unix_ids::uid(existing_uid)),
+        Some(unix_ids::gid(existing_gid)),
+        AtFlags::empty(),
+    )
+    .expect("assign dest ownership");
+
+    let override_uid = 9999;
+    let operands = vec![
+        source.into_os_string(),
+        destination.clone().into_os_string(),
+    ];
+    let plan = LocalCopyPlan::from_operands(&operands).expect("plan");
+
+    let summary = plan
+        .execute_with_options(
+            LocalCopyExecution::Apply,
+            LocalCopyOptions::default().with_owner_override(Some(override_uid)),
+        )
+        .expect("copy succeeds");
+
+    let metadata = fs::metadata(&destination).expect("dest metadata");
+    assert_eq!(
+        metadata.uid(),
+        override_uid,
+        "should override existing ownership"
+    );
+    assert_ne!(metadata.uid(), existing_uid);
+    assert_eq!(summary.files_copied(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn execute_applies_group_override_with_existing_destination() {
+    use rustix::fs::{AtFlags, chownat};
+    use std::os::unix::fs::MetadataExt;
+
+    if rustix::process::geteuid().as_raw() != 0 {
+        return;
+    }
+
+    let temp = tempdir().expect("tempdir");
+    let source = temp.path().join("source.txt");
+    let destination = temp.path().join("dest.txt");
+    fs::write(&source, b"new content").expect("write source");
+    fs::write(&destination, b"old content").expect("write dest");
+    // Backdate destination to prevent quick-check skip (same size files)
+    let one_hour_ago = FileTime::from_system_time(
+        std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+    );
+    set_file_mtime(&destination, one_hour_ago).expect("backdate dest");
+
+    let existing_uid = 2000;
+    let existing_gid = 3000;
+    chownat(
+        rustix::fs::CWD,
+        &destination,
+        Some(unix_ids::uid(existing_uid)),
+        Some(unix_ids::gid(existing_gid)),
+        AtFlags::empty(),
+    )
+    .expect("assign dest ownership");
+
+    let override_gid = 7777;
+    let operands = vec![
+        source.into_os_string(),
+        destination.clone().into_os_string(),
+    ];
+    let plan = LocalCopyPlan::from_operands(&operands).expect("plan");
+
+    let summary = plan
+        .execute_with_options(
+            LocalCopyExecution::Apply,
+            LocalCopyOptions::default().with_group_override(Some(override_gid)),
+        )
+        .expect("copy succeeds");
+
+    let metadata = fs::metadata(&destination).expect("dest metadata");
+    assert_eq!(
+        metadata.gid(),
+        override_gid,
+        "should override existing group"
+    );
+    assert_ne!(metadata.gid(), existing_gid);
+    assert_eq!(summary.files_copied(), 1);
+}

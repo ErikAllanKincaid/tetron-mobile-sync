@@ -1,0 +1,1307 @@
+use super::*;
+use std::io::{Cursor, Read, Write};
+use std::sync::{Arc, Mutex};
+
+use compress::algorithm::CompressionAlgorithm;
+
+#[test]
+fn server_reader_new_plain() {
+    let data = vec![1, 2, 3, 4, 5];
+    let reader = ServerReader::new_plain(Cursor::new(data));
+    assert!(!reader.is_multiplexed());
+}
+
+#[test]
+fn server_reader_activate_multiplex() {
+    let data = vec![1, 2, 3, 4, 5];
+    let reader = ServerReader::new_plain(Cursor::new(data));
+    let result = reader.activate_multiplex();
+    assert!(result.is_ok());
+    let multiplexed = result.unwrap();
+    assert!(multiplexed.is_multiplexed());
+}
+
+#[test]
+fn server_reader_activate_multiplex_twice_fails() {
+    let data = vec![1, 2, 3, 4, 5];
+    let reader = ServerReader::new_plain(Cursor::new(data));
+    let multiplexed = reader.activate_multiplex().unwrap();
+    let result = multiplexed.activate_multiplex();
+    assert!(result.is_err());
+    match result {
+        Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists),
+        Ok(_) => panic!("expected error"),
+    }
+}
+
+#[test]
+fn server_reader_is_multiplexed_plain() {
+    let data = vec![1, 2, 3, 4, 5];
+    let reader = ServerReader::new_plain(Cursor::new(data));
+    assert!(!reader.is_multiplexed());
+}
+
+#[test]
+fn server_reader_is_multiplexed_multiplex() {
+    let data = vec![1, 2, 3, 4, 5];
+    let reader = ServerReader::new_plain(Cursor::new(data))
+        .activate_multiplex()
+        .unwrap();
+    assert!(reader.is_multiplexed());
+}
+
+#[test]
+fn server_reader_plain_read() {
+    let data = vec![1, 2, 3, 4, 5];
+    let mut reader = ServerReader::new_plain(Cursor::new(data));
+    let mut buf = [0u8; 5];
+    let n = reader.read(&mut buf).unwrap();
+    assert_eq!(n, 5);
+    assert_eq!(buf, [1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn server_reader_plain_partial_read() {
+    let data = vec![1, 2, 3, 4, 5];
+    let mut reader = ServerReader::new_plain(Cursor::new(data));
+    let mut buf = [0u8; 3];
+    let n = reader.read(&mut buf).unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(buf, [1, 2, 3]);
+}
+
+#[test]
+fn server_reader_plain_empty_read() {
+    let data: Vec<u8> = vec![];
+    let mut reader = ServerReader::new_plain(Cursor::new(data));
+    let mut buf = [0u8; 5];
+    let n = reader.read(&mut buf).unwrap();
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn buffered_input_hint_plain_is_false() {
+    // A plain reader has no peekable frame buffer, so it always keeps the
+    // conservative pre-read flush.
+    let reader = ServerReader::new_plain(Cursor::new(vec![1u8, 2, 3]));
+    assert!(!reader.has_buffered_input());
+}
+
+#[test]
+fn buffered_input_hint_tracks_demuxed_frame() {
+    // has_buffered_input mirrors Read::read's short-circuit: it is true exactly
+    // while unconsumed demuxed payload remains, guaranteeing the next read is
+    // served from the buffer without touching the socket.
+    let mut stream = Vec::new();
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"hello").unwrap();
+    let mut reader = ServerReader::new_plain(Cursor::new(stream))
+        .activate_multiplex()
+        .unwrap();
+
+    // Nothing demuxed yet: the next read must go to the socket.
+    assert!(!reader.has_buffered_input());
+
+    // Read 2 of 5 payload bytes; 3 remain buffered.
+    let mut buf = [0u8; 2];
+    assert_eq!(reader.read(&mut buf).unwrap(), 2);
+    assert_eq!(&buf, b"he");
+    assert!(
+        reader.has_buffered_input(),
+        "unconsumed demuxed payload must report buffered input"
+    );
+
+    // Drain the rest; the buffer empties, so a further read would block again.
+    let mut rest = [0u8; 3];
+    assert_eq!(reader.read(&mut rest).unwrap(), 3);
+    assert_eq!(&rest, b"llo");
+    assert!(
+        !reader.has_buffered_input(),
+        "a drained frame buffer must report no buffered input"
+    );
+}
+
+#[test]
+fn server_reader_activate_compression_on_plain_fails() {
+    let data = vec![1, 2, 3, 4, 5];
+    let reader = ServerReader::new_plain(Cursor::new(data));
+    let result = reader.activate_compression(CompressionAlgorithm::Zlib);
+    assert!(result.is_err());
+    match result {
+        Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput),
+        Ok(_) => panic!("expected error"),
+    }
+}
+
+#[test]
+fn server_reader_activate_compression_on_multiplex_succeeds() {
+    let data = vec![1, 2, 3, 4, 5];
+    let reader = ServerReader::new_plain(Cursor::new(data))
+        .activate_multiplex()
+        .unwrap();
+    let result = reader.activate_compression(CompressionAlgorithm::Zlib);
+    assert!(result.is_ok());
+    let compressed = result.unwrap();
+    assert!(compressed.is_multiplexed());
+}
+
+#[test]
+fn server_reader_activate_compression_twice_fails() {
+    let data = vec![1, 2, 3, 4, 5];
+    let compressed = ServerReader::new_plain(Cursor::new(data))
+        .activate_multiplex()
+        .unwrap()
+        .activate_compression(CompressionAlgorithm::Zlib)
+        .unwrap();
+    let result = compressed.activate_compression(CompressionAlgorithm::Zlib);
+    assert!(result.is_err());
+    match result {
+        Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists),
+        Ok(_) => panic!("expected error"),
+    }
+}
+
+#[test]
+fn multiplex_reader_new() {
+    let data = vec![1, 2, 3, 4, 5];
+    let mux = MultiplexReader::new(Cursor::new(data));
+    assert!(mux.buffer.is_empty());
+    assert_eq!(mux.pos, 0);
+}
+
+#[test]
+fn multiplex_reader_buffered_read() {
+    let data = vec![];
+    let mut mux = MultiplexReader::new(Cursor::new(data));
+
+    // Manually populate the buffer as if we had read a message
+    mux.buffer = vec![10, 20, 30, 40, 50];
+    mux.pos = 0;
+
+    let mut buf = [0u8; 3];
+    let n = mux.read(&mut buf).unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(buf, [10, 20, 30]);
+    assert_eq!(mux.pos, 3);
+}
+
+#[test]
+fn multiplex_reader_buffered_read_complete() {
+    let data = vec![];
+    let mut mux = MultiplexReader::new(Cursor::new(data));
+
+    mux.buffer = vec![10, 20, 30];
+    mux.pos = 0;
+
+    let mut buf = [0u8; 5];
+    let n = mux.read(&mut buf).unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(&buf[..3], &[10, 20, 30]);
+    assert!(mux.buffer.is_empty());
+    assert_eq!(mux.pos, 0);
+}
+
+#[test]
+fn multiplex_reader_buffered_partial_read() {
+    let data = vec![];
+    let mut mux = MultiplexReader::new(Cursor::new(data));
+
+    mux.buffer = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    mux.pos = 2;
+
+    let mut buf = [0u8; 3];
+    let n = mux.read(&mut buf).unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(buf, [3, 4, 5]);
+    assert_eq!(mux.pos, 5);
+}
+
+#[test]
+fn multiplex_reader_accumulates_msg_io_error() {
+    // upstream: io.c:1542-1547
+    let mut stream = Vec::new();
+
+    let io_err_val: i32 = 1; // IOERR_GENERAL
+    protocol::send_msg(
+        &mut stream,
+        protocol::MessageCode::IoError,
+        &io_err_val.to_le_bytes(),
+    )
+    .unwrap();
+
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"hello").unwrap();
+
+    let io_err_val2: i32 = 2; // IOERR_VANISHED
+    protocol::send_msg(
+        &mut stream,
+        protocol::MessageCode::IoError,
+        &io_err_val2.to_le_bytes(),
+    )
+    .unwrap();
+
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"world").unwrap();
+
+    let mut mux = MultiplexReader::new(Cursor::new(stream));
+
+    let mut buf = [0u8; 5];
+    let n = mux.read(&mut buf).unwrap();
+    assert_eq!(n, 5);
+    assert_eq!(&buf, b"hello");
+
+    assert_eq!(mux.io_error, 1);
+
+    let n = mux.read(&mut buf).unwrap();
+    assert_eq!(n, 5);
+    assert_eq!(&buf, b"world");
+
+    // Both flags should be OR'd together: 1 | 2 = 3
+    assert_eq!(mux.io_error, 3);
+
+    let taken = mux.take_io_error();
+    assert_eq!(taken, 3);
+    assert_eq!(mux.io_error, 0);
+}
+
+#[test]
+fn multiplex_reader_io_error_wrong_payload_length_aborts() {
+    // A wrong-sized MSG_IO_ERROR is a stream-integrity violation: upstream jumps
+    // to invalid_msg and exit_cleanup(RERR_STREAMIO) (exit 12). Silently dropping
+    // it would lose the io_error flags the frame carries and desynchronise the
+    // demultiplexer, so the read must abort rather than deliver later data.
+    // upstream: io.c:1543 `if (msg_bytes != 4) goto invalid_msg;`
+    let mut stream = Vec::new();
+
+    protocol::send_msg(&mut stream, protocol::MessageCode::IoError, &[1, 0, 0]).unwrap();
+
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"ok").unwrap();
+
+    let mut mux = MultiplexReader::new(Cursor::new(stream));
+    let mut buf = [0u8; 2];
+    let err = mux
+        .read(&mut buf)
+        .expect_err("a malformed MSG_IO_ERROR frame must abort the stream");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        mux.io_error, 0,
+        "no io_error may be accumulated from a bad frame"
+    );
+}
+
+/// Feeds one `MSG_IO_ERROR` frame and returns what the reader accumulated.
+fn accumulate_one_msg_io_error(value: i32) -> i32 {
+    let mut stream = Vec::new();
+    protocol::send_msg(
+        &mut stream,
+        protocol::MessageCode::IoError,
+        &value.to_le_bytes(),
+    )
+    .unwrap();
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"x").unwrap();
+
+    let mut mux = MultiplexReader::new(Cursor::new(stream));
+    let mut buf = [0u8; 1];
+    assert_eq!(mux.read(&mut buf).unwrap(), 1);
+    mux.take_io_error()
+}
+
+/// A peer controls all 32 bits of the `MSG_IO_ERROR` payload. Upstream reduces
+/// the value to the defined bits at the read site, so undefined bits are never
+/// stored locally and never re-forwarded to the next hop.
+///
+/// upstream: io.c:1703-1710 - `val &= IOERR_VALID_MASK; io_error |= val;`
+#[test]
+fn msg_io_error_masks_undefined_bits_from_a_hostile_peer() {
+    use protocol::{IOERR_GENERAL, IOERR_VALID_MASK, IOERR_VANISHED};
+
+    // A value made entirely of undefined bits must accumulate to nothing.
+    assert_eq!(accumulate_one_msg_io_error(0x7fff_fff8), 0);
+    // Defined bits survive, undefined ones alongside them do not.
+    assert_eq!(accumulate_one_msg_io_error(-1), IOERR_VALID_MASK);
+    assert_eq!(
+        accumulate_one_msg_io_error(IOERR_VANISHED | 0x0100_0000),
+        IOERR_VANISHED
+    );
+    // The honest path is untouched.
+    assert_eq!(accumulate_one_msg_io_error(IOERR_GENERAL), IOERR_GENERAL);
+}
+
+/// CLASS-level guard: whatever 32-bit value a peer puts on the wire, the two
+/// consumers that the value steers - the delete-pass suppression guard
+/// (`io_error & IOERR_GENERAL`) and the exit-code mapping - must only ever see
+/// defined bits. Masking at one entry point but not the other is exactly the
+/// defect upstream fixed, so this asserts the property, not one call site.
+///
+/// upstream: rsync.h:195-200 (the mask's rationale), generator.c:304 (the
+/// delete guard), cleanup.c:213-218 (the exit-code mapping).
+#[test]
+fn no_peer_value_can_steer_the_delete_guard_or_exit_code_off_the_defined_bits() {
+    use crate::generator::io_error_flags::to_exit_code;
+    use protocol::IOERR_VALID_MASK;
+
+    const DOCUMENTED_EXIT_CODES: [i32; 4] = [0, 23, 24, 25];
+
+    for value in [
+        -1,
+        i32::MIN,
+        i32::MAX,
+        0x7fff_fff8,
+        42,
+        0x0100_0000,
+        0x0000_0008,
+    ] {
+        let accumulated = accumulate_one_msg_io_error(value);
+        assert_eq!(
+            accumulated & !IOERR_VALID_MASK,
+            0,
+            "undefined bits reached local io_error from wire value {value:#x}"
+        );
+        assert!(
+            DOCUMENTED_EXIT_CODES.contains(&to_exit_code(accumulated)),
+            "wire value {value:#x} produced an undocumented exit code"
+        );
+        assert_eq!(
+            accumulated,
+            value & IOERR_VALID_MASK,
+            "the surviving bits must be exactly the masked wire value"
+        );
+    }
+}
+
+#[test]
+fn server_reader_take_io_error_plain_returns_zero() {
+    let mut reader = ServerReader::new_plain(Cursor::new(vec![]));
+    assert_eq!(reader.take_io_error(), 0);
+}
+
+/// The receiver folds a sender's MSG_IO_ERROR into its exit-code io_error so a
+/// remote pull that loses a source file mid-transfer reports the right code:
+/// IOERR_VANISHED -> 24, IOERR_GENERAL -> 23. This is the value the receiver
+/// transfer path ORs via `stats.io_error |= reader.take_io_error()`.
+/// upstream: io.c:1707 `io_error |= val`; log.c `log_exit` maps to RERR_*.
+#[test]
+fn server_reader_io_error_drives_receiver_exit_code() {
+    use crate::generator::io_error_flags::{IOERR_GENERAL, IOERR_VANISHED, to_exit_code};
+
+    for (bits, expected) in [(IOERR_VANISHED, 24), (IOERR_GENERAL, 23)] {
+        let mut stream = Vec::new();
+        protocol::send_msg(
+            &mut stream,
+            protocol::MessageCode::IoError,
+            &bits.to_le_bytes(),
+        )
+        .unwrap();
+        protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"x").unwrap();
+
+        let mut reader = ServerReader::new_plain(Cursor::new(stream))
+            .activate_multiplex()
+            .unwrap();
+        let mut buf = [0u8; 1];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(&buf, b"x");
+
+        assert_eq!(to_exit_code(reader.take_io_error()), expected);
+    }
+}
+
+#[test]
+fn server_reader_take_io_error_multiplex_accumulates() {
+    let mut stream = Vec::new();
+    let io_err: i32 = 1; // IOERR_GENERAL
+    protocol::send_msg(
+        &mut stream,
+        protocol::MessageCode::IoError,
+        &io_err.to_le_bytes(),
+    )
+    .unwrap();
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"data").unwrap();
+
+    let mut reader = ServerReader::new_plain(Cursor::new(stream))
+        .activate_multiplex()
+        .unwrap();
+
+    let mut buf = [0u8; 4];
+    let n = reader.read(&mut buf).unwrap();
+    assert_eq!(n, 4);
+    assert_eq!(&buf, b"data");
+
+    let io_error = reader.take_io_error();
+    assert_eq!(io_error, 1);
+
+    assert_eq!(reader.take_io_error(), 0);
+}
+
+#[test]
+fn msg_io_error_round_trip_through_multiplex_layer() {
+    // Verifies the full MSG_IO_ERROR round-trip:
+    // 1. Sender writes MSG_IO_ERROR via multiplex writer
+    // 2. Receiver reads it via multiplex reader (accumulates flags)
+    // 3. Receiver forwards accumulated flags via multiplex writer
+    // 4. Generator receives the forwarded MSG_IO_ERROR
+    //
+    // upstream: io.c:1542-1549
+    use crate::io_error_flags;
+    use protocol::{MessageCode, MplexWriter};
+    use std::io::Write;
+
+    // Step 1: Build a wire stream with two MSG_IO_ERROR messages
+    let mut wire = Vec::new();
+    {
+        let mut writer = MplexWriter::new(&mut wire);
+
+        let flags1 = io_error_flags::IOERR_GENERAL;
+        writer
+            .write_message(MessageCode::IoError, &flags1.to_le_bytes())
+            .unwrap();
+        writer.write_all(b"part1").unwrap();
+        writer.flush().unwrap();
+
+        let flags2 = io_error_flags::IOERR_VANISHED;
+        writer
+            .write_message(MessageCode::IoError, &flags2.to_le_bytes())
+            .unwrap();
+        writer.write_all(b"part2").unwrap();
+        writer.flush().unwrap();
+    }
+
+    // Step 2: Receiver reads through the stream
+    let mut reader = MultiplexReader::new(Cursor::new(wire));
+    let mut buf = [0u8; 5];
+
+    let n = reader.read(&mut buf).unwrap();
+    assert_eq!(n, 5);
+    assert_eq!(&buf, b"part1");
+
+    let first = reader.take_io_error();
+    assert_eq!(first, io_error_flags::IOERR_GENERAL);
+
+    let n = reader.read(&mut buf).unwrap();
+    assert_eq!(n, 5);
+    assert_eq!(&buf, b"part2");
+
+    let second = reader.take_io_error();
+    assert_eq!(second, io_error_flags::IOERR_VANISHED);
+
+    let combined = first | second;
+    assert_eq!(
+        combined,
+        io_error_flags::IOERR_GENERAL | io_error_flags::IOERR_VANISHED
+    );
+
+    // Step 3: Receiver forwards the accumulated io_error to the generator
+    let mut forward_wire = Vec::new();
+    {
+        let mut fwd_writer = MplexWriter::new(&mut forward_wire);
+        fwd_writer
+            .write_message(MessageCode::IoError, &combined.to_le_bytes())
+            .unwrap();
+    }
+
+    // Step 4: Generator receives the forwarded MSG_IO_ERROR
+    let mut fwd_cursor = Cursor::new(forward_wire);
+    let frame = protocol::recv_msg(&mut fwd_cursor).unwrap();
+    assert_eq!(frame.code(), MessageCode::IoError);
+    assert_eq!(frame.payload().len(), 4);
+    let forwarded_flags = i32::from_le_bytes(frame.payload().try_into().unwrap());
+    assert_eq!(
+        forwarded_flags,
+        io_error_flags::IOERR_GENERAL | io_error_flags::IOERR_VANISHED
+    );
+
+    let exit_code = io_error_flags::to_exit_code(forwarded_flags);
+    assert_eq!(exit_code, multiplex::RERR_PARTIAL);
+}
+
+#[test]
+fn multiplex_reader_surfaces_each_msg_no_send_before_the_data_after_it() {
+    // The sender emits MSG_NO_SEND and moves straight on to the next file
+    // without answering, so the decline must INTERRUPT the read that awaits
+    // that file. Recording it and continuing to wait is an unconditional hang.
+    //
+    // Consecutive declines surface one per read, in order: a receiver awaits
+    // exactly one file at a time, so draining them together would report the
+    // first and silently strand the rest.
+    //
+    // upstream: io.c:1809-1818 - MSG_NO_SEND retires the entry on the generator
+    // upstream: sender.c:669,723,751 - each emitter `continue`s, writing no response
+    let mut stream = Vec::new();
+    let ndx1: i32 = 42;
+    protocol::send_msg(
+        &mut stream,
+        protocol::MessageCode::NoSend,
+        &ndx1.to_le_bytes(),
+    )
+    .unwrap();
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"hello").unwrap();
+    let ndx2: i32 = 99;
+    protocol::send_msg(
+        &mut stream,
+        protocol::MessageCode::NoSend,
+        &ndx2.to_le_bytes(),
+    )
+    .unwrap();
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"world").unwrap();
+
+    let mut mux = MultiplexReader::new(Cursor::new(stream));
+    let mut buf = [0u8; 5];
+
+    let err = mux
+        .read(&mut buf)
+        .expect_err("the first decline must surface, not be swallowed");
+    assert_eq!(declined_ndx(&err), 42);
+
+    // The decline is consumed, so the data behind it is now deliverable.
+    assert_eq!(mux.read(&mut buf).unwrap(), 5);
+    assert_eq!(&buf, b"hello");
+
+    let err = mux
+        .read(&mut buf)
+        .expect_err("the second decline must surface independently");
+    assert_eq!(declined_ndx(&err), 99);
+
+    assert_eq!(mux.read(&mut buf).unwrap(), 5);
+    assert_eq!(&buf, b"world");
+
+    // Each index is reported exactly once and leaves no residue behind.
+    assert!(mux.no_send_indices.is_empty());
+}
+
+/// Extracts the declined file index from a surfaced `MSG_NO_SEND` error,
+/// asserting the typed inner error survives the `io::Error` wrapper.
+fn declined_ndx(err: &std::io::Error) -> i32 {
+    err.get_ref()
+        .and_then(|inner| inner.downcast_ref::<multiplex::FileDeclinedError>())
+        .expect("inner FileDeclinedError must survive the io::Error wrapper")
+        .ndx
+}
+
+#[test]
+fn multiplex_reader_no_send_wrong_payload_length_aborts() {
+    // A wrong-sized MSG_NO_SEND is fatal upstream (invalid_msg ->
+    // exit_cleanup(RERR_STREAMIO)). Dropping it would lose the no-send file index
+    // the generator needs, so the read must abort instead of continuing.
+    // upstream: io.c:1640 `if (msg_bytes != 4) goto invalid_msg;`
+    let mut stream = Vec::new();
+
+    protocol::send_msg(&mut stream, protocol::MessageCode::NoSend, &[1, 0, 0]).unwrap();
+
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"ok").unwrap();
+
+    let mut mux = MultiplexReader::new(Cursor::new(stream));
+    let mut buf = [0u8; 2];
+    let err = mux
+        .read(&mut buf)
+        .expect_err("a malformed MSG_NO_SEND frame must abort the stream");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(mux.no_send_indices.is_empty());
+}
+
+#[test]
+fn server_reader_surfaces_msg_no_send_through_the_multiplex_arm() {
+    // The same contract must hold through `ServerReader`, which is the type
+    // the receiver actually reads from.
+    let mut stream = Vec::new();
+    let ndx: i32 = 7;
+    protocol::send_msg(
+        &mut stream,
+        protocol::MessageCode::NoSend,
+        &ndx.to_le_bytes(),
+    )
+    .unwrap();
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"data").unwrap();
+
+    let mut reader = ServerReader::new_plain(Cursor::new(stream))
+        .activate_multiplex()
+        .unwrap();
+
+    let mut buf = [0u8; 4];
+    let err = reader
+        .read(&mut buf)
+        .expect_err("the decline must surface through ServerReader too");
+    assert_eq!(declined_ndx(&err), 7);
+
+    assert_eq!(reader.read(&mut buf).unwrap(), 4);
+    assert_eq!(&buf, b"data");
+}
+
+#[test]
+fn multiplex_reader_accumulates_msg_redo() {
+    // upstream: io.c:1535-1540, receiver.c:1093-1097
+    let mut stream = Vec::new();
+
+    let ndx1: i32 = 5;
+    protocol::send_msg(
+        &mut stream,
+        protocol::MessageCode::Redo,
+        &ndx1.to_le_bytes(),
+    )
+    .unwrap();
+
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"chunk1").unwrap();
+
+    let ndx2: i32 = 17;
+    protocol::send_msg(
+        &mut stream,
+        protocol::MessageCode::Redo,
+        &ndx2.to_le_bytes(),
+    )
+    .unwrap();
+
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"chunk2").unwrap();
+
+    let mut mux = MultiplexReader::new(Cursor::new(stream));
+
+    let mut buf = [0u8; 6];
+    let n = mux.read(&mut buf).unwrap();
+    assert_eq!(n, 6);
+    assert_eq!(&buf, b"chunk1");
+
+    assert_eq!(mux.redo_indices, vec![5]);
+
+    let n = mux.read(&mut buf).unwrap();
+    assert_eq!(n, 6);
+    assert_eq!(&buf, b"chunk2");
+
+    assert_eq!(mux.redo_indices, vec![5, 17]);
+
+    let taken = mux.take_redo_indices();
+    assert_eq!(taken, vec![5, 17]);
+    assert!(mux.redo_indices.is_empty());
+}
+
+#[test]
+fn multiplex_reader_redo_wrong_payload_length_aborts() {
+    // A wrong-sized MSG_REDO is fatal upstream (invalid_msg ->
+    // exit_cleanup(RERR_STREAMIO)). Dropping it would lose the redo file index
+    // the generator must reprocess, so the read must abort instead of continuing.
+    // upstream: io.c:1536 `if (msg_bytes != 4 || !am_generator) goto invalid_msg;`
+    let mut stream = Vec::new();
+
+    protocol::send_msg(&mut stream, protocol::MessageCode::Redo, &[1, 0, 0]).unwrap();
+
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"ok").unwrap();
+
+    let mut mux = MultiplexReader::new(Cursor::new(stream));
+    let mut buf = [0u8; 2];
+    let err = mux
+        .read(&mut buf)
+        .expect_err("a malformed MSG_REDO frame must abort the stream");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(mux.redo_indices.is_empty());
+}
+
+#[test]
+fn server_reader_take_redo_indices_plain_returns_empty() {
+    let mut reader = ServerReader::new_plain(Cursor::new(vec![]));
+    assert!(reader.take_redo_indices().is_empty());
+}
+
+#[test]
+fn server_reader_take_redo_indices_multiplex_accumulates() {
+    let mut stream = Vec::new();
+    let ndx: i32 = 13;
+    protocol::send_msg(&mut stream, protocol::MessageCode::Redo, &ndx.to_le_bytes()).unwrap();
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"data").unwrap();
+
+    let mut reader = ServerReader::new_plain(Cursor::new(stream))
+        .activate_multiplex()
+        .unwrap();
+
+    let mut buf = [0u8; 4];
+    let n = reader.read(&mut buf).unwrap();
+    assert_eq!(n, 4);
+    assert_eq!(&buf, b"data");
+
+    let indices = reader.take_redo_indices();
+    assert_eq!(indices, vec![13]);
+
+    assert!(reader.take_redo_indices().is_empty());
+}
+
+#[test]
+fn multiplex_reader_redo_and_no_send_interleaved() {
+    // A redo index is still accumulated for later collection; only the
+    // no-send decline interrupts the read, because only it means a response
+    // the caller is waiting for will never arrive.
+    let mut stream = Vec::new();
+    let redo_ndx: i32 = 3;
+    protocol::send_msg(
+        &mut stream,
+        protocol::MessageCode::Redo,
+        &redo_ndx.to_le_bytes(),
+    )
+    .unwrap();
+    let no_send_ndx: i32 = 7;
+    protocol::send_msg(
+        &mut stream,
+        protocol::MessageCode::NoSend,
+        &no_send_ndx.to_le_bytes(),
+    )
+    .unwrap();
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"x").unwrap();
+
+    let mut mux = MultiplexReader::new(Cursor::new(stream));
+    let mut buf = [0u8; 1];
+
+    let err = mux.read(&mut buf).expect_err("the decline must surface");
+    assert_eq!(declined_ndx(&err), 7);
+    assert_eq!(mux.redo_indices, vec![3]);
+
+    assert_eq!(mux.read(&mut buf).unwrap(), 1);
+    assert_eq!(&buf, b"x");
+}
+
+#[test]
+fn multiplex_reader_batch_recorder_captures_demuxed_data() {
+    // Verify that the batch recorder captures post-demux MSG_DATA payloads.
+    // upstream: io.c:read_buf() tees data to batch_fd after demultiplexing.
+    let payload = b"hello batch reader";
+    let mut stream = Vec::new();
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, payload).unwrap();
+
+    let mut mux = MultiplexReader::new(Cursor::new(stream));
+    let recorder_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    mux.batch_recorder = Some(recorder_buf.clone());
+
+    let mut buf = vec![0u8; 64];
+    let n = mux.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], payload);
+
+    let recorded = recorder_buf.lock().unwrap();
+    assert_eq!(
+        &*recorded, payload,
+        "recorder should capture exact demuxed bytes"
+    );
+}
+
+#[test]
+fn multiplex_reader_batch_recorder_captures_try_borrow_exact() {
+    // try_borrow_exact is the zero-copy fast path used by literal-delta-token
+    // reads. Before the fix, this path bypassed the batch recorder, so
+    // --write-batch over SSH / daemon produced batch files missing every
+    // literal payload that fit inside a single MSG_DATA frame. The downstream
+    // --read-batch then failed with "Failed to read literal data (N bytes):
+    // failed to fill whole buffer" once the reader exhausted the truncated
+    // batch body. This regression test exercises the zero-copy path and
+    // asserts the bytes still reach the recorder.
+    let payload = b"zero-copy literal block";
+    let mut stream = Vec::new();
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, payload).unwrap();
+
+    let mut mux = MultiplexReader::new(Cursor::new(stream));
+    let recorder_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    mux.batch_recorder = Some(recorder_buf.clone());
+
+    let borrowed = mux
+        .try_borrow_exact(payload.len())
+        .unwrap()
+        .expect("frame buffer must contain full payload");
+    assert_eq!(borrowed, payload);
+
+    let recorded = recorder_buf.lock().unwrap();
+    assert_eq!(
+        &*recorded, payload,
+        "try_borrow_exact must tee bytes to the batch recorder"
+    );
+}
+
+#[test]
+fn multiplex_reader_batch_recorder_skips_control_messages() {
+    // Verify that control messages (MSG_IO_ERROR) are NOT recorded -
+    // only MSG_DATA payloads go to the batch recorder.
+    let mut stream = Vec::new();
+    protocol::send_msg(
+        &mut stream,
+        protocol::MessageCode::IoError,
+        &1i32.to_le_bytes(),
+    )
+    .unwrap();
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"data").unwrap();
+
+    let mut mux = MultiplexReader::new(Cursor::new(stream));
+    let recorder_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    mux.batch_recorder = Some(recorder_buf.clone());
+
+    let mut buf = vec![0u8; 64];
+    let n = mux.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"data");
+
+    let recorded = recorder_buf.lock().unwrap();
+    assert_eq!(
+        &*recorded, b"data",
+        "recorder should only contain MSG_DATA payloads"
+    );
+}
+
+#[test]
+fn multiplex_reader_batch_recorder_multiple_reads() {
+    // Verify that multiple reads accumulate correctly in the recorder.
+    let mut stream = Vec::new();
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"first").unwrap();
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"second").unwrap();
+
+    let mut mux = MultiplexReader::new(Cursor::new(stream));
+    let recorder_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    mux.batch_recorder = Some(recorder_buf.clone());
+
+    let mut buf = vec![0u8; 64];
+    let n1 = mux.read(&mut buf).unwrap();
+    let n2 = mux.read(&mut buf).unwrap();
+
+    assert!(n1 > 0);
+    assert!(n2 > 0);
+
+    let recorded = recorder_buf.lock().unwrap();
+    assert_eq!(&*recorded, b"firstsecond");
+}
+
+#[test]
+fn server_reader_set_batch_recorder_multiplex() {
+    let mut stream = Vec::new();
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"test").unwrap();
+
+    let reader = ServerReader::new_plain(Cursor::new(stream));
+    let mut mux_reader = reader.activate_multiplex().unwrap();
+
+    let recorder: Arc<Mutex<dyn Write + Send>> = Arc::new(Mutex::new(Vec::<u8>::new()));
+    mux_reader.set_batch_recorder(recorder);
+}
+
+#[test]
+fn server_reader_pending_batch_recorder_propagates_on_activate() {
+    // Verify that a batch recorder set in Plain mode gets propagated
+    // to the MultiplexReader when activate_multiplex() is called.
+    let mut stream = Vec::new();
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"propagated").unwrap();
+
+    let mut reader = ServerReader::new_plain(Cursor::new(stream));
+
+    let recorder_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder: Arc<Mutex<dyn Write + Send>> = recorder_buf.clone();
+    reader.set_batch_recorder(recorder);
+
+    // Activate multiplex - recorder should propagate
+    let mut mux_reader = reader.activate_multiplex().unwrap();
+
+    let mut buf = vec![0u8; 64];
+    let n = mux_reader.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"propagated");
+
+    let recorded = recorder_buf.lock().unwrap();
+    assert_eq!(&*recorded, b"propagated");
+}
+
+#[test]
+fn batch_recorder_roundtrip_writer_reader_capture_same_data() {
+    // End-to-end: write data through MultiplexWriter with recorder,
+    // read back through MultiplexReader with recorder, verify both
+    // recorders captured identical pre-mux / post-demux data.
+    use crate::writer::multiplex::MultiplexWriter;
+
+    let mut wire = Vec::new();
+
+    // Writer side: record pre-mux data
+    let write_recorder: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let mut mux_writer = MultiplexWriter::new(&mut wire);
+        mux_writer.batch_recorder = Some(write_recorder.clone());
+        mux_writer.write_all(b"roundtrip test data").unwrap();
+        mux_writer.flush().unwrap();
+    }
+
+    // Reader side: record post-demux data
+    let read_recorder: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut mux_reader = MultiplexReader::new(Cursor::new(wire));
+    mux_reader.batch_recorder = Some(read_recorder.clone());
+
+    let mut buf = vec![0u8; 64];
+    let n = mux_reader.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"roundtrip test data");
+
+    let write_recorded = write_recorder.lock().unwrap();
+    let read_recorded = read_recorder.lock().unwrap();
+    assert_eq!(
+        &*write_recorded, &*read_recorded,
+        "writer and reader recorders should capture identical data"
+    );
+    assert_eq!(&*write_recorded, b"roundtrip test data");
+}
+
+#[test]
+fn batch_recorder_roundtrip_try_borrow_exact_matches_write_side() {
+    // Same as `batch_recorder_roundtrip_writer_reader_capture_same_data` but
+    // drains the reader through `try_borrow_exact` instead of `Read::read`.
+    // This is the zero-copy path used by literal delta-token reads, and it
+    // must produce a byte-identical recording so `--write-batch` over wire
+    // transfers (SSH, daemon) captures the same payload as a local copy. The
+    // bug fixed alongside this test left the batch file truncated to the
+    // header + flist, causing `--read-batch` to fail with "Failed to read
+    // literal data (N bytes): failed to fill whole buffer".
+    use crate::writer::multiplex::MultiplexWriter;
+
+    let payload = b"literal payload taken via zero-copy borrow";
+    let mut wire = Vec::new();
+
+    let write_recorder: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let mut mux_writer = MultiplexWriter::new(&mut wire);
+        mux_writer.batch_recorder = Some(write_recorder.clone());
+        mux_writer.write_all(payload).unwrap();
+        mux_writer.flush().unwrap();
+    }
+
+    let read_recorder: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut mux_reader = MultiplexReader::new(Cursor::new(wire));
+    mux_reader.batch_recorder = Some(read_recorder.clone());
+
+    let borrowed = mux_reader
+        .try_borrow_exact(payload.len())
+        .unwrap()
+        .expect("frame buffer must hold the full payload");
+    assert_eq!(borrowed, payload);
+
+    let write_recorded = write_recorder.lock().unwrap();
+    let read_recorded = read_recorder.lock().unwrap();
+    assert_eq!(
+        &*write_recorded, &*read_recorded,
+        "zero-copy reader path must produce the same batch recording as the writer side"
+    );
+    assert_eq!(&*write_recorded, payload);
+}
+
+// upstream: io.c:read_buf() tees data to batch_fd BEFORE decompression.
+// The batch recorder must stay on MultiplexReader (not CompressedReader)
+// so it captures compressed wire bytes. The batch header stores
+// do_compression=true so replay decompresses the tokens.
+
+#[test]
+fn server_reader_compressed_batch_recorder_captures_compressed_wire_bytes() {
+    // When compression is active, the batch recorder on the inner
+    // MultiplexReader captures the compressed wire bytes (not decompressed).
+    // This matches upstream io.c:read_buf() behavior.
+    use crate::compressed_writer::CompressedWriter;
+    use crate::writer::multiplex::MultiplexWriter;
+    use compress::zlib::CompressionLevel;
+
+    let original = b"server reader compressed batch test data payload";
+
+    // Build a compressed+multiplexed wire stream
+    let mut wire = Vec::new();
+    {
+        let mux = MultiplexWriter::new(&mut wire);
+        let mut compressed =
+            CompressedWriter::new(mux, CompressionAlgorithm::Zlib, CompressionLevel::Default)
+                .unwrap();
+        compressed.write_all(original).unwrap();
+        compressed.finish().unwrap();
+    }
+
+    // Read back through ServerReader with compression and batch recorder
+    let reader = ServerReader::new_plain(Cursor::new(wire));
+    let mux_reader = reader.activate_multiplex().unwrap();
+    let mut compressed_reader = mux_reader
+        .activate_compression(CompressionAlgorithm::Zlib)
+        .unwrap();
+
+    let recorder_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder: Arc<Mutex<dyn Write + Send>> = recorder_buf.clone();
+    compressed_reader.set_batch_recorder(recorder);
+
+    let mut output = vec![0u8; original.len()];
+    compressed_reader.read_exact(&mut output).unwrap();
+    assert_eq!(&output, original);
+
+    let recorded = recorder_buf.lock().unwrap();
+    // The recorded data should be compressed (different from original).
+    // It should NOT equal the original uncompressed data.
+    assert_ne!(
+        &*recorded, original,
+        "batch recorder must capture compressed wire bytes, not decompressed data"
+    );
+    assert!(
+        !recorded.is_empty(),
+        "batch recorder must capture some data"
+    );
+}
+
+#[test]
+fn server_reader_batch_recorder_stays_on_mux_after_compression_activation() {
+    // When a batch recorder is set on MultiplexReader before compression is
+    // activated, it stays on MultiplexReader (not moved to CompressedReader).
+    // This captures compressed wire bytes matching upstream behavior.
+    use crate::compressed_writer::CompressedWriter;
+    use crate::writer::multiplex::MultiplexWriter;
+    use compress::zlib::CompressionLevel;
+
+    let original = b"recorder stays on mux test data";
+
+    let mut wire = Vec::new();
+    {
+        let mux = MultiplexWriter::new(&mut wire);
+        let mut compressed =
+            CompressedWriter::new(mux, CompressionAlgorithm::Zlib, CompressionLevel::Default)
+                .unwrap();
+        compressed.write_all(original).unwrap();
+        compressed.finish().unwrap();
+    }
+
+    let reader = ServerReader::new_plain(Cursor::new(wire));
+    let mut mux_reader = reader.activate_multiplex().unwrap();
+
+    let recorder_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder: Arc<Mutex<dyn Write + Send>> = recorder_buf.clone();
+    mux_reader.set_batch_recorder(recorder);
+
+    // Activate compression - recorder stays on MultiplexReader
+    let mut compressed_reader = mux_reader
+        .activate_compression(CompressionAlgorithm::Zlib)
+        .unwrap();
+
+    let mut output = vec![0u8; original.len()];
+    compressed_reader.read_exact(&mut output).unwrap();
+    assert_eq!(&output, original);
+
+    let recorded = recorder_buf.lock().unwrap();
+    // Recorded data is compressed wire bytes, not equal to original
+    assert_ne!(
+        &*recorded, original,
+        "recorder on mux layer should capture compressed wire bytes"
+    );
+    assert!(!recorded.is_empty());
+}
+
+#[test]
+fn batch_recorder_roundtrip_compressed_captures_identical_wire_bytes() {
+    // End-to-end: write data through compressed+multiplexed writer with
+    // batch recorder on mux layer, read back through compressed+multiplexed
+    // reader with batch recorder on mux layer. Both recorders capture
+    // identical COMPRESSED wire bytes.
+    use crate::compressed_writer::CompressedWriter;
+    use crate::writer::multiplex::MultiplexWriter;
+    use compress::zlib::CompressionLevel;
+
+    let original = b"compressed roundtrip batch verification payload data";
+    let mut wire = Vec::new();
+
+    // Writer side: record post-compression (compressed) data at mux layer
+    let write_recorder: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let mut mux = MultiplexWriter::new(&mut wire);
+        mux.batch_recorder = Some(write_recorder.clone());
+        let mut compressed =
+            CompressedWriter::new(mux, CompressionAlgorithm::Zlib, CompressionLevel::Default)
+                .unwrap();
+        compressed.write_all(original).unwrap();
+        compressed.finish().unwrap();
+    }
+
+    // Reader side: record pre-decompression (compressed) data at mux layer
+    let read_recorder: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let mut mux = MultiplexReader::new(Cursor::new(wire));
+        mux.batch_recorder = Some(read_recorder.clone());
+        let mut compressed =
+            crate::compressed_reader::CompressedReader::new(mux, CompressionAlgorithm::Zlib)
+                .unwrap();
+
+        let mut output = vec![0u8; original.len()];
+        compressed.read_exact(&mut output).unwrap();
+        assert_eq!(&output, original);
+    }
+
+    let write_recorded = write_recorder.lock().unwrap();
+    let read_recorded = read_recorder.lock().unwrap();
+    assert_eq!(
+        &*write_recorded, &*read_recorded,
+        "writer and reader batch recorders should capture identical compressed wire bytes"
+    );
+    // Both should contain compressed data, not the original
+    assert_ne!(&*write_recorded, original);
+    assert!(!write_recorded.is_empty());
+}
+
+#[test]
+fn server_reader_batch_recorder_stays_on_mux_lz4() {
+    // Verify batch recorder stays on MultiplexReader with LZ4 compression.
+    #[cfg(feature = "lz4")]
+    {
+        use crate::compressed_writer::CompressedWriter;
+        use crate::writer::multiplex::MultiplexWriter;
+        use compress::zlib::CompressionLevel;
+
+        let original = b"lz4 mux recorder test";
+
+        let mut wire = Vec::new();
+        {
+            let mux = MultiplexWriter::new(&mut wire);
+            let mut compressed =
+                CompressedWriter::new(mux, CompressionAlgorithm::Lz4, CompressionLevel::Default)
+                    .unwrap();
+            compressed.write_all(original).unwrap();
+            compressed.finish().unwrap();
+        }
+
+        let reader = ServerReader::new_plain(Cursor::new(wire));
+        let mut mux_reader = reader.activate_multiplex().unwrap();
+
+        let recorder_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder: Arc<Mutex<dyn Write + Send>> = recorder_buf.clone();
+        mux_reader.set_batch_recorder(recorder);
+
+        let mut compressed_reader = mux_reader
+            .activate_compression(CompressionAlgorithm::Lz4)
+            .unwrap();
+
+        let mut output = vec![0u8; original.len()];
+        compressed_reader.read_exact(&mut output).unwrap();
+        assert_eq!(&output, original);
+
+        let recorded = recorder_buf.lock().unwrap();
+        assert!(!recorded.is_empty(), "recorder must capture data");
+    }
+}
+
+#[test]
+fn server_reader_batch_recorder_stays_on_mux_zstd() {
+    // Verify batch recorder stays on MultiplexReader with Zstd compression.
+    #[cfg(feature = "zstd")]
+    {
+        use crate::compressed_writer::CompressedWriter;
+        use crate::writer::multiplex::MultiplexWriter;
+        use compress::zlib::CompressionLevel;
+
+        let original = b"zstd mux recorder test";
+
+        let mut wire = Vec::new();
+        {
+            let mux = MultiplexWriter::new(&mut wire);
+            let mut compressed =
+                CompressedWriter::new(mux, CompressionAlgorithm::Zstd, CompressionLevel::Default)
+                    .unwrap();
+            compressed.write_all(original).unwrap();
+            compressed.finish().unwrap();
+        }
+
+        let reader = ServerReader::new_plain(Cursor::new(wire));
+        let mut mux_reader = reader.activate_multiplex().unwrap();
+
+        let recorder_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder: Arc<Mutex<dyn Write + Send>> = recorder_buf.clone();
+        mux_reader.set_batch_recorder(recorder);
+
+        let mut compressed_reader = mux_reader
+            .activate_compression(CompressionAlgorithm::Zstd)
+            .unwrap();
+
+        let mut output = vec![0u8; original.len()];
+        compressed_reader.read_exact(&mut output).unwrap();
+        assert_eq!(&output, original);
+
+        let recorded = recorder_buf.lock().unwrap();
+        assert!(!recorded.is_empty(), "recorder must capture data");
+    }
+}
+
+#[test]
+fn multiplex_reader_exit_23_deferred_until_error_xfer_arrives() {
+    // upstream: daemon sender may emit MSG_ERROR_EXIT(23) before the
+    // FERROR_XFER that caused it, because it reads waitpid() before
+    // fully draining the msg2sndr IPC pipe. The reader must not abort
+    // immediately on exit 23 - it must continue draining to pick up
+    // the late-arriving FERROR_XFER.
+    let mut stream = Vec::new();
+
+    // Wire order: DATA, ERROR_EXIT(RERR_PARTIAL), ERROR_XFER, DATA
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"hello").unwrap();
+
+    let exit_code: i32 = multiplex::RERR_PARTIAL;
+    protocol::send_msg(
+        &mut stream,
+        protocol::MessageCode::ErrorExit,
+        &exit_code.to_le_bytes(),
+    )
+    .unwrap();
+
+    protocol::send_msg(
+        &mut stream,
+        protocol::MessageCode::ErrorXfer,
+        b"daemon refused\n",
+    )
+    .unwrap();
+
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"world").unwrap();
+
+    let mut mux = MultiplexReader::new(Cursor::new(stream));
+
+    let mut buf = [0u8; 5];
+    let n = mux.read(&mut buf).unwrap();
+    assert_eq!(n, 5);
+    assert_eq!(&buf, b"hello");
+
+    // Second read must succeed despite ERROR_EXIT(23) being on the wire
+    // before ERROR_XFER - the reader defers exit 23 and drains through
+    // the FERROR_XFER frame.
+    let n = mux.read(&mut buf).unwrap();
+    assert_eq!(n, 5);
+    assert_eq!(&buf, b"world");
+
+    assert_eq!(mux.xfer_error_count, 1);
+    assert_eq!(mux.error_exit_code, Some(multiplex::RERR_PARTIAL));
+}
+
+#[test]
+fn multiplex_reader_exit_23_without_xfer_still_drains() {
+    // Exit RERR_PARTIAL without any FERROR_XFER: the reader defers the
+    // abort and continues reading. If a DATA frame arrives, it returns the
+    // data normally. The transfer drains and EOF surfaces naturally.
+    let mut stream = Vec::new();
+
+    let exit_code: i32 = multiplex::RERR_PARTIAL;
+    protocol::send_msg(
+        &mut stream,
+        protocol::MessageCode::ErrorExit,
+        &exit_code.to_le_bytes(),
+    )
+    .unwrap();
+
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"ok").unwrap();
+
+    let mut mux = MultiplexReader::new(Cursor::new(stream));
+
+    let mut buf = [0u8; 2];
+    let n = mux.read(&mut buf).unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(&buf, b"ok");
+
+    assert_eq!(mux.xfer_error_count, 0);
+    assert_eq!(mux.error_exit_code, Some(multiplex::RERR_PARTIAL));
+}
+
+#[test]
+fn multiplex_reader_non_23_exit_aborts_immediately() {
+    // Non-23 exit codes must abort immediately, even if FERROR_XFER
+    // frames follow on the wire.
+    let mut stream = Vec::new();
+
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"hello").unwrap();
+
+    let exit_code: i32 = 5; // RERR_SYNTAX
+    protocol::send_msg(
+        &mut stream,
+        protocol::MessageCode::ErrorExit,
+        &exit_code.to_le_bytes(),
+    )
+    .unwrap();
+
+    protocol::send_msg(&mut stream, protocol::MessageCode::Data, b"unreachable").unwrap();
+
+    let mut mux = MultiplexReader::new(Cursor::new(stream));
+
+    let mut buf = [0u8; 5];
+    let n = mux.read(&mut buf).unwrap();
+    assert_eq!(n, 5);
+    assert_eq!(&buf, b"hello");
+
+    let err = mux.read(&mut buf).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::ConnectionAborted);
+    assert!(err.to_string().contains("code 5"));
+}

@@ -1,0 +1,217 @@
+//! Wire-format filter-rule parsing for the receiver transfer setup.
+//!
+//! Converts the wire-format filter rules received during setup into a
+//! `FilterSet` plus the per-directory `DirMergeConfig` list the deletion pass
+//! consults.
+
+use std::borrow::Cow;
+use std::io;
+
+use protocol::filters::{FilterRuleWireFormat, RuleType};
+
+use filters::{DirMergeConfig, FilterSet};
+
+/// Parses wire-format filter rules into a `FilterSet` and `DirMergeConfig` list for the receiver.
+///
+/// Separates DirMerge rules (for per-directory merge file scanning) from regular
+/// filter rules. The returned `FilterSet` contains compiled include/exclude/protect/risk
+/// rules. The `DirMergeConfig` list configures per-directory merge file scanning
+/// used during deletion filtering.
+///
+/// # Upstream Reference
+///
+/// - `exclude.c:recv_filter_list()` - receiver-side filter list reception
+/// - `generator.c:delete_in_dir()` - deletion pass uses filter evaluation
+pub(in crate::receiver) fn parse_wire_filters_for_receiver(
+    wire_rules: &[FilterRuleWireFormat],
+) -> io::Result<(FilterSet, Vec<DirMergeConfig>)> {
+    use ::filters::FilterRule;
+
+    let mut rules = Vec::with_capacity(wire_rules.len());
+    let mut merge_configs = Vec::new();
+
+    for wire_rule in wire_rules {
+        // The wire format carries the directory-only (`/`) modifier as a
+        // separate flag, but the `filters` crate encodes it as a trailing `/`
+        // in the pattern string. Re-append it so a rule like `- foo/*/` keeps
+        // its directory-only semantics instead of matching plain files. Without
+        // this the receiver's rule set diverges from the sender's (which uses
+        // generator/filters.rs reconstruct_pattern), causing the flist re-check
+        // and the deletion pass to over-match. The anchored (`/`) modifier is
+        // applied below via `anchor_to_root()`.
+        // upstream: exclude.c:get_rule_prefix() - directory-only is a trailing
+        // slash on the pattern body.
+        // The `filters` crate compiles patterns into `wildmatch`, which operates
+        // on `&str`, so a non-UTF-8 wire pattern is decoded lossily here for the
+        // local match set. The wire pattern itself stays byte-faithful (it is an
+        // `OsString`); only this receiver-side rule-compilation boundary is
+        // lossy, mirroring the fact that the whole `filters` model is `String`.
+        let lossy = wire_rule.pattern.to_string_lossy();
+        let pattern: Cow<'_, str> = if wire_rule.directory_only && !lossy.ends_with('/') {
+            Cow::Owned(format!("{lossy}/"))
+        } else {
+            lossy.clone()
+        };
+        let mut rule = match wire_rule.rule_type {
+            RuleType::Include => FilterRule::include(pattern.as_ref()),
+            RuleType::Exclude => FilterRule::exclude(pattern.as_ref()),
+            RuleType::Protect => FilterRule::protect(pattern.as_ref()),
+            RuleType::Risk => FilterRule::risk(pattern.as_ref()),
+            RuleType::Clear => {
+                rules.push(
+                    FilterRule::clear().with_sides(wire_rule.sender_side, wire_rule.receiver_side),
+                );
+                continue;
+            }
+            RuleType::DirMerge => {
+                // upstream: exclude.c:setup_merge_file() derives the
+                // per-directory merge FILENAME from the basename after the last
+                // '/' in the rule pattern (`ex->pattern = strdup(y+1)` where
+                // `y = strrchr(x, '/')`). A client's `-F` reaches the receiver as
+                // `: /.rsync-filter` (exclude.c:1608), so the wire pattern is
+                // `/.rsync-filter`. Using it verbatim as the merge filename makes
+                // `directory.join("/.rsync-filter")` resolve to the filesystem
+                // root (Rust's `Path::join` discards the base on an absolute
+                // component), so the per-directory merge file is never found and
+                // its protect rules are absent when the --delete pass decides
+                // candidates - deleting dir-merge-protected destination entries.
+                // Split off the basename to mirror setup_merge_file(); oc's own
+                // encoder emits the anchor as a `/` modifier with a bare pattern,
+                // so this is a no-op for the oc<->oc wire and only normalises the
+                // `/`-in-body form a real upstream client sends.
+                let filename = lossy.rsplit('/').next().unwrap_or(lossy.as_ref());
+                let mut config = DirMergeConfig::new(filename);
+                if wire_rule.no_inherit {
+                    config = config.with_inherit(false);
+                }
+                if wire_rule.exclude_from_merge {
+                    config = config.with_exclude_self(true);
+                }
+                if wire_rule.sender_side {
+                    config = config.with_sender_only(true);
+                }
+                if wire_rule.receiver_side {
+                    config = config.with_receiver_only(true);
+                }
+                if wire_rule.perishable {
+                    config = config.with_perishable(true);
+                }
+                merge_configs.push(config);
+                continue;
+            }
+            RuleType::Merge => continue,
+        };
+
+        if wire_rule.sender_side || wire_rule.receiver_side {
+            rule = rule.with_sides(wire_rule.sender_side, wire_rule.receiver_side);
+        }
+        if wire_rule.perishable {
+            rule = rule.with_perishable(true);
+        }
+        if wire_rule.xattr_only {
+            rule = rule.with_xattr_only(true);
+        }
+        if wire_rule.negate {
+            rule = rule.with_negate(true);
+        }
+        if wire_rule.anchored {
+            rule = rule.anchor_to_root();
+        }
+
+        rules.push(rule);
+    }
+
+    let filter_set = FilterSet::from_rules(rules)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("filter error: {e}")))?;
+
+    Ok((filter_set, merge_configs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real upstream client transmits `-F` as the rule `: /.rsync-filter`
+    /// (exclude.c:1608), so the receiver decodes a `DirMerge` wire rule whose
+    /// pattern is `/.rsync-filter`. Upstream's `setup_merge_file()` splits at the
+    /// last '/' to recover the per-directory filename `.rsync-filter`; keeping the
+    /// leading slash makes `directory.join("/.rsync-filter")` escape to the
+    /// filesystem root, so the merge file is never found and its protect rules
+    /// are absent when the --delete pass runs - deleting entries the client's
+    /// dir-merge protects. Encode that the decoded config filename is the
+    /// basename, matching upstream.
+    #[test]
+    fn dir_merge_wire_pattern_yields_basename_filename() {
+        let wire = vec![FilterRuleWireFormat {
+            rule_type: RuleType::DirMerge,
+            pattern: "/.rsync-filter".into(),
+            ..FilterRuleWireFormat::default()
+        }];
+
+        let (_set, merge_configs) =
+            parse_wire_filters_for_receiver(&wire).expect("dir-merge rule parses");
+
+        assert_eq!(merge_configs.len(), 1, "one dir-merge config expected");
+        assert_eq!(
+            merge_configs[0].filename(),
+            ".rsync-filter",
+            "the leading slash from the wire pattern must be stripped so the \
+             per-directory merge file is looked up as `dir/.rsync-filter`, not \
+             at the filesystem root",
+        );
+    }
+
+    /// oc's own encoder emits the anchor as a `/` modifier with a bare pattern,
+    /// so an oc<->oc dir-merge arrives with pattern `.rsync-filter` (no slash).
+    /// The basename split must leave that untouched so the oc<->oc wire path is
+    /// unchanged.
+    #[test]
+    fn dir_merge_bare_pattern_is_unchanged() {
+        let wire = vec![FilterRuleWireFormat {
+            rule_type: RuleType::DirMerge,
+            pattern: ".rsync-filter".into(),
+            anchored: true,
+            ..FilterRuleWireFormat::default()
+        }];
+
+        let (_set, merge_configs) =
+            parse_wire_filters_for_receiver(&wire).expect("dir-merge rule parses");
+
+        assert_eq!(merge_configs.len(), 1);
+        assert_eq!(merge_configs[0].filename(), ".rsync-filter");
+    }
+
+    /// End-to-end: a `:C` dir-merge as an UPSTREAM peer emits it must yield a
+    /// non-inheriting per-directory merge config on the receiver. Upstream's
+    /// `parse_rule_tok` case `C` sets NO_INHERIT (exclude.c:1248-1255), and this
+    /// receiver gates `DirMergeConfig::with_inherit(false)` on `wire_rule.no_inherit`.
+    /// Before the wire parser re-derived the `C`-implied flags, `no_inherit` came
+    /// back unset and the config inherited into subdirectories - dropping the CVS
+    /// no-inherit semantics for a real upstream `:C`. Decode the raw `:C` bytes
+    /// (exercising the parser) and confirm the built config does not inherit.
+    #[test]
+    fn upstream_colon_c_dir_merge_yields_non_inheriting_config() {
+        let protocol = protocol::ProtocolVersion::from_supported(32).unwrap();
+        // Wire record an upstream peer emits for a CVS per-directory merge.
+        let payload: &[u8] = b":C .cvsignore";
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(payload.len() as i32).to_le_bytes());
+        buf.extend_from_slice(payload);
+        buf.extend_from_slice(&0i32.to_le_bytes());
+
+        let wire = protocol::filters::read_filter_list(&mut &buf[..], protocol)
+            .expect("`:C` record decodes");
+        assert_eq!(wire.len(), 1);
+        assert!(wire[0].cvs_exclude, "`C` bit decoded");
+        assert!(wire[0].no_inherit, "`C` re-derives no-inherit on decode");
+
+        let (_set, merge_configs) =
+            parse_wire_filters_for_receiver(&wire).expect("dir-merge rule parses");
+        assert_eq!(merge_configs.len(), 1);
+        assert_eq!(merge_configs[0].filename(), ".cvsignore");
+        assert!(
+            !merge_configs[0].inherits(),
+            "an upstream `:C` merge must NOT inherit into subdirectories",
+        );
+    }
+}
