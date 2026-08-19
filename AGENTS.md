@@ -74,9 +74,40 @@ before counting; re-run confirms `cargo_audit: {"installed": true, "count":
 0}` now. If you add a new accepted advisory, update spec/sync.py's own
 rationale for it AND this set together, same bar as the first one.
 
-SYNC-002 is now fully closed out. Nothing past SYNC-002 has started -- the
-next requirement to pick up is SYNC-003 (or SYNC-008/SYNC-010, which have
-no hard dependency on it). The build is scoped as SYNC-001..SYNC-011 in
+SYNC-002 is now fully closed out. **SYNC-003 (mesh bridge client) is
+IMPLEMENTED as of 2026-08-19** (`feat/sync-003-mesh-bridge`): the Kotlin
+client consumes tetron-mobile's MOBILE-024 ContentProvider
+(`xyz.tetron.mobile.status`, `call("get_status")`). Cross-process key
+insight: the snapshot is a Parcelable class that exists only inside
+tetron-mobile's APK, so a consumer's `Bundle.getParcelable` would throw
+`BadParcelableException`; the fix is the standard cross-app technique --
+hand-written parcel-layout wire mirrors under the SAME FQCN
+(`xyz/tetron/mobile/BridgeStatusWire.kt`: StatusSnapshot, BridgePeer,
+BridgeTunnelState) with public static `CREATOR` fields, verified against
+the provider's compiled `CREATOR` bytecode (state=enum-name string,
+network/ownMeshIp/subnet strings, peer count + N peers (hostname, ip,
+connKind int), updatedAtMillis long). Fresh GPL mirrors, zero logic, never
+copied from tetron-mobile. App-facing surface is
+`xyz.tetron.sync.bridge`: sealed `BridgeResponse` (Snapshot /
+ConsentRequired / Unavailable -- never throws to UI), typed models
+(BridgeSnapshot/BridgePeer/BridgeTunnelState/ConnKind), `MeshBridge` with
+a 5s TTL cache (injected clock, thread-safe), `ProviderStatusCaller`
+(Bundle glue, catches everything to Unavailable), defensive parsing
+(unknown state name -> Unknown, unknown ConnKind int -> Unknown,
+negative peer count -> empty). The parcel layout is MOBILE-024's contract:
+a provider-side field change requires the Mirror updates in lockstep with
+`MeshStatusProviderContractTest` staying green. Automated gate: 11 JVM
+unit tests pass (`:app:testDebugUnitTest`; mapping + response algebra +
+cache, zero Android deps). The instrumented cross-process test
+(`MeshBridgeDeviceTest`) compiles but awaits the LG V40: consent branch +
+mirror CREATOR resolution; the grant-then-snapshot branch is manual
+(tap consent notification -> GrantActivity Allow) and @Ignore'd. Manifest
+gained a `<queries><provider authorities=.../></queries>` so
+`resolveContentProvider` in the device test is deterministic on Android 11+
+(direct `ContentResolver.call` needs no visibility). Still-open device
+verification is a TODO, not a blocker for SYNC-004. The next requirement
+is SYNC-004 (gates, depends on SYNC-003's bridge state); SYNC-008/SYNC-010
+also have no dependency on it. The build is scoped as SYNC-001..SYNC-011 in
 `spec/sync.py`, which also records the decision register (consensus
 2026-08-18) and the still-open items. Dependency ordering (also stated
 per-class in `spec/sync.py`):
