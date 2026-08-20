@@ -644,6 +644,51 @@ class SyncMediaAccess(Requirement):
     confirms the full access prompt appears and a partial grant produces
     the warning banner.
     ENFORCEMENT: unit tests automated; the permission dialog UX is manual.
+
+    **IMPLEMENTED as of 2026-08-20** (`xyz.tetron.sync.media`, no branch cut
+    yet). `resolveMediaAccessGrant(MediaPermissionState, apiLevel): MediaAccessGrant`
+    is the pure classifier (no Android dependency, same bar as
+    `GateEvaluator`): API 33+ needs `READ_MEDIA_IMAGES` AND
+    `READ_MEDIA_VIDEO` together for `Full` (a device offers both as one OS
+    choice, so "images granted, video not" is not modelled as a fourth
+    state); API 34+ additionally maps `READ_MEDIA_VISUAL_USER_SELECTED`
+    alone to `Partial`; that permission does not exist pre-34, so it is
+    never consulted below that level even if a caller's state sets it
+    (`api33_visualUserSelected_doesNotExistYet_isNotGranted` pins this);
+    below API 33 only `READ_EXTERNAL_STORAGE` matters. `resolveSourcePath
+    (MediaAccessGrant, File): String?` resolves the injected camera-roll
+    directory's path for `Full` OR `Partial` (a partial grant still backs
+    up whatever subset was selected -- it does not block the run outright,
+    matching the spec's "only selected photos will back up" framing, not
+    "unavailable") and `null` for `NotGranted` or a missing directory (both
+    surface through `SyncPipeline` as `GateReason.TargetUnreachable` via
+    the existing `SourcePathProvider` contract, exactly the "not a crash"
+    bar SYNC-005 already established). `resolveMediaAccessState` bundles
+    both into one `MediaAccessState(grant, sourcePath)` with a
+    `showPartialAccessWarning` derived property for SYNC-009's banner.
+    `AndroidMediaAccess` is the production `SourcePathProvider` (real
+    `ContextCompat.checkSelfPermission` reads + `Environment
+    .getExternalStoragePublicDirectory(DIRECTORY_DCIM)/Camera`) -- no
+    logic of its own, so no unit test, same bar as
+    `AndroidDeviceStateProvider`/`EngineTransferRunner`. Requesting the
+    runtime grant itself needs an `Activity`
+    (`ActivityResultContracts.RequestMultiplePermissions`, "first-run
+    setup / Backup-press time" per this requirement's own scope), which
+    this class does not have -- same seam split as SYNC-007's
+    `DeletionRequester`; SYNC-009 owns the request flow, this class only
+    reads whatever grant already exists. `AndroidManifest.xml` gained
+    `READ_MEDIA_IMAGES`/`READ_MEDIA_VIDEO`/
+    `READ_MEDIA_VISUAL_USER_SELECTED` plus `READ_EXTERNAL_STORAGE`
+    `maxSdkVersion="32"` (the last permission caused an XML-comment parse
+    failure the first pass -- a `--` inside a `<!-- -->` block is invalid
+    XML, not just a style nit; caught by `processDebugMainManifest`
+    rejecting the manifest outright). 16 new JVM unit tests
+    (`MediaAccessTest`) cover the full grant matrix per API-level band plus
+    path resolution/warning-banner derivation. `:app:assembleDebug` +
+    `:app:testDebugUnitTest` + `:app:compileDebugAndroidTestKotlin` +
+    `python3 reconcile.py` all green. Still open, deferred to SYNC-009 as
+    scoped above: the runtime permission request flow itself and the
+    partial-access warning banner UI.
     """
     req_id = "SYNC-008"
 
