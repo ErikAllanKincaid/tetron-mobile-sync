@@ -20,6 +20,7 @@ import xyz.tetron.sync.bridge.BridgeResponse
 import xyz.tetron.sync.bridge.BridgeTunnelState
 import xyz.tetron.sync.gates.GateReason
 import xyz.tetron.sync.gates.relaxedGateConfig
+import xyz.tetron.sync.media.MediaAccessGrant
 import xyz.tetron.sync.pipeline.PipelineResult
 import xyz.tetron.sync.pipeline.RunRecord
 
@@ -40,7 +41,7 @@ data class HomeUiState(
     val tunnelState: BridgeTunnelState = BridgeTunnelState.Unknown,
     val consentCallerPackage: String? = null,
     val targetDisplayName: String? = null,
-    val showPartialMediaAccessWarning: Boolean = false,
+    val mediaAccessGrant: MediaAccessGrant = MediaAccessGrant.NotGranted,
     val runPhase: RunPhase = RunPhase.Idle,
 )
 
@@ -94,7 +95,7 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
             tunnelState = tunnelState,
             consentCallerPackage = consentCallerPackage,
             targetDisplayName = container.settingsStore.target()?.displayName,
-            showPartialMediaAccessWarning = container.mediaAccess.currentState().showPartialAccessWarning,
+            mediaAccessGrant = container.mediaAccess.currentState().grant,
         )
     }
 

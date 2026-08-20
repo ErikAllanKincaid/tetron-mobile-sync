@@ -22,18 +22,30 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import xyz.tetron.sync.media.MediaAccessGrant
 import xyz.tetron.sync.ui.describeGateReason
 import xyz.tetron.sync.ui.describeTunnelState
 
 /**
  * SYNC-009 Home screen: tunnel-state line, consent banner, target summary,
- * the "Back up now" button, and the current [RunPhase] (blocked reason /
- * in-progress / last result). The gated-run "Transfer anyway?" confirm is
- * the decision from this requirement's own open item (spec/sync.py
- * SYNC-009): shown only when [RunPhase.Gated.canOverride] is true.
+ * media-access banner, the "Back up now" button, and the current
+ * [RunPhase] (blocked reason / in-progress / last result). The gated-run
+ * "Transfer anyway?" confirm is the decision from this requirement's own
+ * open item (spec/sync.py SYNC-009): shown only when [RunPhase.Gated
+ * .canOverride] is true.
+ *
+ * [onRequestMediaPermission] launches the SYNC-008 runtime permission
+ * request -- `ActivityResultContracts.RequestMultiplePermissions` needs an
+ * `Activity` to register against, which this Composable does not have, so
+ * [xyz.tetron.sync.MainActivity] owns the launcher and passes the trigger
+ * down (same reason [xyz.tetron.sync.delete.DeletionRequester] is a
+ * contract rather than built here). The result callback is deliberately a
+ * no-op: [HomeViewModel]'s own ~3s poll picks up the new grant either way,
+ * so there is nothing UI-specific to do the instant the system dialog
+ * closes.
  */
 @Composable
-fun HomeScreen(viewModel: HomeViewModel) {
+fun HomeScreen(viewModel: HomeViewModel, onRequestMediaPermission: () -> Unit) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val phase = state.runPhase
 
@@ -57,14 +69,7 @@ fun HomeScreen(viewModel: HomeViewModel) {
             style = MaterialTheme.typography.bodyMedium,
         )
 
-        if (state.showPartialMediaAccessWarning) {
-            Spacer(Modifier.height(8.dp))
-            Text(
-                text = "Only selected photos will back up -- grant full photo access in Settings for the whole camera roll.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.error,
-            )
-        }
+        MediaAccessBanner(state.mediaAccessGrant, onRequestMediaPermission)
 
         Spacer(Modifier.height(24.dp))
         Button(
@@ -100,6 +105,31 @@ private fun ConsentBanner(callerPackage: String) {
             modifier = Modifier.padding(16.dp),
             style = MaterialTheme.typography.bodyMedium,
         )
+    }
+}
+
+@Composable
+private fun MediaAccessBanner(grant: MediaAccessGrant, onRequestMediaPermission: () -> Unit) {
+    when (grant) {
+        MediaAccessGrant.NotGranted -> {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = "tetron sync needs photo access to back up your camera roll.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+            Spacer(Modifier.height(4.dp))
+            TextButton(onClick = onRequestMediaPermission) { Text("Grant photo access") }
+        }
+        MediaAccessGrant.Partial -> {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = "Only selected photos will back up -- grant full photo access in system settings for the whole camera roll.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        MediaAccessGrant.Full -> Unit
     }
 }
 

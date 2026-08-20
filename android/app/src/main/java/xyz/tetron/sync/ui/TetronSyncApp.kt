@@ -47,16 +47,18 @@ private sealed class Destination(val route: String, val label: String, val icon:
 
 /**
  * SYNC-009: the app shell -- bottom navigation across Home/Progress/
- * History (Settings joins in a later slice of this requirement), all
- * hosted under one [TetronSyncTheme]. [HomeViewModel] is requested scoped to
- * the hosting Activity ([LocalContext.current] here is always
- * `MainActivity`, this app's only Activity) so Home and Progress observe
- * the exact same in-flight [xyz.tetron.sync.ui.home.RunPhase] -- a run
- * started from Home must be visible on Progress without either screen
- * owning the other.
+ * History/Settings, all hosted under one [TetronSyncTheme]. [HomeViewModel]
+ * is requested scoped to the hosting Activity ([LocalContext.current] here
+ * is always `MainActivity`, this app's only Activity) so Home and Progress
+ * observe the exact same in-flight [xyz.tetron.sync.ui.home.RunPhase] -- a
+ * run started from Home must be visible on Progress without either screen
+ * owning the other. [onRequestMediaPermission] is `MainActivity`'s
+ * `ActivityResultLauncher` trigger for SYNC-008's runtime permission
+ * request, threaded down to Home (see [xyz.tetron.sync.ui.home.HomeScreen]
+ * for why this Composable cannot own that launcher itself).
  */
 @Composable
-fun TetronSyncApp(container: AppContainer) {
+fun TetronSyncApp(container: AppContainer, onRequestMediaPermission: () -> Unit) {
     val factory = remember(container) { AppViewModelFactory(container) }
     val activity = LocalContext.current as ComponentActivity
     val homeViewModel: HomeViewModel = viewModel(activity, factory = factory)
@@ -90,7 +92,7 @@ fun TetronSyncApp(container: AppContainer) {
                 startDestination = Destination.Home.route,
                 modifier = Modifier.padding(padding),
             ) {
-                composable(Destination.Home.route) { HomeScreen(homeViewModel) }
+                composable(Destination.Home.route) { HomeScreen(homeViewModel, onRequestMediaPermission) }
                 composable(Destination.Progress.route) { ProgressScreen(homeViewModel) }
                 composable(Destination.History.route) {
                     val historyViewModel: HistoryViewModel = viewModel(factory = factory)
