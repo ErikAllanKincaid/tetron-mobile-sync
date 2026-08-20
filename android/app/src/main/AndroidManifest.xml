@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- SYNC-002: rsync client network I/O (the embedded engine opens its
          own sockets; a socket call with no INTERNET grant fails silently
@@ -41,6 +42,7 @@
     </queries>
 
     <application
+        android:name=".TetronSyncApplication"
         android:allowBackup="false"
         android:label="@string/app_name"
         android:theme="@style/Theme.TetronSync">
@@ -53,6 +55,23 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- SYNC-009: WorkManager's default androidx-startup initializer
+             uses its own reflective WorkerFactory, which can not carry
+             SyncWorkerFactory's PipelineRunner dependency into SyncWorker.
+             Removing it here is what makes TetronSyncApplication's own
+             Configuration.Provider (WorkManager.getInstance() lazily
+             on-demand-initializes from that instead) the one that wins. -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                android:value="androidx.startup"
+                tools:node="remove" />
+        </provider>
 
     </application>
 
