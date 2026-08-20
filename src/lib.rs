@@ -92,11 +92,17 @@ pub struct SyncTransferOutcome {
 }
 
 /// FFI error type. The engine's own `ClientError` carries an rsync exit code
-/// plus a formatted message, both of which are surfaced here.
+/// plus a formatted message, both of which are surfaced here. The field is
+/// named `detail`, not `message`: UniFFI's Kotlin codegen adds its own
+/// `override val message` (from `kotlin.Exception`) to every error variant,
+/// and a same-named Rust field collides with it (`compileDebugKotlin`
+/// fails with "Conflicting declarations: val message: String" -- caught
+/// 2026-08-19 regenerating bindings for SYNC-005, since SYNC-002 never
+/// actually rebuilt the Kotlin bindings after adding this error).
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum SyncError {
-    #[error("oc-rsync engine error (exit {exit_code}): {message}")]
-    Engine { exit_code: i32, message: String },
+    #[error("oc-rsync engine error (exit {exit_code}): {detail}")]
+    Engine { exit_code: i32, detail: String },
 }
 
 #[uniffi::export]
@@ -157,7 +163,7 @@ impl SyncEngine {
         )
         .map_err(|err| SyncError::Engine {
             exit_code: err.exit_code(),
-            message: err.to_string(),
+            detail: err.to_string(),
         })?;
 
         Ok(SyncTransferOutcome::from_summary(&summary))
