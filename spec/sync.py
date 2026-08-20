@@ -552,6 +552,58 @@ class SyncDeleteAfterBackup(Requirement):
     deletes only those after confirmation.
     ENFORCEMENT: unit tests automated; the on-device consent flow is a
     manual verification item (also covered by SYNC-011).
+
+    **IMPLEMENTED as of 2026-08-20** (`xyz.tetron.sync.delete`, no branch
+    cut yet). The pipeline's own per-file completion stream (SYNC-002's
+    `SyncProgressEvent`, pushed through the `SyncProgressListener` UniFFI
+    callback) turned out not to distinguish "this event is a byte-verified
+    regular-file transfer completing" from a mid-transfer tick, a
+    directory/symlink/hardlink action, or an already-present skip -- all of
+    which also emit progress events (`ClientEventKind::is_progress()`).
+    `src/lib.rs` fixes this at the FFI boundary rather than pushing the
+    distinction into Kotlin: `SyncProgressEvent` gained `is_transfer`
+    (mirrors `ClientEventKind::is_transfer()` -- true only for
+    `DataCopied`/`ReferenceCopied`) and `is_final` (mirrors
+    `ClientProgressUpdate::is_final()` -- true only on an event's
+    completion tick, not an in-flight one); Kotlin bindings + `jniLibs`
+    regenerated the same two-command way as SYNC-005/006's stale-bindings
+    fix noted above. `TransferredFileCollector` (a `SyncProgressListener`
+    that tees any caller-supplied listener) filters on
+    `isTransfer && isFinal` to build the transferred-this-run path set;
+    `resolveDeleteSet(DeleteAfterBackupConfig, List<String>)` is the pure
+    opt-in gate (`enabled=false` -> always empty, matching decision #8's
+    default OFF) so it is testable with no transfer or Android permission
+    surface at all. `SyncPipeline` wires both in: `deleteConfig`/
+    `deletionRequester` constructor params (both default to an inert no-op,
+    so every pre-existing SYNC-005/006 caller and test is unaffected),
+    collector interposed on the progress listener passed to
+    `TransferRunner`, delete requested only from the try-succeeded branch
+    -- resolving the spec's "gated on the run's success" as *not* excluding
+    an interrupted run (rsync exit 23/24 is explicitly not a failure,
+    spec/sync.py SYNC-005, and whatever it did copy is still byte-verified)
+    but excluding a hard engine exception (no reliable per-file record at
+    that point). `DeletionRequester` is a contract only (`fun interface
+    DeletionRequester { fun requestDelete(paths: List<String>) }`), same
+    seam pattern as `TargetProvider`/`SourcePathProvider`: both the API 33+
+    `MediaStore.createDeleteRequest` confirm dialog and the pre-33
+    app-level confirm need an `Activity` to launch, which this pure-Kotlin
+    layer does not have, and SYNC-009's own dependency list already names
+    "SYNC-007 (delete opt-in UI)" as its real home. 17 new JVM unit tests
+    (`DeleteModelsTest` + 6 new cases in `SyncPipelineTest`) cover: the
+    opt-in gate, collector filtering (mid-transfer tick / non-transfer
+    action / no-path summary line all excluded), delete-set-equals-
+    transferred-set end to end through a faked `TransferRunner`, disabled
+    opt-in never invoking the requester even when files transferred, a
+    hard failure never invoking it, an interrupted run still invoking it,
+    and a caller-supplied progress listener still receiving every event
+    unchanged (the tee does not swallow anything).
+    `:app:assembleDebug` + `:app:testDebugUnitTest` +
+    `:app:compileDebugAndroidTestKotlin` + `python3 reconcile.py` (cargo
+    build/clippy/test/audit + `libspec diff`) all green. Still open, and
+    explicitly deferred to SYNC-009 as scoped above: the real
+    `MediaStoreDeletionRequester` (path -> content URI resolution, the API
+    33+ confirm dialog, the pre-33 app-level confirm) and the settings UI
+    toggle for `DeleteAfterBackupConfig.enabled`.
     """
     req_id = "SYNC-007"
 
