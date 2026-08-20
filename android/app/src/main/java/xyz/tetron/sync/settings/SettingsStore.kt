@@ -31,4 +31,14 @@ interface SettingsStore {
      *  SYNC-009 "WorkManager cadence" setting). */
     fun workCadenceHours(): Long
     fun setWorkCadenceHours(hours: Long)
+
+    /** [xyz.tetron.sync.gates.GateNotificationCoalescer]'s per-reason
+     *  notification window, in hours (SYNC-004 decision #3's ~6h default;
+     *  SYNC-009's "coalescing window N" setting). Unlike `gateConfig`/
+     *  `deleteAfterBackupConfig`, the coalescer itself is not re-read live
+     *  -- same "takes effect at next app start" bar as [workCadenceHours]
+     *  (both are consumed once, at [xyz.tetron.sync.AppContainer]
+     *  construction, not per-run). */
+    fun coalesceWindowHours(): Long
+    fun setCoalesceWindowHours(hours: Long)
 }

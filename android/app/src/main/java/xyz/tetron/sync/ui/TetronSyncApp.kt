@@ -7,6 +7,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -30,14 +31,17 @@ import xyz.tetron.sync.ui.history.HistoryViewModel
 import xyz.tetron.sync.ui.home.HomeScreen
 import xyz.tetron.sync.ui.home.HomeViewModel
 import xyz.tetron.sync.ui.progress.ProgressScreen
+import xyz.tetron.sync.ui.settings.SettingsScreen
+import xyz.tetron.sync.ui.settings.SettingsViewModel
 
 private sealed class Destination(val route: String, val label: String, val icon: ImageVector) {
     data object Home : Destination("home", "Home", Icons.Filled.Home)
     data object Progress : Destination("progress", "Progress", Icons.Filled.CloudUpload)
     data object History : Destination("history", "History", Icons.Filled.History)
+    data object Settings : Destination("settings", "Settings", Icons.Filled.Settings)
 
     companion object {
-        val all = listOf(Home, Progress, History)
+        val all = listOf(Home, Progress, History, Settings)
     }
 }
 
@@ -91,6 +95,10 @@ fun TetronSyncApp(container: AppContainer) {
                 composable(Destination.History.route) {
                     val historyViewModel: HistoryViewModel = viewModel(factory = factory)
                     HistoryScreen(historyViewModel)
+                }
+                composable(Destination.Settings.route) {
+                    val settingsViewModel: SettingsViewModel = viewModel(factory = factory)
+                    SettingsScreen(settingsViewModel)
                 }
             }
         }

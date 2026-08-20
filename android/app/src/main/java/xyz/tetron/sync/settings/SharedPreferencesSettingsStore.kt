@@ -80,12 +80,23 @@ class SharedPreferencesSettingsStore(context: Context) : SettingsStore {
         prefs.edit().putLong(KEY_WORK_CADENCE_HOURS, hours).apply()
     }
 
+    override fun coalesceWindowHours(): Long =
+        prefs.getLong(KEY_COALESCE_WINDOW_HOURS, DEFAULT_COALESCE_WINDOW_HOURS)
+
+    override fun setCoalesceWindowHours(hours: Long) {
+        prefs.edit().putLong(KEY_COALESCE_WINDOW_HOURS, hours).apply()
+    }
+
     companion object {
         const val PREFS_NAME = "xyz.tetron.sync.settings"
 
         /** Matches [xyz.tetron.sync.trigger.SyncWorkScheduler.DEFAULT_INTERVAL]
          *  (1 day). */
         const val DEFAULT_WORK_CADENCE_HOURS = 24L
+
+        /** Matches [xyz.tetron.sync.gates.GateNotificationCoalescer
+         *  .DEFAULT_WINDOW_MILLIS] (6 hours). */
+        const val DEFAULT_COALESCE_WINDOW_HOURS = 6L
         private const val DEFAULT_TARGET_PORT = 873
 
         private const val KEY_WIFI_ONLY = "wifi_only"
@@ -99,5 +110,6 @@ class SharedPreferencesSettingsStore(context: Context) : SettingsStore {
         private const val KEY_TARGET_PORT = "target_port"
         private const val KEY_DELETE_ENABLED = "delete_after_backup_enabled"
         private const val KEY_WORK_CADENCE_HOURS = "work_cadence_hours"
+        private const val KEY_COALESCE_WINDOW_HOURS = "coalesce_window_hours"
     }
 }

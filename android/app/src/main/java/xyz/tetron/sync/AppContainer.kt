@@ -51,7 +51,14 @@ class AppContainer(context: Context) {
     val mediaAccess = AndroidMediaAccess(appContext)
     val deviceState = AndroidDeviceStateProvider(appContext)
     val historyStore: RunHistoryStore = SharedPreferencesRunHistoryStore(appContext)
-    private val coalescer = GateNotificationCoalescer()
+
+    /** Read once at construction, not live like `gateConfig`/`deleteConfig`
+     *  -- same "takes effect at next app start" bar as [schedulePeriodicWork],
+     *  since the coalescer (unlike those two suppliers) is a stateful
+     *  per-reason timer, not a pure per-run read. */
+    private val coalescer = GateNotificationCoalescer(
+        windowMillis = Duration.ofHours(settingsStore.coalesceWindowHours()).toMillis(),
+    )
 
     val pipeline: SyncPipeline = SyncPipeline(
         bridge = bridge,
