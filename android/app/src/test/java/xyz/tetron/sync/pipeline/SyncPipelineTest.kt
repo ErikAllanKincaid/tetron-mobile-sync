@@ -324,6 +324,59 @@ class SyncPipelineTest {
     }
 
     @Test
+    fun override_matchingReason_relaxesGateAndRuns() {
+        var invoked = false
+        val pipeline = pipeline(
+            deviceState = object : DeviceStateProvider {
+                override fun isWifiConnected() = false
+                override fun isCharging() = true
+                override fun batteryPercent() = 100
+            },
+            transferRunner = { _, _, _, _ -> invoked = true; outcome(1, 1) },
+        )
+
+        val result = pipeline.run(overrideReason = GateReason.NotOnWifi)
+
+        assertTrue("override for the actual blocking reason must proceed with the run", invoked)
+        assertTrue(result is PipelineResult.Ran)
+    }
+
+    @Test
+    fun override_mismatchedReason_staysGated_neverInvokesRunner() {
+        var invoked = false
+        val pipeline = pipeline(
+            deviceState = object : DeviceStateProvider {
+                override fun isWifiConnected() = false
+                override fun isCharging() = false
+                override fun batteryPercent() = 100
+            },
+            gateConfig = GateConfig(chargingRequired = true),
+            transferRunner = { _, _, _, _ -> invoked = true; outcome(1, 1) },
+        )
+
+        // Blocked on NotOnWifi (evaluated first); overriding a different
+        // reason must not relax anything.
+        val result = pipeline.run(overrideReason = GateReason.ChargingRequired)
+
+        assertEquals(PipelineResult.Gated(GateReason.NotOnWifi), result)
+        assertFalse(invoked)
+    }
+
+    @Test
+    fun override_forNonRelaxableReason_staysGated() {
+        var invoked = false
+        val pipeline = pipeline(
+            snapshot = openSnapshot().copy(state = BridgeTunnelState.Standby),
+            transferRunner = { _, _, _, _ -> invoked = true; outcome(1, 1) },
+        )
+
+        val result = pipeline.run(overrideReason = GateReason.TunnelNotActive)
+
+        assertEquals(PipelineResult.Gated(GateReason.TunnelNotActive), result)
+        assertFalse("TunnelNotActive has no relaxable knob", invoked)
+    }
+
+    @Test
     fun callerSuppliedProgressListener_stillReceivesEveryEvent() {
         val seen = mutableListOf<String?>()
         val pipeline = pipeline(

@@ -18,6 +18,7 @@ import xyz.tetron.sync.gates.GateEvaluator
 import xyz.tetron.sync.gates.GateInputs
 import xyz.tetron.sync.gates.GateNotificationCoalescer
 import xyz.tetron.sync.gates.GateReason
+import xyz.tetron.sync.gates.relaxedGateConfig
 
 /**
  * SYNC-005: the single run path every trigger (SYNC-006) funnels into.
@@ -37,6 +38,9 @@ import xyz.tetron.sync.gates.GateReason
  * is opted in, hands the byte-verified transferred-this-run set to
  * [deletionRequester]. Default-constructed [deleteConfig]/[deletionRequester]
  * mean this is a no-op unless a caller opts in.
+ *
+ * SYNC-009: [run]'s `overrideReason` parameter is the Home screen's
+ * "Transfer anyway?" confirm -- see [resolveOverride]/[relaxedGateConfig].
  */
 class SyncPipeline(
     private val bridge: MeshBridge,
@@ -57,17 +61,23 @@ class SyncPipeline(
 
     /** Synchronous and blocking (network I/O on the calling thread, same
      *  contract as [uniffi.tetron_mobile_sync.SyncEngine.runClient]) --
-     *  callers must invoke this off the main thread. */
-    fun run(progress: SyncProgressListener? = null): PipelineResult {
+     *  callers must invoke this off the main thread.
+     *
+     *  [overrideReason] is SYNC-009's "Transfer anyway?" confirm: when the
+     *  AND-matrix blocks on exactly this reason, the run proceeds with
+     *  that one gate's knob relaxed ([relaxedGateConfig]) instead of being
+     *  gated. It has no effect when the block reason differs (including a
+     *  reason with no relaxable knob) or when nothing is blocking. */
+    fun run(progress: SyncProgressListener? = null, overrideReason: GateReason? = null): PipelineResult {
         if (!running.compareAndSet(false, true)) return PipelineResult.AlreadyRunning
         try {
-            return runOnce(progress)
+            return runOnce(progress, overrideReason)
         } finally {
             running.set(false)
         }
     }
 
-    private fun runOnce(progress: SyncProgressListener?): PipelineResult {
+    private fun runOnce(progress: SyncProgressListener?, overrideReason: GateReason?): PipelineResult {
         val snapshot = (bridge.current() as? BridgeResponse.Snapshot)?.snapshot
         val target = targetProvider.currentTarget()
         val targetConnKind = target?.let { t -> snapshot?.peers?.firstOrNull { it.ip == t.meshIp }?.connKind }
@@ -81,7 +91,10 @@ class SyncPipeline(
         )
 
         when (val decision = GateEvaluator.evaluate(inputs, gateConfig)) {
-            is GateDecision.Blocked -> return gated(decision.reason)
+            is GateDecision.Blocked -> {
+                val overridden = resolveOverride(decision, inputs, overrideReason)
+                if (overridden is GateDecision.Blocked) return gated(overridden.reason)
+            }
             GateDecision.Allowed -> Unit
         }
 
@@ -122,6 +135,23 @@ class SyncPipeline(
         }
         historyStore.recordRun(record)
         return PipelineResult.Ran(record)
+    }
+
+    /** SYNC-009: applies [overrideReason] only when it names the exact
+     *  reason [blocked] blocked on this cycle -- a stale/mismatched
+     *  override (e.g. the device dropped Wi-Fi AND went low-battery
+     *  between the confirm dialog and this call) is rejected, since only
+     *  whichever reason actually blocks now is meaningful. Returns
+     *  [GateDecision.Allowed] when the relaxed config now passes,
+     *  otherwise the (possibly different) still-blocking decision. */
+    private fun resolveOverride(
+        blocked: GateDecision.Blocked,
+        inputs: GateInputs,
+        overrideReason: GateReason?,
+    ): GateDecision {
+        if (overrideReason != blocked.reason) return blocked
+        val relaxed = relaxedGateConfig(blocked.reason, gateConfig) ?: return blocked
+        return GateEvaluator.evaluate(inputs, relaxed)
     }
 
     /** SYNC-007: never touches [deletionRequester] when the opt-in is off or
