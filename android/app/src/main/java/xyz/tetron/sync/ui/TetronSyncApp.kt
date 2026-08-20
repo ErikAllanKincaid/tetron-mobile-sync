@@ -8,7 +8,6 @@ import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
@@ -45,7 +44,7 @@ private sealed class Destination(val route: String, val label: String, val icon:
 /**
  * SYNC-009: the app shell -- bottom navigation across Home/Progress/
  * History (Settings joins in a later slice of this requirement), all
- * hosted under one [MaterialTheme]. [HomeViewModel] is requested scoped to
+ * hosted under one [TetronSyncTheme]. [HomeViewModel] is requested scoped to
  * the hosting Activity ([LocalContext.current] here is always
  * `MainActivity`, this app's only Activity) so Home and Progress observe
  * the exact same in-flight [xyz.tetron.sync.ui.home.RunPhase] -- a run
@@ -59,7 +58,7 @@ fun TetronSyncApp(container: AppContainer) {
     val homeViewModel: HomeViewModel = viewModel(activity, factory = factory)
     val navController = rememberNavController()
 
-    MaterialTheme {
+    TetronSyncTheme {
         Scaffold(
             bottomBar = {
                 val backStackEntry by navController.currentBackStackEntryAsState()
