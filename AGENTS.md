@@ -213,11 +213,90 @@ adapters (same bar as `ProviderStatusCaller`); `TargetProvider` and
 target) and SYNC-008 (DCIM/permission-aware source) own the real
 implementations, "wiring is minimal" as this file already anticipated.
 `:app:assembleDebug` + `:app:testDebugUnitTest` + `python3 reconcile.py`
-all green. The next requirement is SYNC-006 (trigger model, depends on
-SYNC-005) or SYNC-008/SYNC-010 in parallel (no dependency on SYNC-005). The
-build is scoped as SYNC-001..SYNC-011 in `spec/sync.py`, which also records
-the decision register (consensus 2026-08-18) and the still-open items.
-Dependency ordering (also stated per-class in `spec/sync.py`):
+all green.
+
+**SYNC-006 (trigger model v1) is IMPLEMENTED as of 2026-08-19**
+(`xyz.tetron.sync.trigger`, no branch cut yet). All three triggers funnel
+through one seam, `fun interface PipelineRunner { fun run(): PipelineResult }`
+(production wiring is `PipelineRunner { pipeline.run() }`, SAM-converted;
+kept separate from `SyncPipeline` itself so trigger-layer tests never need
+the bridge/target/source dependencies a real pipeline requires):
+- **Manual**: `ManualTrigger.triggerNow()` -- a direct, blocking pass-through
+  (SYNC-009 wires the actual button and the background dispatch, same
+  pattern `MainActivity`'s scaffold screen already uses for
+  `SyncEngine.version()`).
+- **Periodic**: `SyncWorker` (a real `androidx.work.Worker`, constructed
+  with an injected `PipelineRunner` by `SyncWorkerFactory` rather than
+  WorkManager's reflective default factory, since that only supports a
+  bare `(Context, WorkerParameters)` constructor) delegates to
+  `performSyncWork(PipelineRunner): ListenableWorker.Result` -- pulled out
+  as a standalone function specifically so it is JVM-unit-testable without
+  constructing a `Worker` (whose `WorkerParameters` has no public
+  constructor outside WorkManager's own test harness). `SyncWorkScheduler
+  .schedule` enqueues it via `enqueueUniquePeriodicWork` with
+  `ExistingPeriodicWorkPolicy.KEEP` (relaunching the app must not reset an
+  already-scheduled timer) at a ~daily default interval, `NetworkType
+  .CONNECTED` as a coarse WorkManager-level pre-filter only -- the real
+  Wi-Fi/direct/battery/charging decision still runs inside the pipeline
+  every firing, since WorkManager constraints cannot express "Wi-Fi only,
+  never a network-type heuristic" (SYNC-004 decision #4/#11).
+- **Network-change**: `AndroidNetworkChangeTrigger` registers a
+  `ConnectivityManager.NetworkCallback` (host-lifecycle-scoped
+  `register()`/`unregister()`, deliberately no manifest
+  `BroadcastReceiver` -- "not a wake-up mechanism" per spec) that calls
+  `NetworkChangeDispatcher.onNetworkAvailable()`, split out the same way as
+  `performSyncWork` so the dispatch behavior (submit to an executor, never
+  run inline on the Binder callback thread since the runner blocks on
+  network I/O) is JVM-testable without `android.net.Network` (which has no
+  usable public constructor outside Robolectric).
+
+11 new JVM unit tests cover: each trigger invokes `PipelineRunner.run()`
+exactly once per firing and passes the result through unchanged (including
+`AlreadyRunning`, proving the trigger layer adds no logic on top of
+SYNC-005's own reentrancy guard rather than re-testing that guard itself);
+`performSyncWork`'s full result mapping (hard failure -> `retry()`,
+everything else including gated/already-running -> `success()`, since
+neither is an error at this layer); and `SyncWorkScheduler
+.buildPeriodicRequest`'s interval/constraint, built and asserted on
+directly -- `PeriodicWorkRequestBuilder`/`Constraints` are plain
+`work-runtime` classes, not `android.jar` stubs, so this needed no
+Robolectric. A new instrumented test, `SyncWorkSchedulerDeviceTest`, uses
+WorkManager's own `work-testing` harness (`WorkManagerTestInitHelper`,
+`SynchronousExecutor`) to assert `schedule()` actually enqueues the job
+under its unique name -- satisfies ACCEPTANCE's "instrumented test (or
+manual adb check) confirms the WorkManager job is scheduled" without
+needing to wait on real ~daily OS scheduling (unverifiable in a test run
+regardless; SYNC-011 covers real-device behavior for the app as a whole).
+Explicitly not built here, matching the spec's "must not foreclose it": the
+v2 foreground-service + MediaStore `ContentObserver` instant-upload mode --
+a v2 trigger would just be one more `PipelineRunner` caller.
+
+Also fixes a second gap this surfaced, alongside the SYNC-002/005 stale-
+bindings bug above: `AndroidManifest.xml` had never actually gained
+`INTERNET`/`ACCESS_NETWORK_STATE`, despite the SYNC-001 scaffold comment
+claiming they'd "arrive with SYNC-002"/SYNC-004 -- neither requirement
+touched the manifest. Harmless while nothing in the manifest's own
+component graph exercised `ConnectivityManager`/rsync sockets, but
+SYNC-006 is the first requirement to actually register a manifest-adjacent
+`NetworkCallback` and a `WorkManager` job with a network constraint, so it
+is fixed here (with the corrected history noted inline in the manifest
+comment) rather than left for whichever requirement happened to notice it
+missing on a real device.
+
+Production DI wiring -- constructing a real `SyncPipeline` (needs
+`TargetProvider`/`SourcePathProvider`, still SYNC-009/SYNC-008-owned
+contracts only) and registering `SyncWorkerFactory` via `WorkManager
+.initialize`/`Configuration.Provider` -- is intentionally not done yet,
+same "wiring is minimal until its dependency lands" note as SYNC-005's own
+adapters. `:app:assembleDebug` + `:app:testDebugUnitTest` +
+`:app:compileDebugAndroidTestKotlin` + `python3 reconcile.py` all green.
+The next requirement is SYNC-007 (delete-after-backup, depends on
+SYNC-005 only, already met), or SYNC-008/SYNC-010 in parallel (no
+dependency on SYNC-006); SYNC-009 still needs SYNC-007 and SYNC-008 first.
+The build is scoped as SYNC-001..SYNC-011 in
+`spec/sync.py`, which also records the decision register (consensus
+2026-08-18) and the still-open items. Dependency ordering (also stated
+per-class in `spec/sync.py`):
 
 - SYNC-001 repo scaffold (crate + Gradle/Compose app, GPL-3.0, mirror of tetron-mobile's proven pipeline) — no deps, first.
 - SYNC-002 embedded oc-rsync engine (vendored patched fork `vendor/oc-rsync/`, embed `crates/core` with `default-features = false, features = ["zstd", "lz4", "xattr"]` -- not the spike's root-bin string, see `vendor/oc-rsync/PATCHES.md` "Embedded-build note", `--partial` resume, `TransferProgressCallback` through UniFFI) — after SYNC-001.

@@ -96,11 +96,17 @@ dependencies {
     // not raw JNI.
     implementation("net.java.dev.jna:jna:5.15.0@aar")
 
+    // SYNC-006: v1 trigger layer's periodic job (decision #14).
+    implementation("androidx.work:work-runtime-ktx:2.10.0")
+
     testImplementation("junit:junit:4.13.2")
 
     // SYNC-001: instrumented smoke test deps -- runner + JUnit4.
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test:core-ktx:1.6.1")
+    // SYNC-006: WorkManager's own test harness -- verifies a request was
+    // enqueued without waiting on real OS scheduling.
+    androidTestImplementation("androidx.work:work-testing:2.10.0")
     androidTestImplementation("junit:junit:4.13.2")
 }
