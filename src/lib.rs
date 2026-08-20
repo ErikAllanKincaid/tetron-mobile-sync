@@ -59,6 +59,14 @@ pub struct SyncRunOptions {
 /// transfer-relative path of the entry (None on the synthetic end-of-run
 /// summary line). `files_done` is the 1-based count of regular files
 /// transferred so far, `files_total` the full count for the run.
+///
+/// `is_transfer` and `is_final` exist for SYNC-007 (delete-after-backup):
+/// together they identify the exact set of events that represent a
+/// byte-verified regular-file data transfer completing, as opposed to a
+/// mid-transfer tick, a skip, or a non-data action (directory/symlink/
+/// hardlink) that the file-list walk still emits progress for. A caller
+/// building a "files this run actually transferred" set must filter on
+/// `is_transfer && is_final`, not merely on `path.is_some()`.
 #[derive(Debug, uniffi::Record)]
 pub struct SyncProgressEvent {
     pub path: Option<String>,
@@ -69,6 +77,15 @@ pub struct SyncProgressEvent {
     pub files_total: u64,
     pub flist_eof: bool,
     pub transfer_complete: bool,
+    /// Whether the underlying action is regular-file data transfer
+    /// (`ClientEventKind::DataCopied`/`ReferenceCopied`) rather than a
+    /// directory/symlink/hardlink/device/skip -- mirrors
+    /// `ClientEventKind::is_transfer()`.
+    pub is_transfer: bool,
+    /// Whether this update is the completion tick for its entry (mirrors
+    /// `ClientProgressUpdate::is_final()`), as opposed to an in-flight
+    /// progress tick for a still-copying file.
+    pub is_final: bool,
 }
 
 /// Callback interface the Kotlin app implements (UniFFI callback interface),
@@ -200,6 +217,8 @@ impl SyncProgressEvent {
             files_total: update.total() as u64,
             flist_eof: update.flist_eof(),
             transfer_complete: update.is_transfer_complete(),
+            is_transfer: update.event().kind().is_transfer(),
+            is_final: update.is_final(),
         }
     }
 }

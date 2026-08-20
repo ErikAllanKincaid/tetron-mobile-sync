@@ -10,6 +10,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.tetron_mobile_sync.SyncException
+import uniffi.tetron_mobile_sync.SyncProgressEvent
 import uniffi.tetron_mobile_sync.SyncTransferOutcome
 import xyz.tetron.sync.bridge.BridgePeer
 import xyz.tetron.sync.bridge.BridgeResponse
@@ -18,6 +19,7 @@ import xyz.tetron.sync.bridge.BridgeTunnelState
 import xyz.tetron.sync.bridge.ConnKind
 import xyz.tetron.sync.bridge.MeshBridge
 import xyz.tetron.sync.bridge.StatusCaller
+import xyz.tetron.sync.delete.DeleteAfterBackupConfig
 import xyz.tetron.sync.gates.GateConfig
 import xyz.tetron.sync.gates.GateNotificationCoalescer
 import xyz.tetron.sync.gates.GateReason
@@ -68,6 +70,8 @@ class SyncPipelineTest {
         gateConfig: GateConfig = GateConfig(),
         coalescer: GateNotificationCoalescer = GateNotificationCoalescer(),
         onNotify: (GateReason) -> Unit = {},
+        deleteConfig: DeleteAfterBackupConfig = DeleteAfterBackupConfig(),
+        deletionRequester: xyz.tetron.sync.delete.DeletionRequester = xyz.tetron.sync.delete.DeletionRequester {},
     ) = SyncPipeline(
         bridge = bridgeWith(snapshot),
         targetProvider = targetProvider,
@@ -78,7 +82,23 @@ class SyncPipelineTest {
         coalescer = coalescer,
         gateConfig = gateConfig,
         onNotify = onNotify,
+        deleteConfig = deleteConfig,
+        deletionRequester = deletionRequester,
     )
+
+    private fun transferEvent(path: String, isTransfer: Boolean = true, isFinal: Boolean = true) =
+        SyncProgressEvent(
+            path = path,
+            totalBytes = null,
+            overallTransferred = 0UL,
+            overallTotalBytes = null,
+            filesDone = 1UL,
+            filesTotal = 1UL,
+            flistEof = true,
+            transferComplete = false,
+            isTransfer = isTransfer,
+            isFinal = isFinal,
+        )
 
     private fun outcome(filesCopied: Int, filesTotal: Int, ioErrorExitCode: Int? = null) =
         SyncTransferOutcome(
@@ -228,5 +248,97 @@ class SyncPipelineTest {
         pipeline.run()
 
         assertEquals("second gated cycle for the same reason must be coalesced", 1, notifyCount)
+    }
+
+    @Test
+    fun deleteEnabled_requestsDelete_forTransferredFilesOnly() {
+        var requested: List<String>? = null
+        val pipeline = pipeline(
+            transferRunner = { _, _, _, progress ->
+                progress?.onProgress(transferEvent("a.jpg"))
+                // A mid-transfer tick for a file still in flight: not final.
+                progress?.onProgress(transferEvent("b.jpg", isFinal = false))
+                // An already-present skip: never a byte-verified transfer.
+                progress?.onProgress(transferEvent("c.jpg", isTransfer = false))
+                outcome(filesCopied = 1, filesTotal = 3)
+            },
+            deleteConfig = DeleteAfterBackupConfig(enabled = true),
+            deletionRequester = xyz.tetron.sync.delete.DeletionRequester { requested = it },
+        )
+
+        pipeline.run()
+
+        assertEquals(listOf("a.jpg"), requested)
+    }
+
+    @Test
+    fun deleteDisabled_neverRequestsDelete_evenWithTransferredFiles() {
+        var invoked = false
+        val pipeline = pipeline(
+            transferRunner = { _, _, _, progress ->
+                progress?.onProgress(transferEvent("a.jpg"))
+                outcome(filesCopied = 1, filesTotal = 1)
+            },
+            deleteConfig = DeleteAfterBackupConfig(enabled = false),
+            deletionRequester = xyz.tetron.sync.delete.DeletionRequester { invoked = true },
+        )
+
+        pipeline.run()
+
+        assertFalse("delete-after-backup opt-in is off; no delete path may run", invoked)
+    }
+
+    @Test
+    fun deleteEnabled_hardEngineFailure_neverRequestsDelete() {
+        var invoked = false
+        val pipeline = pipeline(
+            transferRunner = { _, _, _, progress ->
+                progress?.onProgress(transferEvent("a.jpg"))
+                throw SyncException.Engine(exitCode = 1, detail = "connection refused")
+            },
+            deleteConfig = DeleteAfterBackupConfig(enabled = true),
+            deletionRequester = xyz.tetron.sync.delete.DeletionRequester { invoked = true },
+        )
+
+        pipeline.run()
+
+        assertFalse("a hard engine failure must not trigger deletion", invoked)
+    }
+
+    @Test
+    fun deleteEnabled_interruptedRun_stillRequestsDelete() {
+        var requested: List<String>? = null
+        val pipeline = pipeline(
+            transferRunner = { _, _, _, progress ->
+                progress?.onProgress(transferEvent("a.jpg"))
+                outcome(filesCopied = 1, filesTotal = 2, ioErrorExitCode = 23)
+            },
+            deleteConfig = DeleteAfterBackupConfig(enabled = true),
+            deletionRequester = xyz.tetron.sync.delete.DeletionRequester { requested = it },
+        )
+
+        val record = (pipeline.run() as PipelineResult.Ran).record
+
+        assertTrue(record.interrupted)
+        assertEquals("interrupted is not a failure; what did byte-verify stays eligible", listOf("a.jpg"), requested)
+    }
+
+    @Test
+    fun callerSuppliedProgressListener_stillReceivesEveryEvent() {
+        val seen = mutableListOf<String?>()
+        val pipeline = pipeline(
+            transferRunner = { _, _, _, progress ->
+                progress?.onProgress(transferEvent("a.jpg"))
+                outcome(filesCopied = 1, filesTotal = 1)
+            },
+        )
+
+        pipeline.run(object : uniffi.tetron_mobile_sync.SyncProgressListener {
+            override fun onProgress(event: SyncProgressEvent) {
+                seen.add(event.path)
+            }
+        })
+
+        assertEquals(listOf("a.jpg"), seen)
     }
 }

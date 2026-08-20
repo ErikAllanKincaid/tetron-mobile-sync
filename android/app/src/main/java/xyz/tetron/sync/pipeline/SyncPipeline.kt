@@ -8,6 +8,10 @@ import uniffi.tetron_mobile_sync.SyncRunOptions
 import xyz.tetron.sync.bridge.BridgeResponse
 import xyz.tetron.sync.bridge.BridgeTunnelState
 import xyz.tetron.sync.bridge.MeshBridge
+import xyz.tetron.sync.delete.DeleteAfterBackupConfig
+import xyz.tetron.sync.delete.DeletionRequester
+import xyz.tetron.sync.delete.TransferredFileCollector
+import xyz.tetron.sync.delete.resolveDeleteSet
 import xyz.tetron.sync.gates.GateConfig
 import xyz.tetron.sync.gates.GateDecision
 import xyz.tetron.sync.gates.GateEvaluator
@@ -27,6 +31,12 @@ import xyz.tetron.sync.gates.GateReason
  * [coalescer] has not already notified for that reason within its window;
  * it does not post the actual notification (SYNC-009 owns channels/copy),
  * it only decides *when*.
+ *
+ * SYNC-007: a successful (including interrupted -- not a failure) run tees
+ * [progress] through a [TransferredFileCollector] and, when [deleteConfig]
+ * is opted in, hands the byte-verified transferred-this-run set to
+ * [deletionRequester]. Default-constructed [deleteConfig]/[deletionRequester]
+ * mean this is a no-op unless a caller opts in.
  */
 class SyncPipeline(
     private val bridge: MeshBridge,
@@ -40,6 +50,8 @@ class SyncPipeline(
     private val runOptions: SyncRunOptions = DEFAULT_RUN_OPTIONS,
     private val nowMillis: () -> Long = System::currentTimeMillis,
     private val onNotify: (GateReason) -> Unit = {},
+    private val deleteConfig: DeleteAfterBackupConfig = DeleteAfterBackupConfig(),
+    private val deletionRequester: DeletionRequester = DeletionRequester {},
 ) {
     private val running = AtomicBoolean(false)
 
@@ -81,10 +93,15 @@ class SyncPipeline(
         val source = sourcePathProvider.sourcePath() ?: return gated(GateReason.TargetUnreachable)
 
         val destination = "rsync://${target.meshIp}:${target.port}/${target.module}/"
+        val collector = TransferredFileCollector(progress)
         val record = try {
-            val outcome = transferRunner.run(source, destination, runOptions, progress)
+            val outcome = transferRunner.run(source, destination, runOptions, collector)
             val added = outcome.filesCopied.toInt()
             val total = outcome.filesTotal.toInt()
+            // SYNC-007: interrupted is explicitly NOT a failure (below), so
+            // whatever this run did byte-verify stays eligible for deletion
+            // -- only a hard engine exception (the catch branch) withholds it.
+            requestDeleteIfEnabled(collector.transferredPaths())
             RunRecord(
                 timestampMillis = nowMillis(),
                 added = added,
@@ -105,6 +122,14 @@ class SyncPipeline(
         }
         historyStore.recordRun(record)
         return PipelineResult.Ran(record)
+    }
+
+    /** SYNC-007: never touches [deletionRequester] when the opt-in is off or
+     *  nothing byte-verified transferred this run -- [resolveDeleteSet]
+     *  carries that gate so it stays testable independent of the pipeline. */
+    private fun requestDeleteIfEnabled(transferredPaths: List<String>) {
+        val deleteSet = resolveDeleteSet(deleteConfig, transferredPaths)
+        if (deleteSet.isNotEmpty()) deletionRequester.requestDelete(deleteSet)
     }
 
     private fun gated(reason: GateReason): PipelineResult.Gated {
