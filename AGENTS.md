@@ -138,12 +138,86 @@ all-true passes, tunnel-not-active priority over simultaneous failures,
 the cellular+Direct-allowed case from USER's 2026-08-18 correction) and
 coalescing (drop within window, per-reason independence, re-allow at/after
 the window, a dropped notification does not reset the window);
-`:app:testDebugUnitTest` and `python3 reconcile.py` both green. The next
-requirement is SYNC-005 (transfer pipeline, depends on SYNC-002 + SYNC-004);
-SYNC-008/SYNC-010 still have no dependency on it. The build is scoped as
-SYNC-001..SYNC-011 in `spec/sync.py`, which also records the decision
-register (consensus 2026-08-18) and the still-open items. Dependency
-ordering (also stated per-class in `spec/sync.py`):
+`:app:testDebugUnitTest` and `python3 reconcile.py` both green.
+
+**Bug found + fixed 2026-08-19, ahead of SYNC-005:** the committed
+`android/app/src/main/java/uniffi/tetron_mobile_sync/tetron_mobile_sync.kt`
+was stale -- generated at SYNC-001 (`version()` only) and never regenerated
+after SYNC-002 added `run_client`/`SyncRunOptions`/`SyncProgressListener`/
+`SyncTransferOutcome`/`SyncError`, so `:app:testDebugUnitTest` had been
+passing this whole time without the app ever actually compiling against
+the real engine surface. Regenerating it (`cargo build --features
+uniffi/cli`, then `cargo run --bin uniffi-bindgen --features uniffi/cli --
+generate --library target/debug/libtetron_mobile_sync.so --language kotlin
+--out-dir <dir>`) surfaced a real bug: `SyncError::Engine`'s `message`
+field collided with UniFFI's Kotlin codegen, which adds its own `override
+val message` (from `kotlin.Exception`) to every error variant -- Kotlin
+compilation failed with "Conflicting declarations: val message: String".
+Fixed in `src/lib.rs` by renaming the field to `detail` (now
+`SyncException.Engine(exitCode, detail)` on the Kotlin side); regenerated
+bindings compile clean. Neither the generated bindings file nor the
+`jniLibs/*.so` outputs are tracked by git (`.gitignore` lines 10/13) --
+both are local build artifacts from the explicit build step SYNC-001
+scoped ("Gradle task automation is a follow-up"), regenerate them with the
+two commands above (`cargo ndk -t arm64-v8a -t x86_64 -o
+android/app/src/main/jniLibs build` for the `.so`s) any time `src/lib.rs`'s
+UniFFI surface changes, before trusting `:app:assembleDebug`/
+`:app:testDebugUnitTest` to mean the Kotlin side actually still matches it.
+
+**SYNC-005 (transfer pipeline) is IMPLEMENTED as of 2026-08-19**
+(`xyz.tetron.sync.pipeline`, no branch cut yet). `SyncPipeline.run
+(SyncProgressListener?): PipelineResult` is the single path every trigger
+(SYNC-006) will call: query the SYNC-003 bridge -> build `GateInputs` (the
+configured target's `ConnKind` is looked up by matching its `meshIp`
+against the snapshot's peer roster; a non-`Snapshot` bridge response maps
+to `BridgeTunnelState.Unknown`, which the tunnel-active gate blocks the
+same as a real down tunnel) -> `GateEvaluator.evaluate` (SYNC-004) ->
+resolve target + source path -> invoke the engine through a
+[`TransferRunner`] seam -> record a `RunRecord` -> return. A missing
+target, a target absent from the roster (`directOnly` gate) or with no
+resolvable source path (SYNC-008 not landed yet) all surface through
+`GateReason.TargetUnreachable` rather than a special-cased error, per
+SYNC-008's "target-unreachable-style failure, not a crash" framing --
+deliberately reusing the existing six-reason vocabulary instead of growing
+a parallel one. `TransferRunner`/`TargetProvider`/`SourcePathProvider`/
+`DeviceStateProvider`/`RunHistoryStore` are all fakeable seams (same
+pattern as SYNC-003's `StatusCaller`) so `SyncPipelineTest`'s 9 JVM unit
+tests never touch the native `.so`; the engine's own byte-identical/
+resume/idempotent behavior is what SYNC-002's `tests/engine_rsyncd.rs`
+already covers (ACCEPTANCE's "host-side integration test... drives the
+full pipeline: seeded tree -> run -> present -> idempotent re-run ->
+interrupt -> resume" is exactly those three already-passing cases; SYNC-005
+adds no new Rust test because it adds no new Rust engine behavior).
+Reentrancy is an `AtomicBoolean` guard around the whole synchronous,
+blocking `run()` call -- a concurrent trigger gets `PipelineResult
+.AlreadyRunning` with the transfer runner invoked exactly once, verified
+with a two-thread `CountDownLatch` test. History is a single last-run
+record (`RunRecord`: added/skipped/failed counts, `interrupted` flag,
+`failureReason`), matching SYNC-009's History screen wording ("last run
+time" singular, not a log); `interrupted` (engine returns a summary with
+`ioErrorExitCode` set, e.g. rsync exit 23/24) is explicitly NOT counted as
+`failed` (spec/sync.py SYNC-005: "a partial/interrupted run is NOT an
+error state"), only a thrown `SyncException` is, and the pipeline always
+catches it into a `Ran` result rather than propagating -- callers (UI,
+WorkManager) never need a try/catch. A gated cycle is never written to
+history (only actual attempts are), matching the spec's "skip cycle and
+notify" framing as distinct from a run. `onNotify: (GateReason) -> Unit`
+is called at most once per gated cycle, gated itself by SYNC-004's
+`GateNotificationCoalescer` -- the pipeline decides *when* to notify, not
+*how* (channels/copy are SYNC-009). `EngineTransferRunner` (wraps
+`SyncEngineInterface.runClient`) and `AndroidDeviceStateProvider` (wraps
+`ConnectivityManager`/`BatteryManager`, matching SYNC-004's exact "Wi-Fi
+only -- `TRANSPORT_WIFI` check" language) are the real, untested-by-design
+adapters (same bar as `ProviderStatusCaller`); `TargetProvider` and
+`SourcePathProvider` are contracts only -- SYNC-009 (settings-backed
+target) and SYNC-008 (DCIM/permission-aware source) own the real
+implementations, "wiring is minimal" as this file already anticipated.
+`:app:assembleDebug` + `:app:testDebugUnitTest` + `python3 reconcile.py`
+all green. The next requirement is SYNC-006 (trigger model, depends on
+SYNC-005) or SYNC-008/SYNC-010 in parallel (no dependency on SYNC-005). The
+build is scoped as SYNC-001..SYNC-011 in `spec/sync.py`, which also records
+the decision register (consensus 2026-08-18) and the still-open items.
+Dependency ordering (also stated per-class in `spec/sync.py`):
 
 - SYNC-001 repo scaffold (crate + Gradle/Compose app, GPL-3.0, mirror of tetron-mobile's proven pipeline) — no deps, first.
 - SYNC-002 embedded oc-rsync engine (vendored patched fork `vendor/oc-rsync/`, embed `crates/core` with `default-features = false, features = ["zstd", "lz4", "xattr"]` -- not the spike's root-bin string, see `vendor/oc-rsync/PATCHES.md` "Embedded-build note", `--partial` resume, `TransferProgressCallback` through UniFFI) — after SYNC-001.
