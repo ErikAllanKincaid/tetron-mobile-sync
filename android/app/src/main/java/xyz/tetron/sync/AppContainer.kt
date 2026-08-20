@@ -9,6 +9,8 @@ import java.util.concurrent.Executors
 import uniffi.tetron_mobile_sync.SyncEngine
 import xyz.tetron.sync.bridge.MeshBridge
 import xyz.tetron.sync.bridge.ProviderStatusCaller
+import xyz.tetron.sync.delete.DeleteIntentSenderLauncher
+import xyz.tetron.sync.delete.MediaStoreDeletionRequester
 import xyz.tetron.sync.gates.GateNotificationCoalescer
 import xyz.tetron.sync.media.AndroidMediaAccess
 import xyz.tetron.sync.notifications.SyncNotifier
@@ -37,12 +39,17 @@ import xyz.tetron.sync.trigger.SyncWorkerFactory
  * so a Settings-screen toggle reaches the very next pipeline run with no
  * rebuild of [pipeline] itself.
  *
- * [pipeline]'s `deletionRequester` stays the SYNC-007 no-op default here --
- * the real `MediaStoreDeletionRequester` needs an `Activity` to launch the
- * system confirm dialog and lands in a later slice of this same
- * requirement; until then delete-after-backup is inert even if a tester
- * flips the setting on, which is the correct default for "never silently
- * deletes" rather than a half-finished delete path.
+ * [pipeline]'s `deletionRequester` is the real [MediaStoreDeletionRequester],
+ * but it needs an `Activity` to launch the system confirm dialog
+ * (`ActivityResultContracts.StartIntentSenderForResult`), which this
+ * process-scoped container does not have -- same seam split as the
+ * SYNC-008 permission launchers. [deleteIntentSenderLauncher] is the
+ * mutable indirection that makes that work without making [pipeline]
+ * itself mutable: [xyz.tetron.sync.MainActivity] sets it once in
+ * `onCreate`, and [MediaStoreDeletionRequester] forwards through whatever
+ * is currently set (`null` only in the impossible window before that
+ * happens, in which case a delete request is silently dropped rather than
+ * crashing the pipeline thread).
  *
  * [notifier] finally gives SYNC-004's `onNotify` gate hook and SYNC-005's
  * completion result somewhere real to go -- both existed as plumbing with
@@ -66,6 +73,15 @@ class AppContainer(context: Context) {
     )
     private val notifier = SyncNotifier(appContext)
 
+    /** Set by [xyz.tetron.sync.MainActivity] once its `ActivityResultLauncher`
+     *  is registered; see the class doc for why this is mutable. */
+    var deleteIntentSenderLauncher: DeleteIntentSenderLauncher? = null
+
+    private val deletionRequester = MediaStoreDeletionRequester(
+        contentResolver = appContext.contentResolver,
+        launcher = DeleteIntentSenderLauncher { intentSender -> deleteIntentSenderLauncher?.launch(intentSender) },
+    )
+
     val pipeline: SyncPipeline = SyncPipeline(
         bridge = bridge,
         targetProvider = { settingsStore.target() },
@@ -78,6 +94,7 @@ class AppContainer(context: Context) {
         deleteConfig = { settingsStore.deleteAfterBackupConfig() },
         onNotify = notifier::notifyGated,
         onRunCompleted = notifier::notifyRunCompleted,
+        deletionRequester = deletionRequester,
     )
 
     /** SYNC-006's trigger layer, real wiring deferred until SYNC-008/009 --

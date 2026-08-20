@@ -7,8 +7,10 @@ import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import xyz.tetron.sync.delete.DeleteIntentSenderLauncher
 import xyz.tetron.sync.media.AndroidMediaAccess
 import xyz.tetron.sync.ui.TetronSyncApp
 
@@ -35,17 +37,30 @@ import xyz.tetron.sync.ui.TetronSyncApp
  * at all to request it from -- unusual for this app's own "not eagerly"
  * precedent (SYNC-008), but the least-bad option given no better trigger
  * point exists.
+ *
+ * SYNC-007's real `MediaStoreDeletionRequester` needs the same kind of
+ * Activity-owned launcher, this time for the system delete-confirm
+ * `IntentSender` `MediaStore.createDeleteRequest` returns
+ * ([deleteIntentSenderLauncher]); [AppContainer.deleteIntentSenderLauncher]
+ * is set here so [xyz.tetron.sync.delete.MediaStoreDeletionRequester] (built
+ * once, process-scoped, at [AppContainer] construction time) has somewhere
+ * to forward through once this Activity exists.
  */
 class MainActivity : ComponentActivity() {
     private val requestMediaPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
     private val requestNotificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    private val deleteIntentSenderLauncher =
+        registerForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         requestNotificationPermissionIfNeeded()
         val container = (application as TetronSyncApplication).container
+        container.deleteIntentSenderLauncher = DeleteIntentSenderLauncher { intentSender ->
+            deleteIntentSenderLauncher.launch(IntentSenderRequest.Builder(intentSender).build())
+        }
         setContent {
             TetronSyncApp(
                 container = container,
