@@ -32,6 +32,16 @@
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
 
+    <!-- SYNC-009: gate-blocked and completion/failure notifications
+         (xyz.tetron.sync.notifications.SyncNotifier). API 33+ requires
+         this as a runtime-requested dangerous permission, same as the
+         media permissions above; MainActivity requests it eagerly at
+         first launch rather than tied to a specific button, since (unlike
+         photo access) there is no single natural action in this app's
+         flow to hang the request on and a background-triggered run has no
+         UI moment at all to request it from. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <!-- SYNC-003: package-visibility declaration for the MOBILE-024 bridge.
          ContentResolver.call() itself reaches any exported provider without
          this; it only makes PackageManager.resolveContentProvider() (used

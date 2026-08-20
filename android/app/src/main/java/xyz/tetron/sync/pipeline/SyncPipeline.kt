@@ -45,7 +45,12 @@ import xyz.tetron.sync.gates.relaxedGateConfig
  * on every [run] call -- a Settings-screen toggle must be reflected on the
  * very next run (SYNC-009 ACCEPTANCE), and this [SyncPipeline] instance is
  * a long-lived singleton in the app's composition root, constructed once
- * well before any particular settings value is known.
+ * well before any particular settings value is known. [onRunCompleted] is
+ * called once per attempted run (success, interrupted, or hard failure
+ * alike) right after [historyStore] is updated -- unlike [onNotify] it is
+ * never coalesced, since a completion/failure notification is not the
+ * "skip and notify" case decision #3 was written for; the caller decides
+ * what to do with it (SYNC-009's notification channels).
  */
 class SyncPipeline(
     private val bridge: MeshBridge,
@@ -61,6 +66,7 @@ class SyncPipeline(
     private val onNotify: (GateReason) -> Unit = {},
     private val deleteConfig: () -> DeleteAfterBackupConfig = { DeleteAfterBackupConfig() },
     private val deletionRequester: DeletionRequester = DeletionRequester {},
+    private val onRunCompleted: (RunRecord) -> Unit = {},
 ) {
     private val running = AtomicBoolean(false)
 
@@ -140,6 +146,7 @@ class SyncPipeline(
             )
         }
         historyStore.recordRun(record)
+        onRunCompleted(record)
         return PipelineResult.Ran(record)
     }
 

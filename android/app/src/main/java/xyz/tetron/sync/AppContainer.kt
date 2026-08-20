@@ -11,6 +11,7 @@ import xyz.tetron.sync.bridge.MeshBridge
 import xyz.tetron.sync.bridge.ProviderStatusCaller
 import xyz.tetron.sync.gates.GateNotificationCoalescer
 import xyz.tetron.sync.media.AndroidMediaAccess
+import xyz.tetron.sync.notifications.SyncNotifier
 import xyz.tetron.sync.pipeline.AndroidDeviceStateProvider
 import xyz.tetron.sync.pipeline.EngineTransferRunner
 import xyz.tetron.sync.pipeline.RunHistoryStore
@@ -42,6 +43,10 @@ import xyz.tetron.sync.trigger.SyncWorkerFactory
  * requirement; until then delete-after-backup is inert even if a tester
  * flips the setting on, which is the correct default for "never silently
  * deletes" rather than a half-finished delete path.
+ *
+ * [notifier] finally gives SYNC-004's `onNotify` gate hook and SYNC-005's
+ * completion result somewhere real to go -- both existed as plumbing with
+ * no listener since their own requirements landed.
  */
 class AppContainer(context: Context) {
     private val appContext = context.applicationContext
@@ -59,6 +64,7 @@ class AppContainer(context: Context) {
     private val coalescer = GateNotificationCoalescer(
         windowMillis = Duration.ofHours(settingsStore.coalesceWindowHours()).toMillis(),
     )
+    private val notifier = SyncNotifier(appContext)
 
     val pipeline: SyncPipeline = SyncPipeline(
         bridge = bridge,
@@ -70,6 +76,8 @@ class AppContainer(context: Context) {
         coalescer = coalescer,
         gateConfig = { settingsStore.gateConfig() },
         deleteConfig = { settingsStore.deleteAfterBackupConfig() },
+        onNotify = notifier::notifyGated,
+        onRunCompleted = notifier::notifyRunCompleted,
     )
 
     /** SYNC-006's trigger layer, real wiring deferred until SYNC-008/009 --

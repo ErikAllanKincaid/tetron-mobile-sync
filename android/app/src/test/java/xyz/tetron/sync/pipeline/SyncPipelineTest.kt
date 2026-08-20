@@ -72,6 +72,7 @@ class SyncPipelineTest {
         onNotify: (GateReason) -> Unit = {},
         deleteConfig: DeleteAfterBackupConfig = DeleteAfterBackupConfig(),
         deletionRequester: xyz.tetron.sync.delete.DeletionRequester = xyz.tetron.sync.delete.DeletionRequester {},
+        onRunCompleted: (RunRecord) -> Unit = {},
     ) = SyncPipeline(
         bridge = bridgeWith(snapshot),
         targetProvider = targetProvider,
@@ -84,6 +85,7 @@ class SyncPipelineTest {
         onNotify = onNotify,
         deleteConfig = { deleteConfig },
         deletionRequester = deletionRequester,
+        onRunCompleted = onRunCompleted,
     )
 
     private fun transferEvent(path: String, isTransfer: Boolean = true, isFinal: Boolean = true) =
@@ -409,6 +411,46 @@ class SyncPipelineTest {
         assertEquals(PipelineResult.Gated(GateReason.NotOnWifi), firstResult)
         assertTrue(secondResult is PipelineResult.Ran)
         assertEquals(1, invoked)
+    }
+
+    @Test
+    fun onRunCompleted_firesForSuccessfulRun_withTheRecordedResult() {
+        var completed: RunRecord? = null
+        val pipeline = pipeline(
+            transferRunner = { _, _, _, _ -> outcome(filesCopied = 3, filesTotal = 5) },
+            onRunCompleted = { completed = it },
+        )
+
+        val result = pipeline.run()
+
+        assertEquals((result as PipelineResult.Ran).record, completed)
+    }
+
+    @Test
+    fun onRunCompleted_firesForHardFailure_too() {
+        var completed: RunRecord? = null
+        val pipeline = pipeline(
+            transferRunner = { _, _, _, _ -> throw SyncException.Engine(exitCode = 1, detail = "boom") },
+            onRunCompleted = { completed = it },
+        )
+
+        pipeline.run()
+
+        assertEquals(1, completed?.failed)
+    }
+
+    @Test
+    fun onRunCompleted_neverFiresForAGatedCycle() {
+        var invoked = false
+        val pipeline = pipeline(
+            snapshot = openSnapshot().copy(state = BridgeTunnelState.Standby),
+            transferRunner = { _, _, _, _ -> outcome(1, 1) },
+            onRunCompleted = { invoked = true },
+        )
+
+        pipeline.run()
+
+        assertFalse(invoked)
     }
 
     @Test
