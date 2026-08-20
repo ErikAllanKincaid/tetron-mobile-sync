@@ -19,6 +19,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.NavHost
@@ -81,7 +82,14 @@ fun TetronSyncApp(container: AppContainer, onRequestMediaPermission: () -> Unit)
                                 }
                             },
                             icon = { Icon(destination.icon, contentDescription = destination.label) },
-                            label = { Text(destination.label) },
+                            label = {
+                                Text(
+                                    destination.label,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    softWrap = false,
+                                )
+                            },
                         )
                     }
                 }
