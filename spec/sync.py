@@ -350,11 +350,41 @@ class SyncMeshBridgeClient(Requirement):
       ContentProviderNotFound -> bridge reports `unavailable`, UI shows
       "tetron-mobile not running / access not granted".
 
-    ACCEPTANCE: unit tests (mock ContentResolver Bundle) cover parsing of
-    every `BridgeTunnelState`, ConnKind mapping, and the consent-required
-    branch; instrumented test against the real installed tetron-mobile on
-    the LG V40 covers grant-then-snapshot on a real device; `./gradlew
-    :app:testDebugUnitTest` + any instrumented test pass.
+    Wire compat (settled 2026-08-19): the snapshot crosses the Binder as a
+    Parcelable class that lives only inside tetron-mobile's APK, so the
+    consumer can never load it; `Bundle.getParcelable` on it throws
+    `BadParcelableException`. The standard cross-app technique applies: this
+    app ships hand-written parcel-layout mirror classes under the same
+    fully-qualified names (`xyz.tetron.mobile.StatusSnapshot`,
+    `xyz.tetron.mobile.BridgePeer`, `xyz.tetron.mobile.BridgeTunnelState`) --
+    fresh GPL code carrying exactly the layout verified from the provider's
+    compiled `CREATOR` bytecode (state=enum-name string, then network,
+    ownMeshIp, subnet as strings, peer count int + per-peer
+    (hostname, ip, connKind int), updatedAtMillis long), plus a public
+    static `CREATOR`/companion so Parcel's `Class.forName` + reflective
+    `getField("CREATOR")` path finds them. The mirrors are wire DTOs with no
+    logic and are never the type callers see; the app's own typed models
+    (`xyz.tetron.sync.bridge`: BridgeSnapshot, BridgePeer,
+    BridgeTunnelState, ConnKind) are the only surface consumed by UI and
+    gates. Parsing is never-crash defensive: unknown tunnel-state name ->
+    app `Unknown`; unknown ConnKind int -> Unknown; malformed/negative peer
+    count -> empty list. The response algebra is a sealed `BridgeResponse`:
+    `Snapshot(BridgeSnapshot)`, `ConsentRequired(callerPackage)`, or
+    `Unavailable` (dead app / missing provider / SecurityException /
+    BadParcelableException -- the bridge never throws to UI). `MeshBridge`
+    wraps the caller with a short TTL cache (5s default) so UI polling does
+    not hammer the provider; every response kind is cached for the TTL. The
+    parcel layout is MOBILE-024's contract: any provider-side change must
+    keep `MeshStatusProviderContractTest` green and this mirror updated in
+    lockstep.
+
+    ACCEPTANCE: JVM unit tests cover parsing of every `BridgeTunnelState`,
+    the ConnKind int mapping (including defensive fallbacks), the
+    consent-required branch, and the TTL cache (fake caller, no Android
+    deps); instrumented test against the real installed tetron-mobile on
+    the LG V40 covers the cross-process parcel round-trip (mirror-class
+    CREATOR resolution) plus grant-then-snapshot on a real device;
+    `./gradlew :app:testDebugUnitTest` + any instrumented test pass.
     ENFORCEMENT: unit tests are the automated gate; the real-device
     cross-app flow is verified manually (same bar as MOBILE-024's own
     verification).

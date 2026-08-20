@@ -10,6 +10,7 @@ See `AGENTS.md` for the spec-first development workflow (same as core tetron and
 
 SYNC-001 done: crate + Gradle/Compose app scaffolded (host checks, Android cross-compile via cargo-ndk, UniFFI Kotlin bindings, debug APK with both ABIs, JVM unit + instrumented smoke tests).
 SYNC-002 done: the embedded oc-rsync engine (vendored patched fork) runs host-side against a real `rsync --daemon` byte-identically, and all three wire-compat/resume tests in `tests/engine_rsyncd.rs` pass, including `--partial` resume from both a receiver-pre-seeded partial and a kill-mid-transfer partial. The build is scoped as SYNC-001..SYNC-011 in `spec/sync.py`; SYNC-003 is next.
+SYNC-003 implemented: the mesh bridge client consumes tetron-mobile's MOBILE-024 ContentProvider (authority `xyz.tetron.mobile.status`, `call("get_status")`) with hand-written parcel-layout wire mirrors so the foreign snapshot Parcelable unmarshals cross-process; the app's own typed models (BridgeSnapshot/BridgePeer/BridgeTunnelState/ConnKind) are the only surface UI and gates see, the answer is always a sealed Snapshot/ConsentRequired/Unavailable (never throws), and a 5s TTL cache keeps UI polling off the provider. 11 JVM unit tests pass; the cross-process device test is written but still needs the LG V40 (and a manual GrantActivity grant for the snapshot branch). SYNC-004 is next.
 
 ## How it works (the one-paragraph version)
 
