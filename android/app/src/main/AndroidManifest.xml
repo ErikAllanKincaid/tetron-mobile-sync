@@ -1,10 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- SYNC-001: no permissions yet, the scaffold proves the FFI chain
-         only. INTERNET/ACCESS_NETWORK_STATE arrive with SYNC-002 (rsync
-         traffic) and SYNC-004 (connectivity gates); READ_MEDIA_* with
-         SYNC-008. -->
+    <!-- SYNC-002: rsync client network I/O (the embedded engine opens its
+         own sockets; a socket call with no INTERNET grant fails silently
+         as a connect refusal, not a permission error). SYNC-004/006:
+         ConnectivityManager reads for the Wi-Fi gate
+         (AndroidDeviceStateProvider) and the network-change trigger
+         (AndroidNetworkChangeTrigger). Correction 2026-08-19: this
+         SYNC-001 comment previously said these "arrive with" SYNC-002/004,
+         but neither of those requirements actually added them; caught only
+         now that SYNC-006 wires a manifest-registered NetworkCallback and
+         a WorkManager job with a CONNECTED constraint, the first real
+         callers. READ_MEDIA_* still arrives with SYNC-008. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <!-- SYNC-003: package-visibility declaration for the MOBILE-024 bridge.
          ContentResolver.call() itself reaches any exported provider without
