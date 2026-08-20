@@ -27,6 +27,7 @@ data class SettingsUiState(
     val deleteAfterBackupEnabled: Boolean = false,
     val workCadenceHours: Long = 24L,
     val coalesceWindowHours: Long = 6L,
+    val ownMeshIp: String? = null,
     val engineInfoLine: String = "",
 )
 
@@ -68,10 +69,14 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
         }
     }
 
+    /** Also refreshes [SettingsUiState.ownMeshIp] -- plan §IPC bridge's
+     *  enrollment UX: the phone's own mesh IP is what goes into the home
+     *  side's `rsyncd.conf hosts allow`, and the roster/own-IP come from
+     *  the exact same bridge snapshot, so one poll covers both. */
     private suspend fun refreshRoster() {
         val response = container.bridge.current()
-        val peers = (response as? BridgeResponse.Snapshot)?.snapshot?.peers ?: emptyList()
-        _uiState.update { it.copy(rosterPeers = peers) }
+        val snapshot = (response as? BridgeResponse.Snapshot)?.snapshot
+        _uiState.update { it.copy(rosterPeers = snapshot?.peers ?: emptyList(), ownMeshIp = snapshot?.ownMeshIp) }
     }
 
     fun setGateConfig(config: GateConfig) {

@@ -22,6 +22,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -30,6 +31,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -80,6 +83,9 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
         SectionHeader("Backup target")
         TargetEditor(target = state.target, rosterPeers = state.rosterPeers, onSave = viewModel::setTarget)
 
+        Spacer(Modifier.height(16.dp))
+        OwnMeshIpRow(state.ownMeshIp)
+
         Spacer(Modifier.height(24.dp))
         SectionHeader("Delete after backup")
         SwitchRow("Delete photos from this device once backed up", state.deleteAfterBackupEnabled) {
@@ -115,6 +121,31 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
         HorizontalDivider()
         Spacer(Modifier.height(8.dp))
         Text(state.engineInfoLine, style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+/**
+ * plan §IPC bridge enrollment UX: the phone's own mesh IP is what the home
+ * side's `rsyncd.conf hosts allow` line needs (SYNC-010), so copying it
+ * out of the app is the whole point -- typing a mesh IP by hand invites
+ * transcription errors.
+ */
+@Composable
+private fun OwnMeshIpRow(ownMeshIp: String?) {
+    val clipboard = LocalClipboardManager.current
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = ownMeshIp?.let { "Your mesh IP: $it" } ?: "Your mesh IP is not available yet",
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.weight(1f),
+        )
+        if (ownMeshIp != null) {
+            TextButton(onClick = { clipboard.setText(AnnotatedString(ownMeshIp)) }) { Text("Copy") }
+        }
     }
 }
 
