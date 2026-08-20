@@ -80,9 +80,9 @@ class SyncPipelineTest {
         transferRunner = transferRunner,
         historyStore = historyStore,
         coalescer = coalescer,
-        gateConfig = gateConfig,
+        gateConfig = { gateConfig },
         onNotify = onNotify,
-        deleteConfig = deleteConfig,
+        deleteConfig = { deleteConfig },
         deletionRequester = deletionRequester,
     )
 
@@ -374,6 +374,41 @@ class SyncPipelineTest {
 
         assertEquals(PipelineResult.Gated(GateReason.TunnelNotActive), result)
         assertFalse("TunnelNotActive has no relaxable knob", invoked)
+    }
+
+    @Test
+    fun gateConfig_isReadFreshOnEveryRun_notFixedAtConstruction() {
+        // A Settings-screen toggle mutated between two runs must be
+        // reflected on the very next run (SYNC-009 ACCEPTANCE), since the
+        // pipeline is a long-lived singleton constructed once at app start.
+        var wifiOnly = true
+        var invoked = 0
+        // The `pipeline(...)` test helper bakes `gateConfig` in as a fixed
+        // supplier value, so this test builds a SyncPipeline directly to
+        // exercise a supplier whose result actually changes between calls.
+        val history = InMemoryRunHistoryStore()
+        val live = SyncPipeline(
+            bridge = bridgeWith(openSnapshot()),
+            targetProvider = TargetProvider { target },
+            sourcePathProvider = SourcePathProvider { "/dcim/camera" },
+            deviceState = object : DeviceStateProvider {
+                override fun isWifiConnected() = false
+                override fun isCharging() = true
+                override fun batteryPercent() = 100
+            },
+            transferRunner = { _, _, _, _ -> invoked++; outcome(1, 1) },
+            historyStore = history,
+            coalescer = GateNotificationCoalescer(),
+            gateConfig = { GateConfig(wifiOnly = wifiOnly) },
+        )
+
+        val firstResult = live.run()
+        wifiOnly = false
+        val secondResult = live.run()
+
+        assertEquals(PipelineResult.Gated(GateReason.NotOnWifi), firstResult)
+        assertTrue(secondResult is PipelineResult.Ran)
+        assertEquals(1, invoked)
     }
 
     @Test

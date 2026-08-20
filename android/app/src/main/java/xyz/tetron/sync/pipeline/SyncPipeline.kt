@@ -41,6 +41,11 @@ import xyz.tetron.sync.gates.relaxedGateConfig
  *
  * SYNC-009: [run]'s `overrideReason` parameter is the Home screen's
  * "Transfer anyway?" confirm -- see [resolveOverride]/[relaxedGateConfig].
+ * [gateConfig]/[deleteConfig] are suppliers, not fixed values, read fresh
+ * on every [run] call -- a Settings-screen toggle must be reflected on the
+ * very next run (SYNC-009 ACCEPTANCE), and this [SyncPipeline] instance is
+ * a long-lived singleton in the app's composition root, constructed once
+ * well before any particular settings value is known.
  */
 class SyncPipeline(
     private val bridge: MeshBridge,
@@ -50,11 +55,11 @@ class SyncPipeline(
     private val transferRunner: TransferRunner,
     private val historyStore: RunHistoryStore,
     private val coalescer: GateNotificationCoalescer,
-    private val gateConfig: GateConfig = GateConfig(),
+    private val gateConfig: () -> GateConfig = { GateConfig() },
     private val runOptions: SyncRunOptions = DEFAULT_RUN_OPTIONS,
     private val nowMillis: () -> Long = System::currentTimeMillis,
     private val onNotify: (GateReason) -> Unit = {},
-    private val deleteConfig: DeleteAfterBackupConfig = DeleteAfterBackupConfig(),
+    private val deleteConfig: () -> DeleteAfterBackupConfig = { DeleteAfterBackupConfig() },
     private val deletionRequester: DeletionRequester = DeletionRequester {},
 ) {
     private val running = AtomicBoolean(false)
@@ -90,9 +95,10 @@ class SyncPipeline(
             targetConnKind = targetConnKind,
         )
 
-        when (val decision = GateEvaluator.evaluate(inputs, gateConfig)) {
+        val currentGateConfig = gateConfig()
+        when (val decision = GateEvaluator.evaluate(inputs, currentGateConfig)) {
             is GateDecision.Blocked -> {
-                val overridden = resolveOverride(decision, inputs, overrideReason)
+                val overridden = resolveOverride(decision, inputs, currentGateConfig, overrideReason)
                 if (overridden is GateDecision.Blocked) return gated(overridden.reason)
             }
             GateDecision.Allowed -> Unit
@@ -147,10 +153,11 @@ class SyncPipeline(
     private fun resolveOverride(
         blocked: GateDecision.Blocked,
         inputs: GateInputs,
+        currentGateConfig: GateConfig,
         overrideReason: GateReason?,
     ): GateDecision {
         if (overrideReason != blocked.reason) return blocked
-        val relaxed = relaxedGateConfig(blocked.reason, gateConfig) ?: return blocked
+        val relaxed = relaxedGateConfig(blocked.reason, currentGateConfig) ?: return blocked
         return GateEvaluator.evaluate(inputs, relaxed)
     }
 
@@ -158,7 +165,7 @@ class SyncPipeline(
      *  nothing byte-verified transferred this run -- [resolveDeleteSet]
      *  carries that gate so it stays testable independent of the pipeline. */
     private fun requestDeleteIfEnabled(transferredPaths: List<String>) {
-        val deleteSet = resolveDeleteSet(deleteConfig, transferredPaths)
+        val deleteSet = resolveDeleteSet(deleteConfig(), transferredPaths)
         if (deleteSet.isNotEmpty()) deletionRequester.requestDelete(deleteSet)
     }
 
