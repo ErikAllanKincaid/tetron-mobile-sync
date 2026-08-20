@@ -105,12 +105,45 @@ mirror CREATOR resolution; the grant-then-snapshot branch is manual
 gained a `<queries><provider authorities=.../></queries>` so
 `resolveContentProvider` in the device test is deterministic on Android 11+
 (direct `ContentResolver.call` needs no visibility). Still-open device
-verification is a TODO, not a blocker for SYNC-004. The next requirement
-is SYNC-004 (gates, depends on SYNC-003's bridge state); SYNC-008/SYNC-010
-also have no dependency on it. The build is scoped as SYNC-001..SYNC-011 in
-`spec/sync.py`, which also records the decision register (consensus
-2026-08-18) and the still-open items. Dependency ordering (also stated
-per-class in `spec/sync.py`):
+verification is a TODO, not a blocker for SYNC-004.
+
+**SYNC-004 (gate evaluation) is IMPLEMENTED as of 2026-08-19**
+(`xyz.tetron.sync.gates`, no branch cut yet). Pure-Kotlin, no Android deps:
+`GateEvaluator.evaluate(GateInputs, GateConfig): GateDecision` is a single
+side-effect-free function -- callers gather `GateInputs` (bridge tunnel
+state + per-target `ConnKind` from SYNC-003's cached snapshot,
+`isWifiConnected`/`isCharging`/`batteryPercent` from local
+`ConnectivityManager`/`BatteryManager` reads) before calling it, so a
+`Blocked` result is produced with zero network activity by construction --
+satisfies the ACCEPTANCE bullet about short-circuiting before any rsync
+invocation without needing a mock rsync caller in this requirement (SYNC-005
+owns wiring the real pipeline to it). Evaluation order is
+`TunnelNotActive` -> `NotOnWifi` -> `ChargingRequired` -> `LowBattery` ->
+`RelayOnlyPath`: the implicit tunnel gate first (nothing else is meaningful
+without it), then the two local device-state gates, then the per-target
+direct-only gate last since the spec calls it out as "second-stage" (only
+meaningful once a target exists). `GateReason` carries a sixth value,
+`TargetUnreachable`, deliberately never produced by this evaluator --
+reserved for SYNC-005's pipeline, the only place an actual connection
+attempt happens; it exists so `GateNotificationCoalescer`'s window covers
+all six coalescing reasons from one enum ahead of SYNC-005 landing.
+`GateConfig` defaults match the decision register exactly (wifiOnly=true,
+directOnly=true, chargingRequired=false, lowBatteryPauseEnabled=true,
+lowBatteryThresholdPercent=20). `GateNotificationCoalescer.shouldNotify
+(GateReason): Boolean` implements decision #3's coalescing (default 6h
+window, per-reason not global, injected clock for tests). 24 JVM unit
+tests (`GateEvaluatorTest` + `GateNotificationCoalescerTest`) cover the
+full AND matrix (every gate individually false with the right reason,
+all-true passes, tunnel-not-active priority over simultaneous failures,
+the cellular+Direct-allowed case from USER's 2026-08-18 correction) and
+coalescing (drop within window, per-reason independence, re-allow at/after
+the window, a dropped notification does not reset the window);
+`:app:testDebugUnitTest` and `python3 reconcile.py` both green. The next
+requirement is SYNC-005 (transfer pipeline, depends on SYNC-002 + SYNC-004);
+SYNC-008/SYNC-010 still have no dependency on it. The build is scoped as
+SYNC-001..SYNC-011 in `spec/sync.py`, which also records the decision
+register (consensus 2026-08-18) and the still-open items. Dependency
+ordering (also stated per-class in `spec/sync.py`):
 
 - SYNC-001 repo scaffold (crate + Gradle/Compose app, GPL-3.0, mirror of tetron-mobile's proven pipeline) — no deps, first.
 - SYNC-002 embedded oc-rsync engine (vendored patched fork `vendor/oc-rsync/`, embed `crates/core` with `default-features = false, features = ["zstd", "lz4", "xattr"]` -- not the spike's root-bin string, see `vendor/oc-rsync/PATCHES.md` "Embedded-build note", `--partial` resume, `TransferProgressCallback` through UniFFI) — after SYNC-001.
