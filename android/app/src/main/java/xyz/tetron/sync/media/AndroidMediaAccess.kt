@@ -58,7 +58,7 @@ class AndroidMediaAccess(private val context: Context) : SourcePathProvider {
     override fun resolve(): SourceSpec? {
         val root = currentState().sourcePath ?: return null
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return SourceSpec(rootPath = root)
-        return SourceSpec(rootPath = root, filesFromPath = writeFilesFromList())
+        return SourceSpec(rootPath = root, filesFromPath = writeFilesFromList(root))
     }
 
     /**
@@ -70,15 +70,32 @@ class AndroidMediaAccess(private val context: Context) : SourcePathProvider {
      * A query returning zero rows still writes (and returns) an empty
      * list -- "nothing new to back up" is a normal outcome, not a
      * [SourceSpec] resolution failure.
+     *
+     * Root-caused SYNC-011: `MediaStore`'s index can go stale (a row for a
+     * file that no longer exists on disk, deleted through some path that
+     * never triggered a rescan) -- ordinary on a real, lived-in gallery.
+     * Feeding a dead name into `--files-from` makes oc-rsync `link_stat`
+     * it, fail, and set the transfer's exit code to "partial transfer due
+     * to error" even though every other file transfers correctly --
+     * surfacing as a misleading "Interrupted" run on the Home/History
+     * screens. [File.exists] is a single stat on a *known* path, not a
+     * directory listing, so (per the SYNC-011 Scoped Storage root cause
+     * above) it is not subject to the enumeration filter -- checking each
+     * candidate here is safe and keeps stale rows out of the list `oc-rsync`
+     * ever sees, rather than asking the engine to cope with them.
      */
-    private fun writeFilesFromList(): String {
+    private fun writeFilesFromList(root: String): String {
+        val rootDir = File(root)
         val listFile = File(context.filesDir, FILES_FROM_LIST_NAME)
         listFile.bufferedWriter().use { writer ->
             queryCameraRollNames().use { cursor ->
                 val nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME)
                 while (cursor.moveToNext()) {
-                    writer.write(cursor.getString(nameColumn))
-                    writer.write("\n")
+                    val name = cursor.getString(nameColumn)
+                    if (File(rootDir, name).exists()) {
+                        writer.write(name)
+                        writer.write("\n")
+                    }
                 }
             }
         }

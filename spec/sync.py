@@ -737,6 +737,47 @@ class SyncMediaAccess(Requirement):
     the vendored fork) were removed once root-caused -- USER's call to
     keep the crate's dependency surface minimal rather than carry
     permanent logcat plumbing.
+
+    **Bug found + fixed 2026-08-21, during the SYNC-011 interrupt/resume
+    device pass:** every real transfer against the real camera roll --
+    including several that completed with zero data loss and a clean
+    daemon-side finish -- was recorded as "Interrupted -- will resume next
+    run". Root cause: `MediaStore`'s index on a real, lived-in gallery can
+    go stale (rows for files deleted through some path that never
+    triggered a rescan). oc-rsync correctly `link_stat`s each `--files-from`
+    entry, logs an `ErrorXfer` diagnostic for the handful that no longer
+    exist, and continues transferring everything else (matching real
+    `rsync`'s own behavior for a named-but-missing `--files-from` entry) --
+    but that still sets the run's exit code to 23 ("partial transfer due
+    to error"), which `SyncPipeline.kt`'s `interrupted = outcome
+    .ioErrorExitCode != null` treated identically to a genuine
+    interruption. Confirmed via a throwaway diagnostic (a raw file write
+    at the exact point `oc-rsync`'s `transfer` crate sets `got_xfer_error`,
+    not committed, reverted immediately after use -- routing that crate's
+    internal messages through `tracing` would need extra Cargo feature
+    wiring the `core` crate's own `tracing` feature does not propagate
+    down to `transfer`, so a raw file write was the faster path this time):
+    `ErrorXfer: rsync: [sender] link_stat "<path>" failed: No such file or
+    directory (2)`, for a handful of filenames independently confirmed
+    absent from disk via `adb shell ls` on the literal path.
+
+    **Fix:** `AndroidMediaAccess.writeFilesFromList` now checks
+    `File(rootDir, name).exists()` for each `MediaStore` row before writing
+    it into the `--files-from` list, so a stale index entry is never handed
+    to the engine at all -- `File.exists()` is a single stat on a *known*
+    path, not a directory listing, so per this same requirement's Scoped
+    Storage finding above it is not subject to the enumeration filter,
+    making the check safe on API 29+. No Rust/UniFFI changes needed: this
+    closes the gap entirely on the Kotlin side by never asking oc-rsync to
+    fetch something already known to be gone, rather than trying to
+    reclassify its exit code after the fact (exit 23 is also what a genuine
+    mid-run interruption produces, so the two are not reliably
+    distinguishable from the exit code alone). Verified on-device with a
+    full clean-slate run against the entire real camera roll (701 files)
+    with the diagnostic still active: zero `ErrorXfer` events, clean daemon
+    completion, History correctly shows "701 added, 0 skipped, 0 failed"
+    with no "Interrupted" label. Diagnostic reverted afterward, same as
+    Bug #2's.
     """
     req_id = "SYNC-008"
 
