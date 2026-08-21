@@ -356,6 +356,28 @@ fork) were all removed once root-caused -- USER's call, to keep the
 crate's dependency surface minimal rather than carry permanent logcat
 plumbing as a side effect of this investigation.
 
+**Bug found + fixed 2026-08-21, during the SYNC-011 interrupt/resume
+device pass:** every real transfer against the real camera roll -- even
+ones that fully succeeded with a clean daemon-side finish -- was recorded
+as "Interrupted -- will resume next run". Root cause: `MediaStore`'s index
+on a real, lived-in gallery can go stale (rows for files deleted through
+some path that never triggered a rescan). oc-rsync correctly skips each
+stale `--files-from` entry and transfers everything else (matching real
+`rsync`'s own behavior for a named-but-missing entry), but still sets the
+run's exit code to 23, which the app treated identically to a genuine
+interruption. Confirmed via a throwaway diagnostic (a raw file write at
+the point `oc-rsync`'s `transfer` crate sets `got_xfer_error`, reverted
+immediately after use): `link_stat "<path>" failed: No such file or
+directory`, for filenames independently confirmed absent from disk via
+`adb shell ls`. **Fix:** `AndroidMediaAccess.writeFilesFromList` now
+checks `File(rootDir, name).exists()` per `MediaStore` row before adding
+it to the `--files-from` list -- a single stat on a *known* path, not a
+directory listing, so it is not subject to the Scoped Storage enumeration
+filter above. No Rust changes needed. Verified with a full clean-slate run
+against the entire real camera roll (701 files): zero errors, clean
+completion, History correctly shows "701 added, 0 skipped, 0 failed" with
+no "Interrupted" label.
+
 ## Spec-first workflow (libspec + reconcile.py)
 
 Same loop as core and tetron-mobile:
