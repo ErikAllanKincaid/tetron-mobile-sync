@@ -63,7 +63,7 @@ class SyncPipelineTest {
     private fun pipeline(
         snapshot: BridgeSnapshot? = openSnapshot(),
         targetProvider: TargetProvider = TargetProvider { target },
-        sourcePathProvider: SourcePathProvider = SourcePathProvider { "/dcim/camera" },
+        sourcePathProvider: SourcePathProvider = SourcePathProvider { SourceSpec("/dcim/camera") },
         deviceState: DeviceStateProvider = openDeviceState,
         transferRunner: TransferRunner,
         historyStore: RunHistoryStore = InMemoryRunHistoryStore(),
@@ -392,7 +392,7 @@ class SyncPipelineTest {
         val live = SyncPipeline(
             bridge = bridgeWith(openSnapshot()),
             targetProvider = TargetProvider { target },
-            sourcePathProvider = SourcePathProvider { "/dcim/camera" },
+            sourcePathProvider = SourcePathProvider { SourceSpec("/dcim/camera") },
             deviceState = object : DeviceStateProvider {
                 override fun isWifiConnected() = false
                 override fun isCharging() = true

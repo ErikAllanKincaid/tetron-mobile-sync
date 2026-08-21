@@ -29,13 +29,32 @@ fun interface TargetProvider {
 }
 
 /**
- * Resolves the local filesystem path to back up (SYNC-008 owns the real
+ * The resolved backup source for one run. [rootPath] is the transfer_args
+ * source operand oc-rsync opens files under; [filesFromPath] is an optional
+ * local `--files-from` list (newline-delimited relative filenames) that, when
+ * set, makes oc-rsync open exactly those entries under [rootPath] instead of
+ * recursively walking the directory itself.
+ *
+ * [filesFromPath] exists because raw directory *enumeration*
+ * (`readdir`/`jwalk`) is filtered per-app-UID by Android's Scoped Storage
+ * FUSE layer on API 29+ -- a real device only ever sees 1 entry under
+ * `DCIM/Camera` via a raw walk, even with `READ_MEDIA_IMAGES`/`READ_MEDIA_VIDEO`
+ * granted (root-caused during SYNC-011). Opening a *known* path directly is
+ * NOT filtered the same way (confirmed on-device), so [AndroidMediaAccess]
+ * enumerates via `MediaStore` instead of a raw walk on API 29+ and stages the
+ * result as this list; `null` (pre-29, or any future non-media source type)
+ * falls back to oc-rsync's own recursive walk, unchanged from SYNC-008 v1.
+ */
+data class SourceSpec(val rootPath: String, val filesFromPath: String? = null)
+
+/**
+ * Resolves the backup source for one run (SYNC-008 owns the real
  * DCIM/permission-aware implementation). `null` means the source is not
  * available (permission missing, path does not exist) -- surfaced as a
  * gate-style failure, never a crash (spec/sync.py SYNC-008).
  */
 fun interface SourcePathProvider {
-    fun sourcePath(): String?
+    fun resolve(): SourceSpec?
 }
 
 /**

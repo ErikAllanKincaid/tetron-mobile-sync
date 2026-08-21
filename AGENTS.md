@@ -290,10 +290,15 @@ contracts only) and registering `SyncWorkerFactory` via `WorkManager
 same "wiring is minimal until its dependency lands" note as SYNC-005's own
 adapters. `:app:assembleDebug` + `:app:testDebugUnitTest` +
 `:app:compileDebugAndroidTestKotlin` + `python3 reconcile.py` all green.
-The next requirement is SYNC-007 (delete-after-backup, depends on
-SYNC-005 only, already met), or SYNC-008/SYNC-010 in parallel (no
-dependency on SYNC-006); SYNC-009 still needs SYNC-007 and SYNC-008 first.
-The build is scoped as SYNC-001..SYNC-011 in
+SYNC-007 (delete-after-backup), SYNC-008 (media access), and SYNC-009
+(Compose UI) are all implemented and merged to `main` as of 2026-08-20;
+see `spec/sync.py` for the full per-requirement writeups (this file has
+not been kept in lockstep with every one of their implementation details --
+a known gap, not a claim those requirements are undocumented, just that
+`spec/sync.py`'s docstrings are the more current source for them right
+now). SYNC-011 (final device verification, LG V40 against an AORUS
+receiver) is in progress; see the SYNC-008 bug-fix note below for the one
+real bug it has found so far. The build is scoped as SYNC-001..SYNC-011 in
 `spec/sync.py`, which also records the decision register (consensus
 2026-08-18) and the still-open items. Dependency ordering (also stated
 per-class in `spec/sync.py`):
@@ -309,6 +314,47 @@ per-class in `spec/sync.py`):
 - SYNC-009 Compose UI (home/progress/history/settings, roster target picker, consent banner, own-IP copy button) — after SYNC-003/005/007/008.
 - SYNC-010 home-side deliverable (sample rsyncd.conf, dedicated user, `hosts allow` on mesh IP, README setup, optional contrib/install script) — parallel, anytime.
 - SYNC-011 final device verification (LG V40: real Wi-Fi + camera roll, delete consent flow, cellular Direct-or-deferred-never-relay, interrupt/resume) — after the app works.
+
+**Bug found + fixed 2026-08-20, during SYNC-011 device verification:** a
+real run on the LG V40 (API 29) against the real `DCIM/Camera` (705 real
+files) transferred exactly 1 file. Root cause: Android Scoped Storage
+filters raw directory *enumeration* (`readdir`, which oc-rsync's
+`jwalk`-based recursive walk uses) per-app-UID via a FUSE daemon on API
+29+ -- the app's own UID sees almost nothing via a raw walk of
+`DCIM/Camera` even with `READ_MEDIA_IMAGES`/`READ_MEDIA_VIDEO` granted
+(that grant covers MediaStore `content://` access, not raw path
+enumeration). Confirmed with `tracing` instrumentation temporarily added
+to the vendored oc-rsync fork, a packet capture, and
+`android:requestLegacyExternalStorage="true"` (API 29-only, not a real
+fix, used purely to confirm the hypothesis) -- with it, the same run saw
+and transferred hundreds of files. Further confirmed that opening a
+*known* filename directly (no enumeration) already works fine even with
+Scoped Storage strictly enforced, by staging a hand-written oc-rsync
+`--files-from` list of a few real filenames -- all transferred
+successfully. This meant the fix only needed to replace *enumeration*,
+not file *reads* -- avoiding a much larger MediaStore-URI/FD-based
+rewrite of oc-rsync's core read path.
+
+**Fix:** `AndroidMediaAccess.resolve()` (the real `SourcePathProvider`)
+now returns `SourceSpec(rootPath, filesFromPath)`. On API 29+,
+`filesFromPath` is populated by querying `MediaStore.Files`
+(`RELATIVE_PATH = 'DCIM/Camera/'`, image/video `MEDIA_TYPE`) -- never
+subject to the enumeration filter, since enumerating is MediaStore's
+entire purpose -- and staging the filenames as a newline-delimited list
+in app-private storage. Pre-29 devices keep `filesFromPath = null`
+(unchanged recursive-walk behavior; no Scoped Storage restriction to work
+around there). `SyncRunOptions` gained `files_from_path: Option<String>`,
+wired in `SyncEngine::run_client` to `ClientConfig::builder().files_from
+(FilesFromSource::LocalFile(path))` -- oc-rsync-core's own `--files-from`
+support, unmodified. Verified on-device end to end with all diagnostics
+removed: 701 real files/2.7GB transferred cleanly (the gap versus a raw
+`find` count of 705 is MediaStore correctly excluding non-image/video
+entries a blind walk would have counted). The `tracing`/`android_log-sys`
+diagnostic dependencies and instrumentation added during the
+investigation (including one temporary `tracing::error!` in the vendored
+fork) were all removed once root-caused -- USER's call, to keep the
+crate's dependency surface minimal rather than carry permanent logcat
+plumbing as a side effect of this investigation.
 
 ## Spec-first workflow (libspec + reconcile.py)
 

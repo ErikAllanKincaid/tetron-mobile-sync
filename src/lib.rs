@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use oc_rsync_core::client::{
     BandwidthLimit, ClientConfig, ClientProgressObserver, ClientProgressUpdate, ClientSummary,
-    run_client_with_observer,
+    FilesFromSource, run_client_with_observer,
 };
 
 uniffi::setup_scaffolding!();
@@ -50,6 +50,19 @@ pub struct SyncRunOptions {
     pub modify_window_secs: Option<i64>,
     /// `--bwlimit` -- transfer ceiling in KiB/s.
     pub bwlimit_kib: Option<u64>,
+    /// `--files-from` -- absolute path to a local, newline-delimited list of
+    /// filenames relative to `source`. When set, oc-rsync opens exactly
+    /// those entries instead of recursively walking `source` itself.
+    ///
+    /// Exists for Android API 29+: raw directory *enumeration* is filtered
+    /// per-app-UID by Scoped Storage's FUSE layer (root-caused SYNC-011 --
+    /// a real device's own recursive walk of `DCIM/Camera` sees only 1
+    /// entry even with `READ_MEDIA_IMAGES`/`READ_MEDIA_VIDEO` granted), but
+    /// opening a *known* path directly is not filtered the same way. The
+    /// Kotlin side enumerates via `MediaStore` and stages the result here;
+    /// `None` (desktop, pre-29, or any future non-media source) falls back
+    /// to oc-rsync's own recursive walk, unchanged from SYNC-002 v1.
+    pub files_from_path: Option<String>,
 }
 
 /// Per-file progress event pushed across the FFI while a transfer runs.
@@ -160,6 +173,10 @@ impl SyncEngine {
             .recursive(options.recursive)
             .times(options.times)
             .links(options.links);
+
+        if let Some(path) = options.files_from_path {
+            builder = builder.files_from(FilesFromSource::LocalFile(std::path::PathBuf::from(path)));
+        }
 
         if let Some(secs) = options.modify_window_secs {
             builder = builder.modify_window(Some(secs));

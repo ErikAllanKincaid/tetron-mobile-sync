@@ -115,12 +115,13 @@ class SyncPipeline(
         // target's IP not being in the roster while charging/battery/wifi
         // still open) can reach here with no usable destination.
         if (target == null) return gated(GateReason.TargetUnreachable)
-        val source = sourcePathProvider.sourcePath() ?: return gated(GateReason.TargetUnreachable)
+        val spec = sourcePathProvider.resolve() ?: return gated(GateReason.TargetUnreachable)
 
         val destination = "rsync://${target.meshIp}:${target.port}/${target.module}/"
+        val effectiveRunOptions = spec.filesFromPath?.let { runOptions.copy(filesFromPath = it) } ?: runOptions
         val collector = TransferredFileCollector(progress)
         val record = try {
-            val outcome = transferRunner.run(source, destination, runOptions, collector)
+            val outcome = transferRunner.run(spec.rootPath, destination, effectiveRunOptions, collector)
             val added = outcome.filesCopied.toInt()
             val total = outcome.filesTotal.toInt()
             // SYNC-007: interrupted is explicitly NOT a failure (below), so
@@ -191,6 +192,7 @@ class SyncPipeline(
             links = true,
             modifyWindowSecs = null,
             bwlimitKib = null,
+            filesFromPath = null,
         )
     }
 }
