@@ -41,6 +41,7 @@ fn main() {
             SyncRunOptions {
                 recursive: true,
                 times: true,
+                links: true,
                 bwlimit_kib,
                 ..Default::default()
             },
