@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The tetron-mobile T glyph (unchanged proportions from that app's own
+     ic_launcher_foreground.xml), encircled by a two-arrow sync ring to
+     mark this as the sync app of the family. Design approved after
+     several rounds of live review (see ~/code/tetron-mobile-sync/docs/
+     for a rendered sample and the source SVG this was generated from).
+
+     viewportWidth/Height is 46, not 32 like tetron-mobile's own file:
+     the approved design fills about 86% of a 32-unit square, which is
+     too large for Android's real adaptive-icon safe zone (a centered
+     66dp circle inside the 108dp canvas, ~61%). Every launcher that
+     applies a circular or squircle mask would clip the ring's outer
+     edge at that size, so the whole design (T + ring, both unchanged
+     in absolute size) is recentered here at (23,23) instead of
+     (15.5,15.5) so it occupies ~61% of this larger viewport instead,
+     staying inside the safe zone on every mask shape. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="46"
+    android:viewportHeight="46">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M28.97,14.48 A10.4,10.4 0 0 1 19.96,32.95 L16.21,33.58 L18.97,36.20 A13.8,13.8 0 0 0 30.92,11.70 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M17.03,31.52 A10.4,10.4 0 0 1 26.04,13.05 L29.79,12.42 L27.03,9.80 A13.8,13.8 0 0 0 15.08,34.30 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M17.50,15.50 L28.50,15.50 L28.50,18.50 L24.75,18.50 L24.75,30.50 L21.25,30.50 L21.25,18.50 L17.50,18.50 Z" />
+</vector>

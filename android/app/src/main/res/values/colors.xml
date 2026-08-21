@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Same tetron brand green as tetron-mobile/tetron-systray's own
+         icon.svg. The launcher icon deliberately matches the sibling
+         apps' color, just with a sync ring added around the T glyph. -->
+    <color name="ic_launcher_background">#4CAF50</color>
+</resources>

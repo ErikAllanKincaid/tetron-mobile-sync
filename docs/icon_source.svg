@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 46 46">
+  <!-- Same path data as android/app/src/main/res/drawable/ic_launcher_foreground.xml.
+       Rendered here on a transparent background (white fill only);
+       pair with the brand green (#4CAF50, see res/values/colors.xml) as
+       the adaptive-icon background layer to reproduce the real launcher
+       icon, or see icon_sample.png for a rendered preview with that
+       background already applied. -->
+  <path fill="#FFFFFF" d="M28.97,14.48 A10.4,10.4 0 0 1 19.96,32.95 L16.21,33.58 L18.97,36.20 A13.8,13.8 0 0 0 30.92,11.70 Z"/>
+  <path fill="#FFFFFF" d="M17.03,31.52 A10.4,10.4 0 0 1 26.04,13.05 L29.79,12.42 L27.03,9.80 A13.8,13.8 0 0 0 15.08,34.30 Z"/>
+  <path fill="#FFFFFF" d="M17.50,15.50 L28.50,15.50 L28.50,18.50 L24.75,18.50 L24.75,30.50 L21.25,30.50 L21.25,18.50 L17.50,18.50 Z"/>
+</svg>
