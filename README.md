@@ -1,28 +1,40 @@
 # tetron-mobile-sync
 
-GPL-3.0 Android photo-backup addon for the [tetron](https://github.com/ErikAllanKincaid/tetron) mesh: one-way phone-to-home photo/video backup over the mesh, using an embedded oc-rsync client against a stock `rsync --daemon` on the home machine.
+An Android app that backs up your phone's camera roll to a computer you own, automatically, over a private mesh network you control -- no cloud storage, no third-party server, no subscription. GPL-3.0 licensed.
 
-Working name only. The app/product name is not decided; `tetron-mobile-sync` is the repo and crate name until then.
+Working name only. The app/product name is not decided yet; `tetron-mobile-sync` is the repo and crate name until then.
 
-See `AGENTS.md` for the spec-first development workflow (same as core tetron and tetron-mobile). The full product plan and decision history live in `DO-NOT-COMMIT/PLAN_tetron-mobile-sync_2026-08-13.md` (consensus reached 2026-08-18); `spec/sync.py` is the buildable conclusion of it.
+## What it does
 
-## Status
+Your phone and your home computer both join the same [tetron](https://github.com/ErikAllanKincaid/tetron) mesh network -- a private, encrypted network between your own devices, not a public service. Once they're both on it, this app watches your camera roll and copies new photos and videos to your home computer whenever it's safe and convenient to do so: normally only over Wi-Fi, only when connected directly rather than through a relay, and (optionally) only while charging or above a battery threshold you choose. You can also just tap a button to back up right now. The transfer itself uses `rsync`, the same well-established file-sync protocol used by countless backup tools, so an interrupted transfer picks up where it left off instead of starting over.
 
-SYNC-001 done: crate + Gradle/Compose app scaffolded (host checks, Android cross-compile via cargo-ndk, UniFFI Kotlin bindings, debug APK with both ABIs, JVM unit + instrumented smoke tests).
-SYNC-002 done: the embedded oc-rsync engine (vendored patched fork) runs host-side against a real `rsync --daemon` byte-identically, and all three wire-compat/resume tests in `tests/engine_rsyncd.rs` pass, including `--partial` resume from both a receiver-pre-seeded partial and a kill-mid-transfer partial. The build is scoped as SYNC-001..SYNC-011 in `spec/sync.py`; SYNC-003 is next.
-SYNC-003 implemented: the mesh bridge client consumes tetron-mobile's MOBILE-024 ContentProvider (authority `xyz.tetron.mobile.status`, `call("get_status")`) with hand-written parcel-layout wire mirrors so the foreign snapshot Parcelable unmarshals cross-process; the app's own typed models (BridgeSnapshot/BridgePeer/BridgeTunnelState/ConnKind) are the only surface UI and gates see, the answer is always a sealed Snapshot/ConsentRequired/Unavailable (never throws), and a 5s TTL cache keeps UI polling off the provider. 11 JVM unit tests pass; the cross-process device test is written but still needs the LG V40 (and a manual GrantActivity grant for the snapshot branch). SYNC-004 is next.
+Everything runs one-way, phone to home: this app never deletes or modifies anything unless you explicitly turn on "delete after backup," and even then it only ever deletes files that a given backup run actually finished copying.
 
-## How it works (the one-paragraph version)
+## Setting up
 
-Two apps share a tetron mesh network. This app reads mesh state (own mesh IP, tunnel state, peer roster with per-peer connection kind) from tetron-mobile's MOBILE-024 status bridge, gates runs on Wi-Fi / direct-connection / battery conditions, and rsyncs DCIM to the home machine's `rsync --daemon` (target picked from the roster, `hosts allow` keyed on the phone's mesh IP). v1 triggers are opportunistic: manual button + periodic WorkManager job + network-change callback. Delete-after-backup is an explicit opt-in that only deletes files a run actually transferred.
+1. Install [tetron](https://github.com/ErikAllanKincaid/tetron) and its companion mobile app on your phone, and join your mesh network -- this app relies on that connection already existing, and has no networking of its own.
+2. On the computer you want backups to land on, install [tetron-sync-receiver](https://github.com/ErikAllanKincaid/tetron-sync-receiver) and set up at least one shared folder and one allowed device (your phone). See that project's own README for exact steps -- it can be done entirely from a terminal, or by clicking through [tetron-webui](https://github.com/ErikAllanKincaid/tetron-webui)'s dashboard if you run that too.
+3. Open this app. If it's the first time it has talked to the mesh, you'll see a banner asking you to grant it access -- tap through and allow it.
+4. Grant photo/video access when prompted.
+5. In Settings, pick your home computer from the device list, and enter the folder name you shared in step 2.
+6. Adjust the Wi-Fi/battery/charging rules if the defaults don't suit you, or leave them as they are.
+7. Tap "Back up now" once to confirm everything works, or just leave the app alone -- it checks in on its own afterward.
 
-## Repo layout
+## Using the app
 
-```
-Cargo.toml, src/lib.rs, uniffi-bindgen.rs   -- the sync-app Rust crate (repo root)
-vendor/oc-rsync/                            -- patched oc-rsync fork, applied + tracked (SYNC-002)
-android/                                    -- Gradle/Kotlin/Compose app (SYNC-001)
-spec/, reconcile.py, pyproject.toml         -- spec-first workflow, own from core's
-DO-NOT-COMMIT/                              -- working docs, gitignored
-LICENSE                                     -- GPL-3.0 (route (a): oc-rsync embedded in-process)
-```
+**Home screen.** Shows whether the mesh connection is up, which computer you're backing up to, and a "Back up now" button. Tapping it starts an immediate backup; the screen shows progress while one is running, and the result of the last run once it finishes (how many files were added, how many were skipped, and whether anything failed).
+
+**Settings screen.** Everything you can configure:
+
+- **Backup target** -- which computer to back up to (picked from your mesh network's device list) and the shared-folder name it's exposing.
+- **Gates** -- Wi-Fi only, direct connection only, require charging, and a low-battery cutoff. All are meant to keep a background backup from costing you mobile data, a slow relayed connection, or your battery.
+- **Delete after backup** -- off by default. When on, a file is only ever deleted once a backup run has actually finished copying it.
+- **Schedule** -- how often the app checks in on its own in the background, separate from the manual button.
+
+## How this relates to tetron-sync-receiver
+
+This app is the phone side of a two-piece system. [tetron-sync-receiver](https://github.com/ErikAllanKincaid/tetron-sync-receiver) is the piece that runs on the receiving computer: it exposes shared folders, keeps a list of which devices are allowed to connect, and accepts the transfers this app sends. Neither piece works alone -- this app needs somewhere to send backups to, and tetron-sync-receiver needs something sending it files. They're separate projects (and separate licenses -- this app is GPL-3.0, tetron-sync-receiver is MPL-2.0) because a phone backup app and a headless receiver service are genuinely different pieces of software with different audiences, not because of any technical requirement to keep them apart.
+
+## License
+
+GPL-3.0. See `LICENSE`.
