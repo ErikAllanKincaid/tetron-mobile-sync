@@ -4,11 +4,14 @@ package xyz.tetron.sync.media
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.database.Cursor
 import android.os.Build
 import android.os.Environment
+import android.provider.MediaStore
 import androidx.core.content.ContextCompat
 import java.io.File
 import xyz.tetron.sync.pipeline.SourcePathProvider
+import xyz.tetron.sync.pipeline.SourceSpec
 
 /**
  * SYNC-008: the production [SourcePathProvider] -- reads real runtime
@@ -23,6 +26,18 @@ import xyz.tetron.sync.pipeline.SourcePathProvider
  * [xyz.tetron.sync.delete.DeletionRequester]; SYNC-009 owns the request
  * flow (first-run setup / Backup-press time, spec/sync.py SYNC-008), this
  * class only reads whatever grant already exists.
+ *
+ * SYNC-011 root cause: on API 29+, Scoped Storage's FUSE layer filters raw
+ * directory *enumeration* (`readdir`) per-app-UID -- a real device's own
+ * recursive walk of `DCIM/Camera` sees only 1 entry even with
+ * `READ_MEDIA_IMAGES`/`READ_MEDIA_VIDEO` granted. Opening a *known* path
+ * directly is not filtered the same way (confirmed on-device). So on API
+ * 29+, [resolve] enumerates the real file list via `MediaStore` (which is
+ * never subject to the enumeration filter -- that is its entire purpose)
+ * and stages it as a local `--files-from` list, rather than letting
+ * oc-rsync recurse into the directory itself. Pre-29 devices have no Scoped
+ * Storage restriction, so they keep the plain recursive-walk behavior
+ * unchanged from SYNC-008 v1.
  */
 class AndroidMediaAccess(private val context: Context) : SourcePathProvider {
 
@@ -40,12 +55,64 @@ class AndroidMediaAccess(private val context: Context) : SourcePathProvider {
     )
 
     /** The [SourcePathProvider] contract SYNC-005's pipeline consumes. */
-    override fun sourcePath(): String? = currentState().sourcePath
+    override fun resolve(): SourceSpec? {
+        val root = currentState().sourcePath ?: return null
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return SourceSpec(rootPath = root)
+        return SourceSpec(rootPath = root, filesFromPath = writeFilesFromList())
+    }
+
+    /**
+     * Queries `MediaStore` for every image/video row under `DCIM/Camera/`
+     * and stages their filenames as a newline-delimited `--files-from`
+     * list in app-private storage (overwritten each run -- this is a
+     * transient staging file, not history). Real camera-roll filenames
+     * never contain newlines, so no `--from0`/NUL-delimiting is needed.
+     * A query returning zero rows still writes (and returns) an empty
+     * list -- "nothing new to back up" is a normal outcome, not a
+     * [SourceSpec] resolution failure.
+     */
+    private fun writeFilesFromList(): String {
+        val listFile = File(context.filesDir, FILES_FROM_LIST_NAME)
+        listFile.bufferedWriter().use { writer ->
+            queryCameraRollNames().use { cursor ->
+                val nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME)
+                while (cursor.moveToNext()) {
+                    writer.write(cursor.getString(nameColumn))
+                    writer.write("\n")
+                }
+            }
+        }
+        return listFile.path
+    }
+
+    private fun queryCameraRollNames(): Cursor {
+        val collection = MediaStore.Files.getContentUri("external")
+        val projection = arrayOf(MediaStore.Files.FileColumns.DISPLAY_NAME)
+        val selection = "${MediaStore.Files.FileColumns.RELATIVE_PATH} = ? AND " +
+            "${MediaStore.Files.FileColumns.MEDIA_TYPE} IN (?, ?)"
+        val selectionArgs = arrayOf(
+            CAMERA_RELATIVE_PATH,
+            MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE.toString(),
+            MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString(),
+        )
+        return context.contentResolver.query(collection, projection, selection, selectionArgs, null)
+            ?: throw IllegalStateException("MediaStore query returned null cursor")
+    }
 
     private fun granted(permission: String): Boolean =
         ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
 
     companion object {
+        /** Staging file name for [writeFilesFromList], under `context.filesDir`. */
+        private const val FILES_FROM_LIST_NAME = "backup_files_from.txt"
+
+        /**
+         * `MediaStore.Files.FileColumns.RELATIVE_PATH` value for
+         * `DCIM/Camera` -- MediaStore always stores this with a trailing
+         * slash.
+         */
+        private const val CAMERA_RELATIVE_PATH = "DCIM/Camera/"
+
         /**
          * The real filesystem DCIM/Camera path (plan §Folders: v1 sources
          * are the real path, not a picker). `DIRECTORY_DCIM` is the stable

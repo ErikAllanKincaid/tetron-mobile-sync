@@ -689,6 +689,54 @@ class SyncMediaAccess(Requirement):
     `python3 reconcile.py` all green. Still open, deferred to SYNC-009 as
     scoped above: the runtime permission request flow itself and the
     partial-access warning banner UI.
+
+    **Bug found + fixed 2026-08-20, during SYNC-011 device verification:**
+    on the real LG V40 (API 29), a run against the real `DCIM/Camera`
+    (705 real files) transferred exactly 1 file. Root cause: Android
+    Scoped Storage filters raw directory *enumeration* (`readdir`, which
+    oc-rsync's `jwalk`-based recursive walk uses) per-app-UID via a FUSE
+    daemon on API 29+ -- the app's own UID sees almost nothing via a raw
+    walk of `DCIM/Camera` even with `READ_MEDIA_IMAGES`/`READ_MEDIA_VIDEO`
+    granted (that grant covers MediaStore `content://` access, not raw
+    path enumeration). Root-caused via `tracing` instrumentation temporarily
+    added to the vendored oc-rsync fork (`files_listed=1` at the exact
+    point the daemon-transfer stats were computed) plus a packet capture
+    showing the client closing the connection right where bulk data should
+    start. Confirmed via `android:requestLegacyExternalStorage="true"`
+    (API 29-only diagnostic, not a real fix): with it, the same run saw
+    and transferred hundreds of files. Further confirmed opening a
+    *known* filename directly (no enumeration) works fine even with the
+    flag off, by staging a hand-written oc-rsync `--files-from` list of a
+    few real filenames -- all transferred successfully under strict
+    Scoped Storage. This decoupled the fix into two well-understood parts
+    (enumerate without `readdir`; open-by-known-path already works) instead
+    of needing a MediaStore-URI/FD-based read path (a much larger change to
+    oc-rsync's core, which assumes direct filesystem access throughout).
+
+    **Fix:** `AndroidMediaAccess.resolve()` (the real `SourcePathProvider`)
+    now returns a `SourceSpec(rootPath, filesFromPath)` instead of a bare
+    path string. On API 29+, `filesFromPath` is populated by querying
+    `MediaStore.Files` (`RELATIVE_PATH = 'DCIM/Camera/'`, `MEDIA_TYPE` in
+    image/video) -- which is never subject to the enumeration filter, since
+    enumerating is MediaStore's entire purpose -- and staging the resulting
+    filenames as a newline-delimited list in app-private storage. Pre-29
+    devices (no Scoped Storage restriction) get `filesFromPath = null`,
+    unchanged recursive-walk behavior. `SyncRunOptions` (the UniFFI record)
+    gained a `files_from_path: Option<String>` field, wired in
+    `SyncEngine::run_client` to `ClientConfig::builder().files_from
+    (FilesFromSource::LocalFile(path))` -- oc-rsync-core's own `--files-from`
+    support (`vendor/oc-rsync/crates/core/.../files_from.rs`), unmodified.
+    Verified on-device end to end with the diagnostics fully removed: a
+    fresh run against the real camera roll transferred 701 real files/2.7GB
+    cleanly (the 4-file gap versus a raw `find` count of 705 is MediaStore
+    correctly excluding non-image/video entries a blind walk would have
+    counted). All temporary `tracing`/`android_log-sys` diagnostic
+    dependencies and instrumentation added during this investigation
+    (crate deps, `init_diagnostic_tracing`, `AndroidLogWriter`, both
+    `tracing::error!` call sites including the one temporarily added to
+    the vendored fork) were removed once root-caused -- USER's call to
+    keep the crate's dependency surface minimal rather than carry
+    permanent logcat plumbing.
     """
     req_id = "SYNC-008"
 
