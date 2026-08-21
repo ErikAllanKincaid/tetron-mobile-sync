@@ -61,6 +61,26 @@ android {
         }
     }
 
+    // Same mechanism and reasoning as tetron-mobile's own build.gradle.kts
+    // (MOBILE-017), and deliberately the *same keystore* -- see
+    // DO-NOT-COMMIT/release-signing/README.md. Overrides the "debug"
+    // signing config only when RELEASE_KEYSTORE_PATH is actually set in
+    // the environment (true in CI once the GitHub secrets below exist);
+    // otherwise falls through to AGP's own default debug behavior
+    // unchanged, so a plain local `./gradlew :app:assembleDebug` with no
+    // secrets configured still works exactly as it always has.
+    signingConfigs {
+        getByName("debug") {
+            val keystorePath = System.getenv("RELEASE_KEYSTORE_PATH")
+            if (keystorePath != null) {
+                storeFile = file(keystorePath)
+                storePassword = System.getenv("RELEASE_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("RELEASE_KEY_ALIAS")
+                keyPassword = System.getenv("RELEASE_KEYSTORE_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
