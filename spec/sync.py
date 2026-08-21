@@ -731,6 +731,154 @@ class SyncUi(Requirement):
     roundtrips (persisted, reflected in the next run's gate evaluation).
     ENFORCEMENT: UI compile/unit automated; the rest is manual live bar
     (MOBILE-* convention).
+
+    **IMPLEMENTED as of 2026-08-20** (`xyz.tetron.sync.ui` +
+    `xyz.tetron.sync.{settings,notifications}`, no branch cut yet, landed
+    as twelve incremental commits). This requirement's own open item
+    ("Back up now" behavior when gated) was resolved first via USER
+    decision: respect the gate, offer a "Transfer anyway?" confirm that
+    relaxes only the one gate that blocked. That turned out to need new
+    pipeline-layer plumbing, not just UI: `GateReason ->
+    GateConfig?` (`relaxedGateConfig`, `xyz.tetron.sync.gates.GateModels
+    .kt`) maps each overridable reason to the single config knob it
+    relaxes -- `TunnelNotActive`/`TargetUnreachable` map to `null` (no
+    knob exists, never overridable) -- and `SyncPipeline.run` gained an
+    `overrideReason: GateReason?` parameter that re-evaluates the AND-
+    matrix with that one knob relaxed only when it names the exact reason
+    that actually blocked this cycle (a stale override across a
+    device-state change in between is rejected, not silently honoured).
+
+    Two more `SyncPipeline` changes turned out to be prerequisites, not UI
+    work: `gateConfig`/`deleteConfig` moved from fixed constructor values
+    to `() -> X` suppliers (matching the `nowMillis` pattern already in the
+    class) -- `AppContainer` builds `pipeline` once, long before any
+    Settings value exists, so a fixed value would have frozen whatever was
+    true at construction and no Settings toggle could ever reach a running
+    pipeline. And `onRunCompleted: (RunRecord) -> Unit` is new: SYNC-004's
+    `onNotify` gate hook had existed since that requirement with no
+    listener, and completion/failure notifications had no hook to fire
+    from at all.
+
+    `xyz.tetron.sync.AppContainer` is the hand-rolled composition root (no
+    DI framework -- this repo's own minimal-dependency convention) that
+    finally gives every contract-only seam SYNC-002..008 built a real
+    implementation: `MeshBridge`/`ProviderStatusCaller`, the real
+    `SyncPipeline` with settings-backed `TargetProvider`/`gateConfig`/
+    `deleteConfig`, `AndroidMediaAccess` as `SourcePathProvider`,
+    `SharedPreferencesRunHistoryStore` (the SYNC-005 in-memory store was
+    always "a usable default until then"), the real SYNC-006 trigger
+    wiring (`SyncWorkerFactory` via `Configuration.Provider`,
+    `AndroidNetworkChangeTrigger` registered for the process lifetime in
+    `TetronSyncApplication.onCreate`), `SyncNotifier`, and
+    `MediaStoreDeletionRequester`. `TetronSyncApplication` also removes
+    WorkManager's default `androidx-startup` initializer from the manifest
+    (`tools:node="remove"` on its `WorkManagerInitializer` meta-data) --
+    its own reflective factory can not carry `PipelineRunner` into
+    `SyncWorker`, so leaving it in place would silently mean the real
+    factory never won.
+
+    `xyz.tetron.sync.settings.SettingsStore` (`SharedPreferences`-backed)
+    persists gate config, target, delete-after-backup, WorkManager cadence,
+    and the notification coalescing window (new:
+    `GateNotificationCoalescer`'s ~6h default from SYNC-004, now a
+    setting). Cadence and the coalescing window both take effect next app
+    launch, not live like `gateConfig`/`deleteConfig` -- they size a
+    WorkManager job and construct a stateful per-reason timer respectively,
+    both read once at `AppContainer` construction.
+
+    Four screens, `androidx.navigation-compose` bottom nav, `HomeViewModel`
+    requested Activity-scoped (`viewModel(activity, factory = ...)`) so
+    Home and Progress observe the exact same in-flight `RunPhase` -- a run
+    started from Home must be visible on Progress without either screen
+    owning the other. Progress's cancel affordance is explicitly not
+    built: `SyncEngine.run_client` (src/lib.rs) is fully synchronous and
+    blocking with no cancellation token anywhere in its FFI surface, so
+    there is nothing a button could actually invoke; that needs new
+    Rust-side capability, not a UI gap, and is left as a follow-up rather
+    than a button that would not work. Settings covers every item in this
+    requirement's own scope list: gate toggles, the roster-based target
+    picker (`ExposedDropdownMenuBox` -- Material3 1.3.1's real API needed
+    two fixes over the first draft: `ExposedDropdownMenu` is a member of
+    `ExposedDropdownMenuBoxScope`, not a top-level composable, and
+    `Modifier.weight()` is `RowScope`'s extension, not the internal
+    `androidx.compose.foundation.layout.weight` val an IDE-style import
+    guess pulled in by mistake), delete-after-backup opt-in, WorkManager
+    cadence, the coalescing window, and the own-mesh-IP copy button
+    (`LocalClipboardManager`) for `rsyncd.conf`'s `hosts allow` line
+    (SYNC-010) -- a late addition once the spec bullet was re-read
+    closely, since it doesn't come from any of the other requirements'
+    existing seams.
+
+    `TetronSyncTheme` (`xyz.tetron.sync.ui.Theme.kt`) matches
+    tetron-mobile's own green brand palette (same hex values as
+    `xyz.tetron.mobile.ui.Theme.kt`'s `DarkColorScheme`/`LightColorScheme`)
+    rather than Material3's purple default, per USER feedback on the first
+    screenshots -- fresh code, not shared/copied (tetron-mobile is
+    proprietary, this repo is GPL-3.0, AGENTS.md: "use them as design
+    reference only"), since color values are not original expression.
+    Material3's scheme builders default every *unspecified* slot to the
+    library's own baseline palette rather than deriving it from `primary`,
+    so the first pass (only `primary`/`background`/`surface` set) still
+    left the bottom nav bar's selected-item pill and container purple;
+    the fix sets `secondary`/`secondaryContainer`/`surfaceContainer`/etc.
+    explicitly too.
+
+    SYNC-008's deferred runtime permission request and SYNC-007's deferred
+    real `DeletionRequester` both close out here, both via the same
+    Activity-owned-launcher seam split already established by this app's
+    architecture: `MainActivity.onCreate` (before `ComponentActivity`
+    reaches `STARTED`, which `registerForActivityResult` requires) registers
+    `ActivityResultContracts.RequestMultiplePermissions` for media access
+    (trigger threaded down to Home's "Grant photo access" banner button,
+    shown for `MediaAccessGrant.NotGranted`; `Partial` gets a warning
+    banner with no action, since re-requesting an already-partial grant is
+    not reliably a "show me full access" affordance across OEMs) and
+    `ActivityResultContracts.StartIntentSenderForResult` for
+    `MediaStore.createDeleteRequest`'s system confirm dialog.
+    `MediaStoreDeletionRequester` resolves each transfer-relative path to
+    its MediaStore content `Uri` by querying `MediaStore.Files` on `DATA =
+    ?`, gated at API 33+ to match this app's other media API boundary
+    (spec/sync.py SYNC-007's own "Android 13+" framing) even though the
+    underlying platform call has existed since API 30; below 33 it is a
+    deliberate no-op rather than a half-correct direct-file-delete path
+    (needs `WRITE_EXTERNAL_STORAGE`, never requested, and behaves
+    inconsistently under API 29-32 scoped storage in ways unverifiable
+    without a real low-API device). `AppContainer.deleteIntentSenderLauncher`
+    is a mutable `var` `MainActivity` sets once its launcher exists -- the
+    requester itself is built once, process-scoped, before any Activity
+    exists, so this indirection is what lets it forward through without
+    making `SyncPipeline.deletionRequester` itself mutable.
+
+    `SyncNotifier` posts to two channels ("Backup paused" / "Backup
+    results"); `POST_NOTIFICATIONS` (API 33+) is requested unconditionally
+    at first launch, unlike media access's button-triggered flow, since
+    there is no single natural in-app action to hang it on and a
+    background-triggered run has no UI moment to request it from at all --
+    a deliberate exception to this app's own "not eagerly" precedent
+    (SYNC-008), not an oversight. `NotificationManagerCompat.notify` throws
+    `SecurityException` without that grant rather than silently no-op-ing,
+    so `SyncNotifier` catches it -- a missing notification permission must
+    never take down the pipeline thread that triggered it.
+
+    Verification: `:app:assembleDebug` + `:app:testDebugUnitTest` +
+    `:app:compileDebugAndroidTestKotlin` + `:app:connectedDebugAndroidTest`
+    (all three instrumented suites: `SyncSmokeTest`, `MeshBridgeDeviceTest`
+    -- 2 of 5 cases skipped, both need a real tetron-mobile provider,
+    documented since SYNC-003 -- and `SyncWorkSchedulerDeviceTest`) +
+    `python3 reconcile.py` all green on a headless `tetron_api29` (API 29)
+    emulator, plus live manual verification of every major flow via adb
+    screenshots at each commit: the gate/override banner+dialog, all four
+    screens rendering and navigating, a settings toggle round-tripping on
+    screen, the real system media-permission dialog firing and the banner
+    clearing on grant, and `dumpsys notification` confirming both channels
+    exist and a real gated-cycle notification posts. Still open, and
+    requiring the API 33+ LG V40 reference device rather than this
+    environment: the real `MediaStore.createDeleteRequest` confirm-and-
+    delete flow end to end (SYNC-007's own ENFORCEMENT bar already called
+    this manual), and the partial-access-grant banner on a real API 34+
+    device. SYNC-011 (final device verification) is the next requirement
+    with a hard dependency on this one; SYNC-010 (home-side deliverable)
+    remains independently parallelizable and still not started.
     """
     req_id = "SYNC-009"
 

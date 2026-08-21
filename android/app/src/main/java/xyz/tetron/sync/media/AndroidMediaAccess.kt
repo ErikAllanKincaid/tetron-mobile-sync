@@ -54,5 +54,22 @@ class AndroidMediaAccess(private val context: Context) : SourcePathProvider {
          */
         fun cameraRollDirectory(): File =
             File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "Camera")
+
+        /**
+         * SYNC-009: the permission set to hand
+         * `ActivityResultContracts.RequestMultiplePermissions` -- always
+         * asks for *full* access (never
+         * `READ_MEDIA_VISUAL_USER_SELECTED` on its own), since v1 must
+         * request full access explicitly (spec/sync.py SYNC-008); a
+         * partial grant is something the OS can still offer the user from
+         * this same system dialog on API 34+, this app just never asks
+         * for it directly. Matches [resolveMediaAccessGrant]'s own
+         * apiLevel gating.
+         */
+        fun requiredPermissions(apiLevel: Int): Array<String> = if (apiLevel >= 33) {
+            arrayOf(android.Manifest.permission.READ_MEDIA_IMAGES, android.Manifest.permission.READ_MEDIA_VIDEO)
+        } else {
+            arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
     }
 }

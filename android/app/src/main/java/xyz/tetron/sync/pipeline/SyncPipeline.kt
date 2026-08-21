@@ -18,6 +18,7 @@ import xyz.tetron.sync.gates.GateEvaluator
 import xyz.tetron.sync.gates.GateInputs
 import xyz.tetron.sync.gates.GateNotificationCoalescer
 import xyz.tetron.sync.gates.GateReason
+import xyz.tetron.sync.gates.relaxedGateConfig
 
 /**
  * SYNC-005: the single run path every trigger (SYNC-006) funnels into.
@@ -37,6 +38,19 @@ import xyz.tetron.sync.gates.GateReason
  * is opted in, hands the byte-verified transferred-this-run set to
  * [deletionRequester]. Default-constructed [deleteConfig]/[deletionRequester]
  * mean this is a no-op unless a caller opts in.
+ *
+ * SYNC-009: [run]'s `overrideReason` parameter is the Home screen's
+ * "Transfer anyway?" confirm -- see [resolveOverride]/[relaxedGateConfig].
+ * [gateConfig]/[deleteConfig] are suppliers, not fixed values, read fresh
+ * on every [run] call -- a Settings-screen toggle must be reflected on the
+ * very next run (SYNC-009 ACCEPTANCE), and this [SyncPipeline] instance is
+ * a long-lived singleton in the app's composition root, constructed once
+ * well before any particular settings value is known. [onRunCompleted] is
+ * called once per attempted run (success, interrupted, or hard failure
+ * alike) right after [historyStore] is updated -- unlike [onNotify] it is
+ * never coalesced, since a completion/failure notification is not the
+ * "skip and notify" case decision #3 was written for; the caller decides
+ * what to do with it (SYNC-009's notification channels).
  */
 class SyncPipeline(
     private val bridge: MeshBridge,
@@ -46,28 +60,35 @@ class SyncPipeline(
     private val transferRunner: TransferRunner,
     private val historyStore: RunHistoryStore,
     private val coalescer: GateNotificationCoalescer,
-    private val gateConfig: GateConfig = GateConfig(),
+    private val gateConfig: () -> GateConfig = { GateConfig() },
     private val runOptions: SyncRunOptions = DEFAULT_RUN_OPTIONS,
     private val nowMillis: () -> Long = System::currentTimeMillis,
     private val onNotify: (GateReason) -> Unit = {},
-    private val deleteConfig: DeleteAfterBackupConfig = DeleteAfterBackupConfig(),
+    private val deleteConfig: () -> DeleteAfterBackupConfig = { DeleteAfterBackupConfig() },
     private val deletionRequester: DeletionRequester = DeletionRequester {},
+    private val onRunCompleted: (RunRecord) -> Unit = {},
 ) {
     private val running = AtomicBoolean(false)
 
     /** Synchronous and blocking (network I/O on the calling thread, same
      *  contract as [uniffi.tetron_mobile_sync.SyncEngine.runClient]) --
-     *  callers must invoke this off the main thread. */
-    fun run(progress: SyncProgressListener? = null): PipelineResult {
+     *  callers must invoke this off the main thread.
+     *
+     *  [overrideReason] is SYNC-009's "Transfer anyway?" confirm: when the
+     *  AND-matrix blocks on exactly this reason, the run proceeds with
+     *  that one gate's knob relaxed ([relaxedGateConfig]) instead of being
+     *  gated. It has no effect when the block reason differs (including a
+     *  reason with no relaxable knob) or when nothing is blocking. */
+    fun run(progress: SyncProgressListener? = null, overrideReason: GateReason? = null): PipelineResult {
         if (!running.compareAndSet(false, true)) return PipelineResult.AlreadyRunning
         try {
-            return runOnce(progress)
+            return runOnce(progress, overrideReason)
         } finally {
             running.set(false)
         }
     }
 
-    private fun runOnce(progress: SyncProgressListener?): PipelineResult {
+    private fun runOnce(progress: SyncProgressListener?, overrideReason: GateReason?): PipelineResult {
         val snapshot = (bridge.current() as? BridgeResponse.Snapshot)?.snapshot
         val target = targetProvider.currentTarget()
         val targetConnKind = target?.let { t -> snapshot?.peers?.firstOrNull { it.ip == t.meshIp }?.connKind }
@@ -80,8 +101,12 @@ class SyncPipeline(
             targetConnKind = targetConnKind,
         )
 
-        when (val decision = GateEvaluator.evaluate(inputs, gateConfig)) {
-            is GateDecision.Blocked -> return gated(decision.reason)
+        val currentGateConfig = gateConfig()
+        when (val decision = GateEvaluator.evaluate(inputs, currentGateConfig)) {
+            is GateDecision.Blocked -> {
+                val overridden = resolveOverride(decision, inputs, currentGateConfig, overrideReason)
+                if (overridden is GateDecision.Blocked) return gated(overridden.reason)
+            }
             GateDecision.Allowed -> Unit
         }
 
@@ -121,14 +146,33 @@ class SyncPipeline(
             )
         }
         historyStore.recordRun(record)
+        onRunCompleted(record)
         return PipelineResult.Ran(record)
+    }
+
+    /** SYNC-009: applies [overrideReason] only when it names the exact
+     *  reason [blocked] blocked on this cycle -- a stale/mismatched
+     *  override (e.g. the device dropped Wi-Fi AND went low-battery
+     *  between the confirm dialog and this call) is rejected, since only
+     *  whichever reason actually blocks now is meaningful. Returns
+     *  [GateDecision.Allowed] when the relaxed config now passes,
+     *  otherwise the (possibly different) still-blocking decision. */
+    private fun resolveOverride(
+        blocked: GateDecision.Blocked,
+        inputs: GateInputs,
+        currentGateConfig: GateConfig,
+        overrideReason: GateReason?,
+    ): GateDecision {
+        if (overrideReason != blocked.reason) return blocked
+        val relaxed = relaxedGateConfig(blocked.reason, currentGateConfig) ?: return blocked
+        return GateEvaluator.evaluate(inputs, relaxed)
     }
 
     /** SYNC-007: never touches [deletionRequester] when the opt-in is off or
      *  nothing byte-verified transferred this run -- [resolveDeleteSet]
      *  carries that gate so it stays testable independent of the pipeline. */
     private fun requestDeleteIfEnabled(transferredPaths: List<String>) {
-        val deleteSet = resolveDeleteSet(deleteConfig, transferredPaths)
+        val deleteSet = resolveDeleteSet(deleteConfig(), transferredPaths)
         if (deleteSet.isNotEmpty()) deletionRequester.requestDelete(deleteSet)
     }
 

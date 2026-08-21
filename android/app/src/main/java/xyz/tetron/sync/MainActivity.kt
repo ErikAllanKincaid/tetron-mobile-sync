@@ -1,75 +1,80 @@
 // SPDX-License-Identifier: GPL-3.0-only
 package xyz.tetron.sync
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.dp
-import androidx.lifecycle.lifecycleScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import uniffi.tetron_mobile_sync.SyncEngine
+import androidx.activity.result.IntentSenderRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import xyz.tetron.sync.delete.DeleteIntentSenderLauncher
+import xyz.tetron.sync.media.AndroidMediaAccess
+import xyz.tetron.sync.ui.TetronSyncApp
 
 /**
- * SYNC-001: minimal scaffold screen. The only real behavior is proving the
- * whole FFI chain end to end: construct [SyncEngine] across UniFFI/JNA,
- * call `version()` off the main thread (same pattern tetron-mobile uses
- * for every FFI call), and render the result. The product UI is the
- * SYNC-009 pass; nothing here survives it except the pattern.
+ * SYNC-009: this app's only Activity, hosting the [TetronSyncApp] Compose
+ * shell (bottom nav across Home/Progress/History/Settings) over
+ * [TetronSyncApplication.container]. SYNC-001's original scaffold (a bare
+ * "call `SyncEngine.version()`, render the result" screen, proving the FFI
+ * chain end to end) is gone -- that job is done; [xyz.tetron.sync.ui.home
+ * .HomeViewModel] now calls into the real pipeline instead.
+ *
+ * SYNC-008's runtime permission request must be registered here, before
+ * `onCreate`'s `STARTED` state (`registerForActivityResult` requires it),
+ * which is why [xyz.tetron.sync.ui.home.HomeScreen] cannot own the
+ * launcher itself -- it only gets a trigger lambda. The result callback is
+ * a no-op: [xyz.tetron.sync.ui.home.HomeViewModel]'s own poll picks up
+ * whatever grant the user ended up with either way.
+ *
+ * The notification permission (SYNC-009's [xyz.tetron.sync.notifications
+ * .SyncNotifier]) is requested unconditionally here at first launch,
+ * unlike media access's press-a-button flow: unlike photo access there is
+ * no single natural in-app action to hang the request on, and a
+ * background-triggered run (WorkManager/network-change) has no UI moment
+ * at all to request it from -- unusual for this app's own "not eagerly"
+ * precedent (SYNC-008), but the least-bad option given no better trigger
+ * point exists.
+ *
+ * SYNC-007's real `MediaStoreDeletionRequester` needs the same kind of
+ * Activity-owned launcher, this time for the system delete-confirm
+ * `IntentSender` `MediaStore.createDeleteRequest` returns
+ * ([deleteIntentSenderLauncher]); [AppContainer.deleteIntentSenderLauncher]
+ * is set here so [xyz.tetron.sync.delete.MediaStoreDeletionRequester] (built
+ * once, process-scoped, at [AppContainer] construction time) has somewhere
+ * to forward through once this Activity exists.
  */
 class MainActivity : ComponentActivity() {
-    private var engineVersion by mutableStateOf<String?>(null)
+    private val requestMediaPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
+    private val requestNotificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    private val deleteIntentSenderLauncher =
+        registerForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        requestNotificationPermissionIfNeeded()
+        val container = (application as TetronSyncApplication).container
+        container.deleteIntentSenderLauncher = DeleteIntentSenderLauncher { intentSender ->
+            deleteIntentSenderLauncher.launch(IntentSenderRequest.Builder(intentSender).build())
+        }
         setContent {
-            MaterialTheme {
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(24.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    Spacer(Modifier.height(120.dp))
-                    Text("tetron sync", style = MaterialTheme.typography.headlineMedium)
-                    Spacer(Modifier.height(16.dp))
-                    Text(
-                        text = engineVersion?.let { AppInfo.describeEngine(it) } ?: "engine not started",
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                    Spacer(Modifier.height(24.dp))
-                    Text(
-                        text = "Back up now",
-                        style = MaterialTheme.typography.titleMedium,
-                        modifier = Modifier
-                            .clickable { fetchVersion() }
-                            .padding(16.dp),
-                    )
-                }
-            }
+            TetronSyncApp(
+                container = container,
+                onRequestMediaPermission = {
+                    requestMediaPermissionLauncher.launch(AndroidMediaAccess.requiredPermissions(Build.VERSION.SDK_INT))
+                },
+            )
         }
     }
 
-    private fun fetchVersion() {
-        lifecycleScope.launch {
-            engineVersion = withContext(Dispatchers.IO) {
-                SyncEngine().version()
-            }
-        }
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        if (!granted) requestNotificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
 }

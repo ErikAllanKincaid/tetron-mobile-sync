@@ -72,6 +72,7 @@ class SyncPipelineTest {
         onNotify: (GateReason) -> Unit = {},
         deleteConfig: DeleteAfterBackupConfig = DeleteAfterBackupConfig(),
         deletionRequester: xyz.tetron.sync.delete.DeletionRequester = xyz.tetron.sync.delete.DeletionRequester {},
+        onRunCompleted: (RunRecord) -> Unit = {},
     ) = SyncPipeline(
         bridge = bridgeWith(snapshot),
         targetProvider = targetProvider,
@@ -80,10 +81,11 @@ class SyncPipelineTest {
         transferRunner = transferRunner,
         historyStore = historyStore,
         coalescer = coalescer,
-        gateConfig = gateConfig,
+        gateConfig = { gateConfig },
         onNotify = onNotify,
-        deleteConfig = deleteConfig,
+        deleteConfig = { deleteConfig },
         deletionRequester = deletionRequester,
+        onRunCompleted = onRunCompleted,
     )
 
     private fun transferEvent(path: String, isTransfer: Boolean = true, isFinal: Boolean = true) =
@@ -321,6 +323,134 @@ class SyncPipelineTest {
 
         assertTrue(record.interrupted)
         assertEquals("interrupted is not a failure; what did byte-verify stays eligible", listOf("a.jpg"), requested)
+    }
+
+    @Test
+    fun override_matchingReason_relaxesGateAndRuns() {
+        var invoked = false
+        val pipeline = pipeline(
+            deviceState = object : DeviceStateProvider {
+                override fun isWifiConnected() = false
+                override fun isCharging() = true
+                override fun batteryPercent() = 100
+            },
+            transferRunner = { _, _, _, _ -> invoked = true; outcome(1, 1) },
+        )
+
+        val result = pipeline.run(overrideReason = GateReason.NotOnWifi)
+
+        assertTrue("override for the actual blocking reason must proceed with the run", invoked)
+        assertTrue(result is PipelineResult.Ran)
+    }
+
+    @Test
+    fun override_mismatchedReason_staysGated_neverInvokesRunner() {
+        var invoked = false
+        val pipeline = pipeline(
+            deviceState = object : DeviceStateProvider {
+                override fun isWifiConnected() = false
+                override fun isCharging() = false
+                override fun batteryPercent() = 100
+            },
+            gateConfig = GateConfig(chargingRequired = true),
+            transferRunner = { _, _, _, _ -> invoked = true; outcome(1, 1) },
+        )
+
+        // Blocked on NotOnWifi (evaluated first); overriding a different
+        // reason must not relax anything.
+        val result = pipeline.run(overrideReason = GateReason.ChargingRequired)
+
+        assertEquals(PipelineResult.Gated(GateReason.NotOnWifi), result)
+        assertFalse(invoked)
+    }
+
+    @Test
+    fun override_forNonRelaxableReason_staysGated() {
+        var invoked = false
+        val pipeline = pipeline(
+            snapshot = openSnapshot().copy(state = BridgeTunnelState.Standby),
+            transferRunner = { _, _, _, _ -> invoked = true; outcome(1, 1) },
+        )
+
+        val result = pipeline.run(overrideReason = GateReason.TunnelNotActive)
+
+        assertEquals(PipelineResult.Gated(GateReason.TunnelNotActive), result)
+        assertFalse("TunnelNotActive has no relaxable knob", invoked)
+    }
+
+    @Test
+    fun gateConfig_isReadFreshOnEveryRun_notFixedAtConstruction() {
+        // A Settings-screen toggle mutated between two runs must be
+        // reflected on the very next run (SYNC-009 ACCEPTANCE), since the
+        // pipeline is a long-lived singleton constructed once at app start.
+        var wifiOnly = true
+        var invoked = 0
+        // The `pipeline(...)` test helper bakes `gateConfig` in as a fixed
+        // supplier value, so this test builds a SyncPipeline directly to
+        // exercise a supplier whose result actually changes between calls.
+        val history = InMemoryRunHistoryStore()
+        val live = SyncPipeline(
+            bridge = bridgeWith(openSnapshot()),
+            targetProvider = TargetProvider { target },
+            sourcePathProvider = SourcePathProvider { "/dcim/camera" },
+            deviceState = object : DeviceStateProvider {
+                override fun isWifiConnected() = false
+                override fun isCharging() = true
+                override fun batteryPercent() = 100
+            },
+            transferRunner = { _, _, _, _ -> invoked++; outcome(1, 1) },
+            historyStore = history,
+            coalescer = GateNotificationCoalescer(),
+            gateConfig = { GateConfig(wifiOnly = wifiOnly) },
+        )
+
+        val firstResult = live.run()
+        wifiOnly = false
+        val secondResult = live.run()
+
+        assertEquals(PipelineResult.Gated(GateReason.NotOnWifi), firstResult)
+        assertTrue(secondResult is PipelineResult.Ran)
+        assertEquals(1, invoked)
+    }
+
+    @Test
+    fun onRunCompleted_firesForSuccessfulRun_withTheRecordedResult() {
+        var completed: RunRecord? = null
+        val pipeline = pipeline(
+            transferRunner = { _, _, _, _ -> outcome(filesCopied = 3, filesTotal = 5) },
+            onRunCompleted = { completed = it },
+        )
+
+        val result = pipeline.run()
+
+        assertEquals((result as PipelineResult.Ran).record, completed)
+    }
+
+    @Test
+    fun onRunCompleted_firesForHardFailure_too() {
+        var completed: RunRecord? = null
+        val pipeline = pipeline(
+            transferRunner = { _, _, _, _ -> throw SyncException.Engine(exitCode = 1, detail = "boom") },
+            onRunCompleted = { completed = it },
+        )
+
+        pipeline.run()
+
+        assertEquals(1, completed?.failed)
+    }
+
+    @Test
+    fun onRunCompleted_neverFiresForAGatedCycle() {
+        var invoked = false
+        val pipeline = pipeline(
+            snapshot = openSnapshot().copy(state = BridgeTunnelState.Standby),
+            transferRunner = { _, _, _, _ -> outcome(1, 1) },
+            onRunCompleted = { invoked = true },
+        )
+
+        pipeline.run()
+
+        assertFalse(invoked)
     }
 
     @Test

@@ -50,3 +50,21 @@ sealed class GateDecision {
     data object Allowed : GateDecision()
     data class Blocked(val reason: GateReason) : GateDecision()
 }
+
+/**
+ * SYNC-009: the config knob a manual "Transfer anyway?" override relaxes
+ * for exactly the one gate that blocked -- never a blanket bypass, and
+ * never more than the single reason the caller is overriding. `null` when
+ * [reason] has no corresponding [GateConfig] field: [GateReason
+ * .TunnelNotActive] (nothing is running to connect to) and [GateReason
+ * .TargetUnreachable] (no target/source resolved) are not policy gates, so
+ * there is nothing to relax -- those two never become overridable
+ * regardless of what a caller asks for.
+ */
+fun relaxedGateConfig(reason: GateReason, config: GateConfig): GateConfig? = when (reason) {
+    GateReason.NotOnWifi -> config.copy(wifiOnly = false)
+    GateReason.ChargingRequired -> config.copy(chargingRequired = false)
+    GateReason.LowBattery -> config.copy(lowBatteryPauseEnabled = false)
+    GateReason.RelayOnlyPath -> config.copy(directOnly = false)
+    GateReason.TunnelNotActive, GateReason.TargetUnreachable -> null
+}
