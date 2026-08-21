@@ -12,21 +12,35 @@
 //! io_error_exit_code (rsync 23 = partial transfer) when the summary reports
 //! one.
 
-use tetron_mobile_sync::{SyncEngine, SyncRunOptions};
+use tetron_mobile_sync::{SyncEngine, SyncProgressEvent, SyncProgressListener, SyncRunOptions};
+
+struct PrintingListener;
+
+impl SyncProgressListener for PrintingListener {
+    fn on_progress(&self, event: SyncProgressEvent) {
+        eprintln!(
+            "progress: path={:?} done={}/{} complete={}",
+            event.path, event.files_done, event.files_total, event.transfer_complete
+        );
+    }
+}
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.len() < 2 {
-        eprintln!("usage: sync-test-helper <source> <destination> [--bwlimit=KiB/s]");
+        eprintln!("usage: sync-test-helper <source> <destination> [--bwlimit=KiB/s] [--progress]");
         std::process::exit(2);
     }
 
     let source = argv[0].clone();
     let destination = argv[1].clone();
     let mut bwlimit_kib = None;
+    let mut with_progress = false;
     for arg in &argv[2..] {
         if let Some(v) = arg.strip_prefix("--bwlimit=") {
             bwlimit_kib = v.parse::<u64>().ok();
+        } else if arg == "--progress" {
+            with_progress = true;
         } else {
             eprintln!("unknown helper arg: {arg}");
             std::process::exit(2);
@@ -34,6 +48,8 @@ fn main() {
     }
 
     let engine = SyncEngine::new();
+    let progress: Option<Box<dyn SyncProgressListener>> =
+        if with_progress { Some(Box::new(PrintingListener)) } else { None };
     let outcome = engine
         .run_client(
             source,
@@ -45,7 +61,7 @@ fn main() {
                 bwlimit_kib,
                 ..Default::default()
             },
-            None,
+            progress,
         )
         .unwrap_or_else(|err| {
             eprintln!("engine error: {err}");
