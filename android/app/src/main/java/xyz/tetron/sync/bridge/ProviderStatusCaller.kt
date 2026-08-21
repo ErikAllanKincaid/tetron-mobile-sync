@@ -22,6 +22,18 @@ class ProviderStatusCaller(
             val bundle =
                 contentResolver.call(STATUS_URI, METHOD_GET_STATUS, null, null)
                     ?: return BridgeResponse.Unavailable
+            // A Bundle crossing a Binder call defaults to a bare system
+            // classloader that cannot resolve this app's own classes.
+            // Bundle.unparcel() lazily deserializes EVERY key on first
+            // field access (not just the one asked for), so even reading
+            // EXTRA_CONSENT_REQUIRED's boolean below fails with
+            // ClassNotFoundException on xyz.tetron.mobile.StatusSnapshot
+            // whenever EXTRA_SNAPSHOT is also present in the bundle --
+            // caught 2026-08-20 verifying against a real tetron-mobile
+            // provider on the LG V40 (the emulator/unit tests never
+            // exercise a real cross-process Bundle, so this never
+            // surfaced before). Must be set before ANY field read.
+            bundle.classLoader = WireSnapshot::class.java.classLoader
             statusResponseFrom(
                 consentRequired = bundle.getBoolean(EXTRA_CONSENT_REQUIRED, false),
                 callerPackage = bundle.getString(EXTRA_CALLER_PACKAGE),
