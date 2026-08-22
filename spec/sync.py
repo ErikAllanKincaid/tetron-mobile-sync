@@ -778,6 +778,29 @@ class SyncMediaAccess(Requirement):
     completion, History correctly shows "701 added, 0 skipped, 0 failed"
     with no "Interrupted" label. Diagnostic reverted afterward, same as
     Bug #2's.
+
+    **Bug found + fixed 2026-08-21, while device-testing TODO #8's Cancel
+    button:** real "Back up now" runs against the real camera roll began
+    failing in well under a second (`"Interrupted -- 0 added, 701
+    skipped"`), reproducibly. Root-caused via a temporary JVM-level probe
+    (`FileInputStream(File(rootPath, name)).read()`, reverted after
+    diagnosis): every open failed `EACCES`, even though `File.exists()`
+    (a stat, not an open) succeeded on the same path -- true for both
+    WhatsApp-saved and genuine camera-shot files alike, and true even
+    with the permission granted through the app's own real "Grant photo
+    access" button and the system consent dialog (not just `pm grant`).
+    This narrows the finding above: a known-filename open bypasses the
+    Scoped Storage *enumeration* filter, but evidently does not bypass a
+    raw *read* on this device's current OS state. **Fix:**
+    `android:requestLegacyExternalStorage="true"` on `<application>`
+    (`AndroidManifest.xml`) -- API 29-only, a no-op on API 30+, so it
+    changes nothing for any device beyond the one this matters for.
+    Verified with a full clean-slate 701-file/2.7GB run (zero errors),
+    then a cancelled-mid-flight run (TODO #8) showing correctly in
+    History, then a further clean run proving the cancellation state
+    resets properly. See AGENTS.md's 2026-08-21 entry for the full
+    root-cause chain, including how network/mesh and the Cancel button's
+    own new code were both ruled out first.
     """
     req_id = "SYNC-008"
 

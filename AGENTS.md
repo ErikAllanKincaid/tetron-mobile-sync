@@ -378,6 +378,50 @@ against the entire real camera roll (701 files): zero errors, clean
 completion, History correctly shows "701 added, 0 skipped, 0 failed" with
 no "Interrupted" label.
 
+**Bug found + fixed 2026-08-21, while device-testing the Cancel button
+(TODO #8) on the LG V40:** every real "Back up now" against the real
+camera roll failed in well under a second, `"Interrupted -- 0 added, 701
+skipped"`, with the receiver's log showing the connection reach
+`receiving file list` and then die with no completion line -- looked at
+first like a network/mesh problem (ruled out: the exact same engine code
+path, same `--files-from` mechanism, same scale (700 files/2.1GB) and
+same receiver, run locally, completed cleanly in 16s; this also
+conclusively cleared TODO #8's own new `reset_shutdown_for_testing`/
+`reset_for_testing` calls in `run_client` as a suspect, since the failure
+reproduced identically with those two lines temporarily commented out).
+Root-caused with a temporary JVM-level probe in `SyncPipeline.kt`
+(`FileInputStream(File(rootPath, name)).read()` on a few staged names,
+reverted once diagnosed): every open failed with `EACCES`, even though
+`File.exists()`/`length()` (a stat, not an open) succeeded on the same
+path -- and this held for ordinary camera-shot JPEGs/MP4s exactly as much
+as WhatsApp-saved ones, so it was not the SYNC-011 stale-row case above
+(no `ENOENT`) and not file-type-specific. It also held with `READ_EXTERNAL_STORAGE`
+granted through the app's own real "Grant photo access" button and the
+genuine system consent dialog (not just `pm grant`), which rules out an
+adb-grant-vs-real-consent gap. In short: on this device, right now, raw
+path opens under `DCIM/Camera` are Scoped-Storage-denied even for a
+individually-named, permission-granted file -- narrower than SYNC-008's
+original finding that a known-filename open (as opposed to a directory
+listing) was NOT subject to the enumeration filter; that finding was
+about enumeration specifically, and evidently does not extend to a raw
+*open* on every LG V40 OS state. **Fix:** `android:requestLegacyExternalStorage="true"`
+on the `<application>` tag (`AndroidManifest.xml`) -- API 29-only (a
+no-op on API 30+, so `minSdk 26`/`targetSdk 35` devices elsewhere are
+unaffected), restoring full legacy external-storage access for this
+app on the one API level this matters for. SYNC-008's own doc comment
+had this flag once, purely to *confirm* the enumeration hypothesis, and
+called it "not a real fix" before removing it -- that conclusion no
+longer holds now that a plain read (not enumeration) is confirmed
+blocked without it; keeping the flag is the actual fix, not a workaround
+being reverted again. Verified end-to-end on-device: a full clean-slate
+701-file/2.7GB run completed with zero errors, and a second run
+deliberately interrupted via the new Cancel button (see TODO #8/
+spec/sync.py SYNC-009's writeup) showed `RunRecord.cancelled` correctly,
+then a third run proceeded normally from a clean state -- confirming the
+cancellation flag reset is not itself stuck. No Rust changes needed; no
+change to `AndroidMediaAccess`'s `--files-from` staging (still the
+correct fix for enumeration; this flag is the orthogonal fix for reads).
+
 ## Spec-first workflow (libspec + reconcile.py)
 
 Same loop as core and tetron-mobile:
