@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -99,7 +100,12 @@ fun HomeScreen(viewModel: HomeViewModel, onRequestMediaPermission: () -> Unit) {
         }
 
         Spacer(Modifier.height(16.dp))
-        RunPhaseSummary(phase)
+        // Selectable so a failure (e.g. "Failed: exitCode=10") can be
+        // copy-pasted for a bug report instead of hand-transcribed --
+        // plain Text is not selectable by default in Compose.
+        SelectionContainer {
+            RunPhaseSummary(phase)
+        }
     }
 
     // A dismissed dialog must stay dismissed for THIS blocked reason, but

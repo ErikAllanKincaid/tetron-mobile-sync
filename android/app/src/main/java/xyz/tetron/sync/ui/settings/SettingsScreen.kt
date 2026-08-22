@@ -12,6 +12,10 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -104,17 +108,28 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
 
         Spacer(Modifier.height(24.dp))
         SectionHeader("Schedule")
-        LongSettingRow(
-            label = "Periodic backup interval (hours)",
+        HoursDropdownRow(
+            label = "Periodic backup interval",
             value = state.workCadenceHours,
+            choices = PERIODIC_INTERVAL_CHOICES_HOURS,
             onValueChange = viewModel::setWorkCadenceHours,
         )
         Text(
             "Takes effect next app launch.",
             style = MaterialTheme.typography.bodySmall,
         )
-        LongSettingRow(
-            label = "Notification coalescing window (hours)",
+        // A plain label line above a plain field, not the standard
+        // OutlinedTextField inset label -- that inset label is what
+        // clipped to just "(hours)" with no visible text before it on
+        // narrower screens/larger font scales (a real bug found in
+        // testing), because the label text here is long enough to
+        // overflow the notch it floats into.
+        Text(
+            "Notification coalescing window (hours)",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Spacer(Modifier.height(4.dp))
+        PlainLongField(
             value = state.coalesceWindowHours,
             onValueChange = viewModel::setCoalesceWindowHours,
         )
@@ -198,8 +213,42 @@ private fun IntSettingRow(label: String, value: Int, onValueChange: (Int) -> Uni
     )
 }
 
+private val PERIODIC_INTERVAL_CHOICES_HOURS = listOf(6L, 12L, 24L, 48L)
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun LongSettingRow(label: String, value: Long, onValueChange: (Long) -> Unit) {
+private fun HoursDropdownRow(label: String, value: Long, choices: List<Long>, onValueChange: (Long) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
+        OutlinedTextField(
+            value = "${value}h",
+            onValueChange = {},
+            readOnly = true,
+            label = { Text(label) },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+            modifier = Modifier
+                .fillMaxWidth()
+                .menuAnchor(),
+        )
+        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            choices.forEach { hours ->
+                DropdownMenuItem(
+                    text = { Text("${hours}h") },
+                    onClick = {
+                        onValueChange(hours)
+                        expanded = false
+                    },
+                )
+            }
+        }
+    }
+}
+
+/** No `label` slot at all -- the plain [Text] line just above the call
+ *  site is this field's label instead (see the Schedule section comment
+ *  on why). */
+@Composable
+private fun PlainLongField(value: Long, onValueChange: (Long) -> Unit) {
     var text by remember(value) { mutableStateOf(value.toString()) }
     OutlinedTextField(
         value = text,
@@ -207,7 +256,6 @@ private fun LongSettingRow(label: String, value: Long, onValueChange: (Long) -> 
             text = input
             input.toLongOrNull()?.takeIf { it > 0 }?.let(onValueChange)
         },
-        label = { Text(label) },
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
         modifier = Modifier
             .fillMaxWidth()
