@@ -75,6 +75,19 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
 
     fun transferAnyway(reason: GateReason) = runInternal(overrideReason = reason)
 
+    /** TODO #8: a no-op unless a run is actually in progress -- guards
+     *  against a stray tap after the run just finished (the button that
+     *  triggers this is only shown while [RunPhase.Running] anyway, but the
+     *  check is cheap insurance against the race between that finishing and
+     *  the tap landing). [container.syncEngine]'s `cancel()` is a
+     *  process-global request (mirrors real Ctrl+C, see the Rust doc on
+     *  `SyncEngine.cancel`), so it reaches whichever run is actually in
+     *  flight regardless of which trigger (manual/periodic/network-change)
+     *  started it. */
+    fun cancel() {
+        if (runPhase.value is RunPhase.Running) container.syncEngine.cancel()
+    }
+
     private fun runInternal(overrideReason: GateReason?) {
         if (runPhase.value is RunPhase.Running) return
         viewModelScope.launch(Dispatchers.IO) {

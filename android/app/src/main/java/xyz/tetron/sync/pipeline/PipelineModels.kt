@@ -87,7 +87,12 @@ fun interface TransferRunner {
  * in an otherwise-successful [SyncTransferOutcome]) is explicitly NOT a
  * failure (spec/sync.py SYNC-005: "a partial/interrupted run is NOT an
  * error state"); `failed` covers a hard engine exception, where no
- * per-file counts are available.
+ * per-file counts are available. `cancelled` (TODO #8) is the third case:
+ * also a thrown engine exception, but specifically exit code 20 (`RERR_
+ * SIGNAL`) from [uniffi.tetron_mobile_sync.SyncEngineInterface.cancel] --
+ * the user asked to stop, not a fault, so it is reported distinctly from
+ * `failed` even though both arrive via the same catch branch in
+ * [SyncPipeline].
  */
 data class RunRecord(
     val timestampMillis: Long,
@@ -96,6 +101,7 @@ data class RunRecord(
     val failed: Int,
     val interrupted: Boolean,
     val failureReason: String?,
+    val cancelled: Boolean = false,
 )
 
 /** Persists the most recent run (SYNC-009's History screen: last run time +

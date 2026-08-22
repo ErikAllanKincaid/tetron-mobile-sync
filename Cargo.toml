@@ -25,6 +25,10 @@ uniffi = "0.28"
 # See vendor/oc-rsync/PATCHES.md for the portability patches and why the
 # feature set here maps to the spec's "openssl-vendored,zstd,lz4,parallel,xattr".
 oc-rsync-core = { package = "core", path = "vendor/oc-rsync/crates/core", default-features = false, features = ["zstd", "lz4", "xattr"] }
+# Cancel button (TODO #8): reuses the fork's own Ctrl+C plumbing
+# (`fast_io::signal::mark_shutdown` + `oc_rsync_core::signal::request_shutdown`)
+# instead of inventing a new cancellation path -- see src/lib.rs's `cancel()`.
+fast-io = { package = "fast_io", path = "vendor/oc-rsync/crates/fast_io", default-features = false }
 thiserror = "2"
 
 [lib]

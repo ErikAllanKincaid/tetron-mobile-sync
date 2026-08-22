@@ -167,6 +167,21 @@ impl SyncEngine {
         options: SyncRunOptions,
         progress: Option<Box<dyn SyncProgressListener>>,
     ) -> Result<SyncTransferOutcome, SyncError> {
+        // Cancel button (TODO #8): both flags are process-global in the
+        // vendored fork (they back real Ctrl+C handling for the CLI binary,
+        // see vendor/oc-rsync/PATCHES.md), so a prior run's cancellation (or
+        // a stray call to `cancel()` with nothing in flight) must not leak
+        // into this one. `SyncPipeline`'s own reentrancy guard on the
+        // Kotlin side already ensures only one `run_client` call is ever in
+        // flight at a time, so resetting here -- rather than per-instance
+        // state -- is correct for this app's single-transfer-at-a-time
+        // contract. Both reset fns are named "for_testing" upstream (no
+        // non-test reset previously existed, since the CLI binary just
+        // exits after a signal instead of reusing the process); reusing
+        // them here is deliberate, not a workaround.
+        fast_io::signal::reset_shutdown_for_testing();
+        oc_rsync_core::signal::reset_for_testing();
+
         let mut builder = ClientConfig::builder()
             .transfer_args([source, destination])
             .partial(true)
@@ -201,6 +216,25 @@ impl SyncEngine {
         })?;
 
         Ok(SyncTransferOutcome::from_summary(&summary))
+    }
+
+    /// Requests that an in-progress [`run_client`](Self::run_client) stop at
+    /// the next file boundary (TODO #8, the Cancel button) -- exactly the
+    /// same request a real Ctrl+C makes, reused rather than reinvented: sets
+    /// the same two process-global flags the vendored fork's own SIGINT/
+    /// SIGTERM/SIGHUP handlers set (`vendor/oc-rsync/crates/core/src/signal
+    /// /unix.rs`'s `handle_sigint` etc.), which the generator/receiver
+    /// transfer loops and the local-copy loop already poll on every call to
+    /// `run_client_with_observer` regardless of transfer direction. The
+    /// current file finishes (matching upstream rsync's own graceful-stop
+    /// behavior) before the call returns `Err(SyncError::Engine{exit_code:
+    /// 20, ..})`; a no-op call (nothing running) is harmless -- the next
+    /// `run_client` call resets both flags before starting.
+    pub fn cancel(&self) {
+        fast_io::signal::mark_shutdown();
+        oc_rsync_core::signal::request_shutdown(
+            oc_rsync_core::signal::ShutdownReason::UserRequested,
+        );
     }
 }
 

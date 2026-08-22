@@ -177,6 +177,27 @@ class SyncPipelineTest {
     }
 
     @Test
+    fun cancelledTransfer_isNotRecordedAsFailure() {
+        // TODO #8: exit code 20 (RERR_SIGNAL) is what SyncEngine.cancel()
+        // produces (mirrors real Ctrl+C) -- SyncPipeline must read that
+        // specific code as "cancelled", not lump it in with a genuine
+        // engine failure (a different exit code, e.g. the 1/23 used
+        // elsewhere in this file).
+        val history = InMemoryRunHistoryStore()
+        val pipeline = pipeline(
+            transferRunner = { _, _, _, _ -> throw SyncException.Engine(exitCode = 20, detail = "cancelled by user") },
+            historyStore = history,
+        )
+
+        val record = (pipeline.run() as PipelineResult.Ran).record
+
+        assertTrue("a cancelled run must be flagged, not a failure", record.cancelled)
+        assertEquals(0, record.failed)
+        assertNull(record.failureReason)
+        assertEquals(record, history.lastRun())
+    }
+
+    @Test
     fun reentrantCall_whileRunInProgress_isNoOp() {
         val startedLatch = CountDownLatch(1)
         val releaseLatch = CountDownLatch(1)

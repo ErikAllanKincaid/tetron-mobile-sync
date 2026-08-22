@@ -7,6 +7,7 @@ import androidx.work.WorkManager
 import java.time.Duration
 import java.util.concurrent.Executors
 import uniffi.tetron_mobile_sync.SyncEngine
+import uniffi.tetron_mobile_sync.SyncEngineInterface
 import xyz.tetron.sync.bridge.MeshBridge
 import xyz.tetron.sync.bridge.ProviderStatusCaller
 import xyz.tetron.sync.delete.DeleteIntentSenderLauncher
@@ -82,12 +83,20 @@ class AppContainer(context: Context) {
         launcher = DeleteIntentSenderLauncher { intentSender -> deleteIntentSenderLauncher?.launch(intentSender) },
     )
 
+    /** Held directly (not just wrapped inside [EngineTransferRunner]) so
+     *  [xyz.tetron.sync.ui.home.HomeViewModel] can call `cancel()` (TODO #8)
+     *  on the same engine instance a run is in flight on -- cancellation is
+     *  a process-global request in the vendored fork (mirrors real Ctrl+C),
+     *  so any instance's `cancel()` would work, but reusing this one avoids
+     *  a second, pointless [SyncEngine] object. */
+    val syncEngine: SyncEngineInterface = SyncEngine()
+
     val pipeline: SyncPipeline = SyncPipeline(
         bridge = bridge,
         targetProvider = { settingsStore.target() },
         sourcePathProvider = mediaAccess,
         deviceState = deviceState,
-        transferRunner = EngineTransferRunner(SyncEngine()),
+        transferRunner = EngineTransferRunner(syncEngine),
         historyStore = historyStore,
         coalescer = coalescer,
         gateConfig = { settingsStore.gateConfig() },

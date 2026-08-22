@@ -99,6 +99,19 @@ fun HomeScreen(viewModel: HomeViewModel, onRequestMediaPermission: () -> Unit) {
             Text(if (phase is RunPhase.Running) "Backing up…" else "Back up now")
         }
 
+        // TODO #8: only shown while a run is actually in progress -- there
+        // is nothing to cancel otherwise, and the disabled "Back up now"
+        // button above already communicates that state.
+        if (phase is RunPhase.Running) {
+            Spacer(Modifier.height(8.dp))
+            TextButton(
+                onClick = viewModel::cancel,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Cancel")
+            }
+        }
+
         Spacer(Modifier.height(16.dp))
         // Selectable so a failure (e.g. "Failed: exitCode=10") can be
         // copy-pasted for a bug report instead of hand-transcribed --
@@ -180,6 +193,7 @@ private fun RunPhaseSummary(phase: RunPhase) {
         is RunPhase.Finished -> {
             val record = phase.record
             val status = when {
+                record.cancelled -> "Cancelled"
                 record.failed > 0 -> "Failed: ${record.failureReason ?: "unknown error"}"
                 record.interrupted -> "Interrupted, will resume next run"
                 else -> "Done"

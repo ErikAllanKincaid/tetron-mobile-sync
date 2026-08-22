@@ -137,13 +137,21 @@ class SyncPipeline(
                 failureReason = null,
             )
         } catch (e: SyncException) {
+            // TODO #8: exit code 20 (RERR_SIGNAL) from a Cancel-button call
+            // to SyncEngineInterface.cancel() arrives here the same way any
+            // other engine exception does (there is no separate cancellation
+            // API surface, deliberately -- see cancel()'s own doc on the
+            // Rust side) -- distinguish it from a genuine failure by exit
+            // code rather than growing a second catch branch.
+            val cancelled = (e as? SyncException.Engine)?.exitCode == CANCELLED_EXIT_CODE
             RunRecord(
                 timestampMillis = nowMillis(),
                 added = 0,
                 skipped = 0,
-                failed = 1,
+                failed = if (cancelled) 0 else 1,
                 interrupted = false,
-                failureReason = e.message,
+                failureReason = if (cancelled) null else e.message,
+                cancelled = cancelled,
             )
         }
         historyStore.recordRun(record)
@@ -183,6 +191,12 @@ class SyncPipeline(
     }
 
     companion object {
+        /** RERR_SIGNAL upstream (`vendor/oc-rsync/crates/core/src/exit_code
+         *  /codes.rs`'s `Interrupted -> Signal`); TODO #8's Cancel button
+         *  reuses the fork's own Ctrl+C plumbing, so this is the same code a
+         *  real SIGINT produces, not a value this app invented. */
+        private const val CANCELLED_EXIT_CODE = 20
+
         /** `-rtl`, no bwlimit/modify-window override -- SYNC-009 exposes
          *  these as settings later; `--partial` is always on inside the
          *  engine regardless (SYNC-002 semantics). */

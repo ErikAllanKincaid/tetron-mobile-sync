@@ -902,12 +902,47 @@ class SyncUi(Requirement):
     requested Activity-scoped (`viewModel(activity, factory = ...)`) so
     Home and Progress observe the exact same in-flight `RunPhase` -- a run
     started from Home must be visible on Progress without either screen
-    owning the other. Progress's cancel affordance is explicitly not
-    built: `SyncEngine.run_client` (src/lib.rs) is fully synchronous and
-    blocking with no cancellation token anywhere in its FFI surface, so
-    there is nothing a button could actually invoke; that needs new
-    Rust-side capability, not a UI gap, and is left as a follow-up rather
-    than a button that would not work. Settings covers every item in this
+    owning the other.
+
+    **Cancel button IMPLEMENTED as of 2026-08-21** (TODO #8, follow-up to
+    this requirement's own "left as a follow-up" note above -- the
+    original text is kept above unedited for history). `SyncEngine
+    .run_client` is still fully synchronous/blocking, but a new
+    `SyncEngine.cancel(&self)` (src/lib.rs) needs no per-call cancellation
+    token: it reuses the vendored fork's OWN Ctrl+C plumbing verbatim
+    (`fast_io::signal::mark_shutdown` + `oc_rsync_core::signal
+    ::request_shutdown(ShutdownReason::UserRequested)`, the exact two
+    calls `vendor/oc-rsync/crates/core/src/signal/unix.rs`'s real
+    SIGINT/SIGTERM/SIGHUP handlers make), both process-global flags the
+    generator/receiver transfer loops and the local-copy loop already poll
+    at file boundaries on every `run_client_with_observer` call regardless
+    of transfer direction -- zero changes to the vendored fork itself,
+    since the checkpoints already existed and cover the transfer
+    unconditionally. `run_client` resets both flags before it starts
+    (`fast_io::signal::reset_shutdown_for_testing` / `oc_rsync_core::signal
+    ::reset_for_testing` -- named for testing upstream since the CLI
+    binary just exits after a real signal instead of reusing the process,
+    but both are plain `pub fn`, and reuse here is deliberate, documented
+    at the call site, not a workaround); this is correct because
+    `SyncPipeline`'s own `AtomicBoolean` reentrancy guard already
+    guarantees only one `run_client` is ever in flight per process. A
+    cancelled run surfaces exactly like a real Ctrl+C: `SyncError::Engine
+    {exit_code: 20, ..}` (`RERR_SIGNAL`, already mapped by the fork's own
+    `ErrorKind::Interrupted -> Signal` in `exit_code/codes.rs`, unchanged).
+    `SyncPipeline.kt`'s catch branch reads exit code 20 as a new
+    `RunRecord.cancelled` flag distinct from `failed` (both arrive via the
+    same thrown `SyncException`, but a user-requested stop is not a
+    fault); Home shows a "Cancel" button only while `RunPhase.Running`,
+    wired through `AppContainer.syncEngine` (now held directly, not just
+    inside `EngineTransferRunner`, so `HomeViewModel.cancel()` can reach
+    the same engine instance a run is in flight on -- though since
+    cancellation is process-global, any instance would do). New JVM test:
+    `SyncPipelineTest.cancelledTransfer_isNotRecordedAsFailure`.
+    `:app:testDebugUnitTest` + `:app:assembleDebug` + `reconcile.py` all
+    green; UniFFI bindings + jniLibs regenerated for the new `cancel()`
+    surface.
+
+    Settings covers every item in this
     requirement's own scope list: gate toggles, the roster-based target
     picker (`ExposedDropdownMenuBox` -- Material3 1.3.1's real API needed
     two fixes over the first draft: `ExposedDropdownMenu` is a member of
