@@ -45,9 +45,8 @@ class SharedPreferencesSettingsStore(context: Context) : SettingsStore {
     override fun target(): SyncTarget? {
         val meshIp = prefs.getString(KEY_TARGET_MESH_IP, null) ?: return null
         val module = prefs.getString(KEY_TARGET_MODULE, null) ?: return null
-        val displayName = prefs.getString(KEY_TARGET_DISPLAY_NAME, null) ?: meshIp
         val port = prefs.getInt(KEY_TARGET_PORT, DEFAULT_TARGET_PORT)
-        return SyncTarget(displayName = displayName, meshIp = meshIp, module = module, port = port)
+        return SyncTarget(meshIp = meshIp, module = module, port = port)
     }
 
     override fun setTarget(target: SyncTarget?) {
@@ -55,12 +54,10 @@ class SharedPreferencesSettingsStore(context: Context) : SettingsStore {
         if (target == null) {
             editor.remove(KEY_TARGET_MESH_IP)
                 .remove(KEY_TARGET_MODULE)
-                .remove(KEY_TARGET_DISPLAY_NAME)
                 .remove(KEY_TARGET_PORT)
         } else {
             editor.putString(KEY_TARGET_MESH_IP, target.meshIp)
                 .putString(KEY_TARGET_MODULE, target.module)
-                .putString(KEY_TARGET_DISPLAY_NAME, target.displayName)
                 .putInt(KEY_TARGET_PORT, target.port)
         }
         editor.apply()
@@ -97,7 +94,10 @@ class SharedPreferencesSettingsStore(context: Context) : SettingsStore {
         /** Matches [xyz.tetron.sync.gates.GateNotificationCoalescer
          *  .DEFAULT_WINDOW_MILLIS] (6 hours). */
         const val DEFAULT_COALESCE_WINDOW_HOURS = 6L
-        private const val DEFAULT_TARGET_PORT = 873
+        /** Matches [xyz.tetron.sync.pipeline.SyncTarget]'s own default and
+         *  tetron-sync-receiver's `DEFAULT_PORT` -- 8873 collided with the
+         *  heavily-squatted 8000-9000 dev-tool port range. */
+        private const val DEFAULT_TARGET_PORT = 28873
 
         private const val KEY_WIFI_ONLY = "wifi_only"
         private const val KEY_DIRECT_ONLY = "direct_only"
@@ -106,7 +106,6 @@ class SharedPreferencesSettingsStore(context: Context) : SettingsStore {
         private const val KEY_LOW_BATTERY_THRESHOLD = "low_battery_threshold_percent"
         private const val KEY_TARGET_MESH_IP = "target_mesh_ip"
         private const val KEY_TARGET_MODULE = "target_module"
-        private const val KEY_TARGET_DISPLAY_NAME = "target_display_name"
         private const val KEY_TARGET_PORT = "target_port"
         private const val KEY_DELETE_ENABLED = "delete_after_backup_enabled"
         private const val KEY_WORK_CADENCE_HOURS = "work_cadence_hours"

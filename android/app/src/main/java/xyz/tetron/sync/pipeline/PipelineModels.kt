@@ -13,10 +13,9 @@ import xyz.tetron.sync.gates.GateReason
  * the direct-only gate.
  */
 data class SyncTarget(
-    val displayName: String,
     val meshIp: String,
     val module: String,
-    val port: Int = 873,
+    val port: Int = 28873,
 )
 
 /**

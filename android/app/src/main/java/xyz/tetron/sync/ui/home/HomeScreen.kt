@@ -7,14 +7,22 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -22,17 +30,26 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import xyz.tetron.sync.bridge.BridgePeer
 import xyz.tetron.sync.media.MediaAccessGrant
+import xyz.tetron.sync.pipeline.SyncTarget
 import xyz.tetron.sync.ui.describeGateReason
 import xyz.tetron.sync.ui.describeTunnelState
 
 /**
- * SYNC-009 Home screen: tunnel-state line, consent banner, target summary,
- * media-access banner, the "Back up now" button, and the current
- * [RunPhase] (blocked reason / in-progress / last result). The gated-run
- * "Transfer anyway?" confirm is the decision from this requirement's own
- * open item (spec/sync.py SYNC-009): shown only when [RunPhase.Gated
- * .canOverride] is true.
+ * SYNC-009 Home screen: the backup target editor (mesh peer + module,
+ * moved here from Settings -- this is the thing you look at right before
+ * tapping "Back up now", so it belongs beside that button, not on a
+ * separate settings page), tunnel-state line, consent banner, media-access
+ * banner, the "Back up now" button, and the current [RunPhase] (blocked
+ * reason / in-progress / last result). Port stays on the Settings screen
+ * instead (see SettingsScreen's own "Backup target" note) -- it is a
+ * fixed, rarely-changed technical value tied to the receiver's own setup,
+ * not something you reconsider each time you pick a peer/module.
+ *
+ * The gated-run "Transfer anyway?" confirm is the decision from this
+ * requirement's own open item (spec/sync.py SYNC-009): shown only when
+ * [RunPhase.Gated.canOverride] is true.
  *
  * [onRequestMediaPermission] launches the SYNC-008 runtime permission
  * request -- `ActivityResultContracts.RequestMultiplePermissions` needs an
@@ -52,22 +69,23 @@ fun HomeScreen(viewModel: HomeViewModel, onRequestMediaPermission: () -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .padding(24.dp),
     ) {
         Text("tetron sync", style = MaterialTheme.typography.headlineMedium)
+        Spacer(Modifier.height(16.dp))
+
+        Text("BACKUP TARGET", style = MaterialTheme.typography.labelLarge)
         Spacer(Modifier.height(8.dp))
+        TargetEditor(target = state.target, rosterPeers = state.rosterPeers, onSave = viewModel::setTarget)
+
+        Spacer(Modifier.height(20.dp))
         Text(describeTunnelState(state.tunnelState), style = MaterialTheme.typography.bodyMedium)
 
         state.consentCallerPackage?.let { callerPackage ->
             Spacer(Modifier.height(16.dp))
             ConsentBanner(callerPackage)
         }
-
-        Spacer(Modifier.height(16.dp))
-        Text(
-            text = state.targetDisplayName?.let { "Backing up to $it" } ?: "No backup target configured yet",
-            style = MaterialTheme.typography.bodyMedium,
-        )
 
         MediaAccessBanner(state.mediaAccessGrant, onRequestMediaPermission)
 
@@ -165,6 +183,87 @@ private fun RunPhaseSummary(phase: RunPhase) {
                 style = MaterialTheme.typography.bodyMedium,
             )
         }
+    }
+}
+
+/**
+ * Moved here from Settings (SYNC-009 revision, 2026-08-21): this is what
+ * you look at right before tapping "Back up now", so it belongs on Home.
+ * Only mesh peer + module -- no Display name (redundant with the peer's
+ * own hostname shown right here, and could drift out of sync with it; see
+ * [HomeViewModel]'s own note) and no Port (moved to Settings instead,
+ * since it is a fixed technical value tied to the receiver's own setup,
+ * not something reconsidered alongside peer/module).
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TargetEditor(
+    target: SyncTarget?,
+    rosterPeers: List<BridgePeer>,
+    onSave: (SyncTarget?) -> Unit,
+) {
+    var selectedPeer by remember(target) { mutableStateOf<BridgePeer?>(rosterPeers.firstOrNull { it.ip == target?.meshIp }) }
+    var moduleName by remember(target) { mutableStateOf(target?.module ?: "") }
+    var expanded by remember { mutableStateOf(false) }
+
+    LaunchedEffect(rosterPeers, target) {
+        if (selectedPeer == null) {
+            selectedPeer = rosterPeers.firstOrNull { it.ip == target?.meshIp }
+        }
+    }
+
+    if (rosterPeers.isEmpty()) {
+        Text(
+            "No mesh peers seen yet -- open tetron-mobile and join a network first.",
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        Spacer(Modifier.height(8.dp))
+    }
+
+    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
+        OutlinedTextField(
+            value = selectedPeer?.let { it.hostname ?: it.ip } ?: "Choose a mesh peer",
+            onValueChange = {},
+            readOnly = true,
+            label = { Text("Mesh peer") },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+            modifier = Modifier
+                .fillMaxWidth()
+                .menuAnchor(),
+        )
+        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            rosterPeers.forEach { peer ->
+                DropdownMenuItem(
+                    text = { Text("${peer.hostname ?: peer.ip} (${peer.ip})") },
+                    onClick = {
+                        selectedPeer = peer
+                        expanded = false
+                    },
+                )
+            }
+        }
+    }
+
+    Spacer(Modifier.height(8.dp))
+    OutlinedTextField(
+        value = moduleName,
+        onValueChange = { moduleName = it },
+        label = { Text("rsync module name") },
+        modifier = Modifier.fillMaxWidth(),
+    )
+    Spacer(Modifier.height(8.dp))
+    Button(
+        onClick = {
+            val peer = selectedPeer
+            if (peer != null && moduleName.isNotBlank()) {
+                val newTarget = target?.copy(meshIp = peer.ip, module = moduleName)
+                    ?: SyncTarget(meshIp = peer.ip, module = moduleName)
+                onSave(newTarget)
+            }
+        },
+        enabled = selectedPeer != null && moduleName.isNotBlank(),
+    ) {
+        Text("Save target")
     }
 }
 

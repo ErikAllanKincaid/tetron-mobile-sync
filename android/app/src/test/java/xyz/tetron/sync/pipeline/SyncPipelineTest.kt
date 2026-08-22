@@ -35,7 +35,7 @@ import xyz.tetron.sync.gates.GateReason
  */
 class SyncPipelineTest {
 
-    private val target = SyncTarget(displayName = "aorus", meshIp = "10.10.0.2", module = "photos")
+    private val target = SyncTarget(meshIp = "10.10.0.2", module = "photos")
     private val openPeer = BridgePeer(hostname = "aorus", ip = "10.10.0.2", connKind = ConnKind.Direct)
     private val openDeviceState = object : DeviceStateProvider {
         override fun isWifiConnected() = true

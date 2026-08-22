@@ -16,6 +16,7 @@ import kotlinx.coroutines.launch
 import uniffi.tetron_mobile_sync.SyncProgressEvent
 import uniffi.tetron_mobile_sync.SyncProgressListener
 import xyz.tetron.sync.AppContainer
+import xyz.tetron.sync.bridge.BridgePeer
 import xyz.tetron.sync.bridge.BridgeResponse
 import xyz.tetron.sync.bridge.BridgeTunnelState
 import xyz.tetron.sync.gates.GateReason
@@ -23,6 +24,7 @@ import xyz.tetron.sync.gates.relaxedGateConfig
 import xyz.tetron.sync.media.MediaAccessGrant
 import xyz.tetron.sync.pipeline.PipelineResult
 import xyz.tetron.sync.pipeline.RunRecord
+import xyz.tetron.sync.pipeline.SyncTarget
 
 /** The Home screen's "big button" state -- also what the Progress screen
  *  reads (same [HomeViewModel] instance, Activity-scoped, since a run
@@ -40,7 +42,8 @@ sealed class RunPhase {
 data class HomeUiState(
     val tunnelState: BridgeTunnelState = BridgeTunnelState.Unknown,
     val consentCallerPackage: String? = null,
-    val targetDisplayName: String? = null,
+    val target: SyncTarget? = null,
+    val rosterPeers: List<BridgePeer> = emptyList(),
     val mediaAccessGrant: MediaAccessGrant = MediaAccessGrant.NotGranted,
     val runPhase: RunPhase = RunPhase.Idle,
 )
@@ -89,14 +92,23 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
 
     private fun pollNow(): HomeUiState {
         val response = container.bridge.current()
-        val tunnelState = (response as? BridgeResponse.Snapshot)?.snapshot?.state ?: BridgeTunnelState.Unknown
+        val snapshot = (response as? BridgeResponse.Snapshot)?.snapshot
+        val tunnelState = snapshot?.state ?: BridgeTunnelState.Unknown
         val consentCallerPackage = (response as? BridgeResponse.ConsentRequired)?.callerPackage
         return HomeUiState(
             tunnelState = tunnelState,
             consentCallerPackage = consentCallerPackage,
-            targetDisplayName = container.settingsStore.target()?.displayName,
+            target = container.settingsStore.target(),
+            rosterPeers = snapshot?.peers ?: emptyList(),
             mediaAccessGrant = container.mediaAccess.currentState().grant,
         )
+    }
+
+    /** The backup target is edited directly from Home now (module + mesh
+     *  peer), not a separate Settings section -- port stays untouched here,
+     *  it's edited from Settings instead (see SettingsViewModel.setTargetPort). */
+    fun setTarget(target: SyncTarget?) {
+        container.settingsStore.setTarget(target)
     }
 
     private inner class LiveProgressListener : SyncProgressListener {

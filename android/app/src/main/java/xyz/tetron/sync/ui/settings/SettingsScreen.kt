@@ -12,11 +12,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
-import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ExposedDropdownMenuBox
-import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -24,7 +19,6 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -36,12 +30,15 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import xyz.tetron.sync.bridge.BridgePeer
 
 /**
- * SYNC-009 Settings screen: gate toggles + values, target config
- * (mesh-IP picker roster-based; module name; display name), delete-after-
- * backup opt-in, WorkManager cadence, notification coalescing window.
+ * SYNC-009 Settings screen: gate toggles + values, the target's port
+ * (peer/module selection itself lives on Home now, see
+ * [xyz.tetron.sync.ui.home.HomeScreen] -- this screen just carries the
+ * receiver's port, since that's a fixed
+ * technical value tied to the receiver's own setup, not something
+ * reconsidered alongside picking a peer/module), delete-after-backup
+ * opt-in, WorkManager cadence, notification coalescing window.
  * Notification channel copy itself is a separate, not-yet-built slice of
  * this requirement (spec/sync.py: "exact copy is implementation-time").
  */
@@ -80,11 +77,20 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
         }
 
         Spacer(Modifier.height(24.dp))
-        SectionHeader("Backup target")
-        TargetEditor(target = state.target, rosterPeers = state.rosterPeers, onSave = viewModel::setTarget)
+        OwnMeshIpRow(state.ownMeshIp)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "Which peer/module to back up to is configured on the Home screen.",
+            style = MaterialTheme.typography.bodySmall,
+        )
 
         Spacer(Modifier.height(16.dp))
-        OwnMeshIpRow(state.ownMeshIp)
+        IntSettingRow(
+            label = "Port",
+            value = state.target?.port ?: 28873,
+            onValueChange = viewModel::setTargetPort,
+        )
+        PortWarning()
 
         Spacer(Modifier.height(24.dp))
         SectionHeader("Delete after backup")
@@ -209,86 +215,15 @@ private fun LongSettingRow(label: String, value: Long, onValueChange: (Long) -> 
     )
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+/** Same warning-text convention [xyz.tetron.sync.ui.home.MediaAccessBanner]
+ *  already uses (`MaterialTheme.colorScheme.error`) rather than inventing a
+ *  separate amber "warning" color the app's theme does not otherwise have. */
 @Composable
-private fun TargetEditor(
-    target: xyz.tetron.sync.pipeline.SyncTarget?,
-    rosterPeers: List<BridgePeer>,
-    onSave: (xyz.tetron.sync.pipeline.SyncTarget?) -> Unit,
-) {
-    var selectedPeer by remember(target) { mutableStateOf<BridgePeer?>(rosterPeers.firstOrNull { it.ip == target?.meshIp }) }
-    var moduleName by remember(target) { mutableStateOf(target?.module ?: "") }
-    var displayName by remember(target) { mutableStateOf(target?.displayName ?: "") }
-    var expanded by remember { mutableStateOf(false) }
-
-    LaunchedEffect(rosterPeers, target) {
-        if (selectedPeer == null) {
-            selectedPeer = rosterPeers.firstOrNull { it.ip == target?.meshIp }
-        }
-    }
-
-    if (rosterPeers.isEmpty()) {
-        Text(
-            "No mesh peers seen yet -- open tetron-mobile and join a network first.",
-            style = MaterialTheme.typography.bodyMedium,
-        )
-        Spacer(Modifier.height(8.dp))
-    }
-
-    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
-        OutlinedTextField(
-            value = selectedPeer?.let { it.hostname ?: it.ip } ?: "Choose a mesh peer",
-            onValueChange = {},
-            readOnly = true,
-            label = { Text("Mesh peer") },
-            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-            modifier = Modifier
-                .fillMaxWidth()
-                .menuAnchor(),
-        )
-        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            rosterPeers.forEach { peer ->
-                DropdownMenuItem(
-                    text = { Text("${peer.hostname ?: peer.ip} (${peer.ip})") },
-                    onClick = {
-                        selectedPeer = peer
-                        expanded = false
-                    },
-                )
-            }
-        }
-    }
-
-    Spacer(Modifier.height(8.dp))
-    OutlinedTextField(
-        value = moduleName,
-        onValueChange = { moduleName = it },
-        label = { Text("rsync module name") },
-        modifier = Modifier.fillMaxWidth(),
+private fun PortWarning() {
+    Text(
+        "Must match the port your receiver is actually running on. If it doesn't, backups will fail with a socket error.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.error,
+        modifier = Modifier.padding(top = 4.dp),
     )
-    Spacer(Modifier.height(8.dp))
-    OutlinedTextField(
-        value = displayName,
-        onValueChange = { displayName = it },
-        label = { Text("Display name") },
-        modifier = Modifier.fillMaxWidth(),
-    )
-    Spacer(Modifier.height(8.dp))
-    Button(
-        onClick = {
-            val peer = selectedPeer
-            if (peer != null && moduleName.isNotBlank()) {
-                onSave(
-                    xyz.tetron.sync.pipeline.SyncTarget(
-                        displayName = displayName.ifBlank { peer.hostname ?: peer.ip },
-                        meshIp = peer.ip,
-                        module = moduleName,
-                    ),
-                )
-            }
-        },
-        enabled = selectedPeer != null && moduleName.isNotBlank(),
-    ) {
-        Text("Save target")
-    }
 }
