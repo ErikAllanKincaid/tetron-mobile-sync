@@ -1102,3 +1102,202 @@ class SyncFinalDeviceVerification(Requirement):
     milestone; nothing automated that a passing build could substitute for.
     """
     req_id = "SYNC-011"
+
+
+class SyncFilterControls(Requirement):
+    """REQUIREMENT-ID: SYNC-012
+
+    User-facing backup-scope controls: per-filetype include toggles, a
+    max-file-size cap, a bandwidth ceiling, one-tap presets, and a local
+    backlog estimate with a Preview breakdown. Design record:
+    `DO-NOT-COMMIT/IDEAS_tetron-mobile-sync_user_filter_controls_and_presets_2026-08-28.md`
+    (shape settled 2026-08-28; decisions confirmed and this requirement cut
+    2026-08-28).
+
+    Dependencies: SYNC-008 (the `--files-from` builder in
+    `AndroidMediaAccess` is the single enforcement chokepoint), SYNC-005
+    (the pipeline threads the scope through as a supplier and records the
+    oversize-skip count), SYNC-009 (the Settings UI hosts every control).
+    No dependency on any new engine surface -- see decision A1.
+
+    ## The architectural fact that shapes it
+
+    On Android API 29+ the app does NOT let oc-rsync recursively walk
+    `DCIM/Camera` -- Scoped Storage's FUSE layer filters raw directory
+    enumeration per app UID (root-caused across three SYNC-008 device bugs).
+    `AndroidMediaAccess` instead queries `MediaStore.Files` and stages a
+    `--files-from` list. Consequence: on every modern device the selection
+    lever is a `WHERE`-clause / row filter on that query, NOT rsync
+    `--include`/`--exclude` rules. rsync filter rules would matter only on
+    the pre-29 (API 26-28) recursive-walk fallback path -- which no
+    reference device exercises (decision A2).
+
+    ## Scope is persistent config, not a per-run filter
+
+    There is ONE saved `BackupScope` (persisted in `SettingsStore`), and
+    every trigger path -- manual "Back up now", the WorkManager job, the
+    network-change trigger -- builds its `--files-from` list from that same
+    scope through the one existing `AndroidMediaAccess` chokepoint. No code
+    path runs oc-rsync against the raw `DCIM` tree. This closes the
+    fail-open hole a per-run filter has: a run scoped to just `.jpg` would
+    leave `.dng`/video absent at the destination, and a later wider run
+    would then upload all of them at once. Files "come back" only when the
+    user deliberately widens the scope, which correctly means "back these up
+    from now on too".
+
+    ## Controls (v1)
+
+    1. Filetype include toggles, all default ON: JPEG, HEIC, Raw, Videos,
+       plus an "Other files" catch-all (default ON). The named types are
+       app-maintained extension/MIME sets, not raw Android `MEDIA_TYPE`
+       values (the OS types `.jpg`, `.heic`, `.dng` all as `image`).
+       Turning "Other files" OFF is the ONLY way an unrecognised type stops
+       uploading -- so a new capture format (`.webp`, a motion-photo
+       container, a burst format) is never dropped silently; it stays
+       covered by the catch-all until the user makes a deliberate choice.
+       Classification is by `MediaStore` `MIME_TYPE` first, filename
+       extension as fallback for the "Other files" boundary (decision A3).
+       Default sets (decision B6): JPEG `jpg jpeg`; HEIC `heic heif`; Raw
+       `dng raw arw nef cr2 cr3 rw2 orf raf srw`; Videos `mp4 mov 3gp m4v
+       mkv webm`.
+    2. Max file size: "skip files larger than N". Default OFF, no cap
+       (decision B3). Enforced as a `SIZE <= ?` row filter plus a
+       `File.length()` stat per surviving candidate (a known-path read, not
+       enumeration -- Scoped-Storage-safe, same basis as SYNC-008's
+       existing `File.exists()` stale-row check) as a backstop against a
+       stale `MediaStore.SIZE`.
+    3. Bandwidth limit: a single KiB/s ceiling, unconditional (NOT split
+       Wi-Fi vs cellular -- decision B4/A4). Default OFF. Lives in an
+       Advanced section. Wired through the EXISTING
+       `SyncRunOptions.bwlimit_kib` FFI field -- no engine change.
+    4. Presets: Everything / Photos only / Lean / Custom. A thin layer over
+       the individual fields: selecting one populates them; editing any
+       field flips the selector to Custom. Only "which preset is selected"
+       plus the field values are persisted -- no independent preset store.
+       Mixes (decision B2): Everything = all ON, no caps. Photos only =
+       Videos OFF, everything else ON (Raw stays ON). Lean = Raw OFF,
+       everything else ON, ~1 GB size cap, bandwidth limit on (a single
+       unconditional value). Custom = user-set.
+    5. Backlog estimate: a live read-only line under the toggles in
+       Settings ("On this phone 12,400 photos, 340 videos, 88 GB. This
+       scope will upload about 61 GB."), recomputed as toggles / the size
+       cap change. Computed by iterating a `MediaStore.Files` cursor
+       (`DISPLAY_NAME`, `SIZE`, `MIME_TYPE`) over the same `RELATIVE_PATH`
+       scope and summing client-side -- NOT a SQL `GROUP BY`/`SUM`
+       aggregate (unreliable across API 29-30+). No tunnel, no target
+       needed. Off the main thread, cached with a timestamp, refreshed on
+       screen open or a `ContentObserver` tick.
+    6. Preview action: a button opening a Material 3 modal bottom sheet over
+       Settings with the per-type breakdown, the skipped buckets
+       (toggled-off types, over-the-cap files), and the largest included
+       files -- all from the current scope, no tunnel. NOT the Progress tab
+       (that is about a run happening now). The real dry-run against the
+       server is deferred past v1 (decision "Dry-run in v1: No"); when it
+       lands it augments this same bottom sheet with "already on server /
+       will send" columns.
+    7. Fixed engine defaults (not user-visible): `timeout` 120s,
+       `connect_timeout` 30s in `SyncEngine::run_client` so a dead mesh
+       path fails a WorkManager run instead of hanging it; `partial_dir`
+       (`.tetron-partial`) so in-progress files do not surface as broken
+       thumbnails mid-transfer; `compress` and `checksum` stay the
+       oc-rsync builder defaults (both already false). These are hardcoded
+       builder calls -- they do NOT change the `SyncRunOptions` record
+       shape, so no UniFFI binding / jniLib regeneration.
+
+    ## Deliberately deferred (must not be foreclosed)
+
+    - Overflow ("hamburger dots") menu editors -- "Edit raw formats...",
+      "Add a custom type...", "Reset to defaults" -- that let a power user
+      adjust the extension sets `SettingsStore` holds. v1.1 (decision B1).
+      v1 ships the built-in sets as constants; the set values must already
+      live in a shape the editor can later mutate, not be inlined into the
+      query builder.
+    - Real `--dry-run` against the target (needs tunnel Active + reachable
+      target); augments the Preview bottom sheet when it lands.
+    - User-defined named presets; per-run/per-day data budget ("stop after
+      N GB", app-side byte accounting, no rsync support); folder scope
+      beyond `DCIM/Camera` (SAF picker -- plan decision #10 already defers
+      it); age filter ("only last N days", a `DATE_ADDED` predicate --
+      invites "why was that old photo never backed up").
+
+    ## Consequence for delete-after-backup (SYNC-007)
+
+    An excluded file (toggled-off type, over the cap) is never transferred,
+    so it is never deleted -- correct by construction (SYNC-007 already
+    deletes only byte-verified files transferred this run). A permanent Raw
+    exclusion plus delete-after-backup on means `.dng` files pile up on the
+    phone indefinitely while their `.jpg` siblings are backed up and
+    removed. The Settings copy MUST state this: "Delete after backup
+    removes only files that were backed up. Types you turn off stay on your
+    phone." The app never runs `--delete`, so copies already on the home
+    server from a run made under a wider scope also stay there.
+
+    ## Where it lands
+
+    - `SettingsStore` (`xyz.tetron.sync.settings`): persist the
+      `BackupScope` fields + the selected preset name. Read fresh per run
+      (same live-read contract as `gateConfig`).
+    - `xyz.tetron.sync` scope model + classifier: a `BackupScope` data
+      class, a pure `ScopeFilter` mapping `(displayName, mimeType,
+      sizeBytes) -> Included | ExcludedType | ExcludedOversize`, a `Preset`
+      enum with preset<->scope mapping and Custom detection. Pure Kotlin,
+      fully JVM-unit-tested (no Android deps) -- same bar as SYNC-004's
+      `GateEvaluator`.
+    - `AndroidMediaAccess` (SYNC-008): the `--files-from` query projection
+      gains `SIZE` + `MIME_TYPE`; rows run through `ScopeFilter`; the
+      surviving names are staged as today. A new aggregate mode produces
+      the backlog estimate and the Preview breakdown. `SourceSpec` gains a
+      `skippedOversizeCount: Int`.
+    - `SyncPipeline` (SYNC-005): threads a `() -> BackupScope` supplier
+      through (existing `gateConfig` pattern); carries
+      `skippedOversizeCount` into a new `RunRecord` field distinct from
+      `skipped` (decision A5/B5 -- oversize skips are surfaced in History
+      only, not a notification, but must be countable separately from the
+      "already on server" skips that dominate `skipped`).
+    - `SyncEngine::run_client` (`src/lib.rs`): add the fixed
+      `timeout`/`connect_timeout`/`partial_directory` builder calls (item 7
+      -- no FFI record change).
+    - `xyz.tetron.sync.ui.settings` (SYNC-009): the five toggles, the size
+      cap, the Advanced section (bandwidth limit), the preset selector, the
+      live estimate line, the "Preview" button + its modal bottom sheet,
+      and the updated delete-after-backup copy.
+
+    ## Decision register (confirmed 2026-08-28)
+
+    A1  v1 is spec + Kotlin (+ the item-7 hardcoded Rust defaults) only; NO
+        new `SyncRunOptions` field, NO UniFFI regen. The whole type/size
+        scope is enforced in the Kotlin `--files-from` builder.
+    A2  Pre-29 (API 26-28) keeps the unfiltered recursive walk; the scope
+        does not apply there. Documented gap; no reference device is pre-29.
+    A3  Classify by `MediaStore` `MIME_TYPE` first, filename extension as
+        fallback.
+    A4  "Lean" preset and the bandwidth control use one unconditional
+        KiB/s value; no Wi-Fi-vs-cellular split (also B4).
+    A5  `RunRecord` gets a distinct oversize-skipped count, separate from
+        `skipped`.
+    B1  Overflow-menu extension-set editors: v1.1, not v1.
+    B2  "Photos only" preset keeps Raw ON (drops Videos only).
+    B3  Max file size default: OFF (no cap out of the box).
+    B5  Toggle / size-cap skips: surfaced in History only, no one-time
+        notification (paired with A5's separate count).
+    B6  Default extension sets as listed under control 1 -- accepted for v1.
+
+    ACCEPTANCE: JVM unit tests cover the scope model end to end -- the
+    `ScopeFilter` decision for every toggle state (each type individually
+    excluded with the right reason, "Other files" OFF restricting to the
+    known sets, the oversize path, MIME-vs-extension precedence), the
+    preset<->scope round trip and Custom-on-edit detection, and
+    `SettingsStore` persistence of every field. `AndroidMediaAccess`'s row
+    filtering and aggregate mode are covered by a fake-cursor test at the
+    pure-aggregation seam (same split as SYNC-008's
+    `resolveMediaAccessState`). `SyncPipelineTest` gains a case that a
+    scoped run stages only the in-scope names and records
+    `skippedOversizeCount`. `:app:testDebugUnitTest`,
+    `:app:assembleDebug`, `cargo test`, and `python3 reconcile.py` all
+    green. On-device verification (a real scoped run + Preview against the
+    real camera roll) folds into SYNC-011's ongoing device pass.
+    ENFORCEMENT: the scope-model + pipeline unit tests are the automated
+    gate; the Compose UI and the on-device scoped run are manual, same bar
+    as SYNC-009.
+    """
+    req_id = "SYNC-012"
