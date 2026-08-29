@@ -12,6 +12,11 @@ import androidx.core.content.ContextCompat
 import java.io.File
 import xyz.tetron.sync.pipeline.SourcePathProvider
 import xyz.tetron.sync.pipeline.SourceSpec
+import xyz.tetron.sync.scope.BacklogEstimate
+import xyz.tetron.sync.scope.BackupScope
+import xyz.tetron.sync.scope.MediaEntry
+import xyz.tetron.sync.scope.estimateBacklog
+import xyz.tetron.sync.scope.selectInScope
 
 /**
  * SYNC-008: the production [SourcePathProvider] -- reads real runtime
@@ -39,7 +44,14 @@ import xyz.tetron.sync.pipeline.SourceSpec
  * Storage restriction, so they keep the plain recursive-walk behavior
  * unchanged from SYNC-008 v1.
  */
-class AndroidMediaAccess(private val context: Context) : SourcePathProvider {
+class AndroidMediaAccess(
+    private val context: Context,
+    /** SYNC-012: the persistent backup scope, read fresh each call
+     *  (`AppContainer` wires it to `SettingsStore::backupScope`). Defaults
+     *  to "everything" so tests and any un-wired caller keep the SYNC-008
+     *  behavior. */
+    private val scopeProvider: () -> BackupScope = { BackupScope() },
+) : SourcePathProvider {
 
     fun currentPermissionState(): MediaPermissionState = MediaPermissionState(
         readMediaImagesGranted = granted(Manifest.permission.READ_MEDIA_IMAGES),
@@ -54,57 +66,93 @@ class AndroidMediaAccess(private val context: Context) : SourcePathProvider {
         directory = cameraRollDirectory(),
     )
 
-    /** The [SourcePathProvider] contract SYNC-005's pipeline consumes. */
+    /** The [SourcePathProvider] contract SYNC-005's pipeline consumes.
+     *  SYNC-012: the staged `--files-from` list is the current
+     *  [BackupScope] applied to the `MediaStore` roster
+     *  ([selectInScope]); [SourceSpec.skippedOversizeCount] is the
+     *  size-cap drop count that falls out of the same pass. */
     override fun resolve(): SourceSpec? {
         val root = currentState().sourcePath ?: return null
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return SourceSpec(rootPath = root)
-        return SourceSpec(rootPath = root, filesFromPath = writeFilesFromList(root))
+        val selection = selectInScope(queryCameraRollEntries(File(root)), scopeProvider())
+        return SourceSpec(
+            rootPath = root,
+            filesFromPath = writeFilesFromList(selection.includedNames),
+            skippedOversizeCount = selection.oversizeSkippedCount,
+        )
     }
 
     /**
-     * Queries `MediaStore` for every image/video row under `DCIM/Camera/`
-     * and stages their filenames as a newline-delimited `--files-from`
-     * list in app-private storage (overwritten each run -- this is a
-     * transient staging file, not history). Real camera-roll filenames
-     * never contain newlines, so no `--from0`/NUL-delimiting is needed.
-     * A query returning zero rows still writes (and returns) an empty
-     * list -- "nothing new to back up" is a normal outcome, not a
-     * [SourceSpec] resolution failure.
-     *
-     * Root-caused SYNC-011: `MediaStore`'s index can go stale (a row for a
-     * file that no longer exists on disk, deleted through some path that
-     * never triggered a rescan) -- ordinary on a real, lived-in gallery.
-     * Feeding a dead name into `--files-from` makes oc-rsync `link_stat`
-     * it, fail, and set the transfer's exit code to "partial transfer due
-     * to error" even though every other file transfers correctly --
-     * surfacing as a misleading "Interrupted" run on the Home/History
-     * screens. [File.exists] is a single stat on a *known* path, not a
-     * directory listing, so (per the SYNC-011 Scoped Storage root cause
-     * above) it is not subject to the enumeration filter -- checking each
-     * candidate here is safe and keeps stale rows out of the list `oc-rsync`
-     * ever sees, rather than asking the engine to cope with them.
+     * SYNC-012: the local backlog estimate behind the Settings estimate
+     * line and the Preview bottom sheet -- the same `MediaStore` roster,
+     * aggregated ([estimateBacklog]) instead of staged. No tunnel, no
+     * target. API 29+ only (the scope does not apply to the pre-29
+     * recursive-walk path -- decision A2); [BacklogEstimate.EMPTY] below
+     * that. `Cursor` glue only, so no unit test here -- the aggregation it
+     * feeds is tested directly.
      */
-    private fun writeFilesFromList(root: String): String {
-        val rootDir = File(root)
+    fun backlogEstimate(scope: BackupScope = scopeProvider()): BacklogEstimate {
+        val root = currentState().sourcePath ?: return BacklogEstimate.EMPTY
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return BacklogEstimate.EMPTY
+        return estimateBacklog(queryCameraRollEntries(File(root)), scope)
+    }
+
+    /**
+     * Every image/video `MediaStore` row under `DCIM/Camera/`, reduced to
+     * [MediaEntry]. Stale rows are dropped here: `MediaStore`'s index can
+     * outlive the file on a lived-in gallery (root-caused SYNC-011), and
+     * feeding a dead name into `--files-from` makes oc-rsync `link_stat` it,
+     * fail, and set exit 23 -- a misleading "Interrupted" run. [File.exists]
+     * is a stat on a *known* path, not a directory listing, so it is not
+     * subject to the Scoped Storage enumeration filter. The same stat
+     * yields [File.length] for the SYNC-012 size cap -- `max(MediaStore.SIZE,
+     * length)` since `MediaStore.SIZE` can be stale (0, or a pre-edit
+     * value) and the cap should err toward holding a big file back.
+     */
+    private fun queryCameraRollEntries(rootDir: File): List<MediaEntry> {
+        val entries = ArrayList<MediaEntry>()
+        queryCameraRoll().use { cursor ->
+            val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME)
+            val mimeCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.MIME_TYPE)
+            val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.SIZE)
+            while (cursor.moveToNext()) {
+                val name = cursor.getString(nameCol) ?: continue
+                val onDisk = File(rootDir, name)
+                if (!onDisk.exists()) continue
+                val mime = if (cursor.isNull(mimeCol)) null else cursor.getString(mimeCol)
+                val size = maxOf(cursor.getLong(sizeCol), onDisk.length())
+                entries.add(MediaEntry(displayName = name, mimeType = mime, sizeBytes = size))
+            }
+        }
+        return entries
+    }
+
+    /**
+     * Writes [names] as a newline-delimited `--files-from` list in
+     * app-private storage (overwritten each run -- a transient staging
+     * file, not history). Real camera-roll filenames never contain
+     * newlines, so no `--from0`/NUL-delimiting is needed. An empty list
+     * still writes -- "nothing in scope to back up" is a normal outcome,
+     * not a [SourceSpec] resolution failure.
+     */
+    private fun writeFilesFromList(names: List<String>): String {
         val listFile = File(context.filesDir, FILES_FROM_LIST_NAME)
         listFile.bufferedWriter().use { writer ->
-            queryCameraRollNames().use { cursor ->
-                val nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME)
-                while (cursor.moveToNext()) {
-                    val name = cursor.getString(nameColumn)
-                    if (File(rootDir, name).exists()) {
-                        writer.write(name)
-                        writer.write("\n")
-                    }
-                }
+            for (name in names) {
+                writer.write(name)
+                writer.write("\n")
             }
         }
         return listFile.path
     }
 
-    private fun queryCameraRollNames(): Cursor {
+    private fun queryCameraRoll(): Cursor {
         val collection = MediaStore.Files.getContentUri("external")
-        val projection = arrayOf(MediaStore.Files.FileColumns.DISPLAY_NAME)
+        val projection = arrayOf(
+            MediaStore.Files.FileColumns.DISPLAY_NAME,
+            MediaStore.Files.FileColumns.MIME_TYPE,
+            MediaStore.Files.FileColumns.SIZE,
+        )
         val selection = "${MediaStore.Files.FileColumns.RELATIVE_PATH} = ? AND " +
             "${MediaStore.Files.FileColumns.MEDIA_TYPE} IN (?, ?)"
         val selectionArgs = arrayOf(

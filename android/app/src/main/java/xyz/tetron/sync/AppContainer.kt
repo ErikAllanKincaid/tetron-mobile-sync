@@ -61,7 +61,7 @@ class AppContainer(context: Context) {
 
     val settingsStore: SettingsStore = SharedPreferencesSettingsStore(appContext)
     val bridge = MeshBridge(ProviderStatusCaller(appContext.contentResolver))
-    val mediaAccess = AndroidMediaAccess(appContext)
+    val mediaAccess = AndroidMediaAccess(appContext, scopeProvider = { settingsStore.backupScope() })
     val deviceState = AndroidDeviceStateProvider(appContext)
     val historyStore: RunHistoryStore = SharedPreferencesRunHistoryStore(appContext)
 
@@ -100,6 +100,7 @@ class AppContainer(context: Context) {
         historyStore = historyStore,
         coalescer = coalescer,
         gateConfig = { settingsStore.gateConfig() },
+        backupScope = { settingsStore.backupScope() },
         deleteConfig = { settingsStore.deleteAfterBackupConfig() },
         onNotify = notifier::notifyGated,
         onRunCompleted = notifier::notifyRunCompleted,

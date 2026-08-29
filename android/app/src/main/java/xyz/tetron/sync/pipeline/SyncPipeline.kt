@@ -19,6 +19,7 @@ import xyz.tetron.sync.gates.GateInputs
 import xyz.tetron.sync.gates.GateNotificationCoalescer
 import xyz.tetron.sync.gates.GateReason
 import xyz.tetron.sync.gates.relaxedGateConfig
+import xyz.tetron.sync.scope.BackupScope
 
 /**
  * SYNC-005: the single run path every trigger (SYNC-006) funnels into.
@@ -41,11 +42,14 @@ import xyz.tetron.sync.gates.relaxedGateConfig
  *
  * SYNC-009: [run]'s `overrideReason` parameter is the Home screen's
  * "Transfer anyway?" confirm -- see [resolveOverride]/[relaxedGateConfig].
- * [gateConfig]/[deleteConfig] are suppliers, not fixed values, read fresh
- * on every [run] call -- a Settings-screen toggle must be reflected on the
- * very next run (SYNC-009 ACCEPTANCE), and this [SyncPipeline] instance is
- * a long-lived singleton in the app's composition root, constructed once
- * well before any particular settings value is known. [onRunCompleted] is
+ * [gateConfig]/[deleteConfig]/[backupScope] are suppliers, not fixed
+ * values, read fresh on every [run] call -- a Settings-screen toggle must
+ * be reflected on the very next run (SYNC-009 ACCEPTANCE), and this
+ * [SyncPipeline] instance is a long-lived singleton in the app's
+ * composition root, constructed once well before any particular settings
+ * value is known. [backupScope] (SYNC-012) only contributes the bandwidth
+ * ceiling here; its type/size filtering is applied by [sourcePathProvider]
+ * when it stages the `--files-from` list. [onRunCompleted] is
  * called once per attempted run (success, interrupted, or hard failure
  * alike) right after [historyStore] is updated -- unlike [onNotify] it is
  * never coalesced, since a completion/failure notification is not the
@@ -61,6 +65,7 @@ class SyncPipeline(
     private val historyStore: RunHistoryStore,
     private val coalescer: GateNotificationCoalescer,
     private val gateConfig: () -> GateConfig = { GateConfig() },
+    private val backupScope: () -> BackupScope = { BackupScope() },
     private val runOptions: SyncRunOptions = DEFAULT_RUN_OPTIONS,
     private val nowMillis: () -> Long = System::currentTimeMillis,
     private val onNotify: (GateReason) -> Unit = {},
@@ -118,7 +123,15 @@ class SyncPipeline(
         val spec = sourcePathProvider.resolve() ?: return gated(GateReason.TargetUnreachable)
 
         val destination = "rsync://${target.meshIp}:${target.port}/${target.module}/"
-        val effectiveRunOptions = spec.filesFromPath?.let { runOptions.copy(filesFromPath = it) } ?: runOptions
+        // SYNC-012: the scope's bandwidth ceiling is the only scope field
+        // that reaches the engine -- the type/size filtering already
+        // happened in sourcePathProvider.resolve() when it staged the
+        // --files-from list (that is also where spec.skippedOversizeCount
+        // comes from).
+        val effectiveRunOptions = runOptions.copy(
+            filesFromPath = spec.filesFromPath ?: runOptions.filesFromPath,
+            bwlimitKib = backupScope().bwlimitKib?.toULong() ?: runOptions.bwlimitKib,
+        )
         val collector = TransferredFileCollector(progress)
         val record = try {
             val outcome = transferRunner.run(spec.rootPath, destination, effectiveRunOptions, collector)
@@ -135,6 +148,7 @@ class SyncPipeline(
                 failed = 0,
                 interrupted = outcome.ioErrorExitCode != null,
                 failureReason = null,
+                skippedOversize = spec.skippedOversizeCount,
             )
         } catch (e: SyncException) {
             // TODO #8: exit code 20 (RERR_SIGNAL) from a Cancel-button call

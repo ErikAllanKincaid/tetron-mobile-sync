@@ -68,6 +68,7 @@ class SyncPipelineTest {
         transferRunner: TransferRunner,
         historyStore: RunHistoryStore = InMemoryRunHistoryStore(),
         gateConfig: GateConfig = GateConfig(),
+        backupScope: xyz.tetron.sync.scope.BackupScope = xyz.tetron.sync.scope.BackupScope(),
         coalescer: GateNotificationCoalescer = GateNotificationCoalescer(),
         onNotify: (GateReason) -> Unit = {},
         deleteConfig: DeleteAfterBackupConfig = DeleteAfterBackupConfig(),
@@ -82,6 +83,7 @@ class SyncPipelineTest {
         historyStore = historyStore,
         coalescer = coalescer,
         gateConfig = { gateConfig },
+        backupScope = { backupScope },
         onNotify = onNotify,
         deleteConfig = { deleteConfig },
         deletionRequester = deletionRequester,
@@ -145,6 +147,48 @@ class SyncPipelineTest {
         assertEquals(0, record.failed)
         assertFalse(record.interrupted)
         assertEquals(record, history.lastRun())
+    }
+
+    @Test
+    fun scopedRun_stagesTheProvidersFilesFromList_andRecordsOversizeCount() {
+        // SYNC-012 ACCEPTANCE: a scoped run stages only the in-scope names
+        // and records skippedOversizeCount. The type/size filtering itself
+        // lives in AndroidMediaAccess/selectInScope (unit-tested there);
+        // the pipeline's job is to carry the SourceSpec through unchanged.
+        var seenFilesFrom: String? = null
+        val history = InMemoryRunHistoryStore()
+        val pipeline = pipeline(
+            sourcePathProvider = SourcePathProvider {
+                SourceSpec("/dcim/camera", filesFromPath = "/data/app/backup_files_from.txt", skippedOversizeCount = 4)
+            },
+            transferRunner = { _, _, options, _ ->
+                seenFilesFrom = options.filesFromPath
+                outcome(filesCopied = 10, filesTotal = 10)
+            },
+            historyStore = history,
+        )
+
+        val record = (pipeline.run() as PipelineResult.Ran).record
+
+        assertEquals("/data/app/backup_files_from.txt", seenFilesFrom)
+        assertEquals(4, record.skippedOversize)
+        assertEquals(record, history.lastRun())
+    }
+
+    @Test
+    fun backupScopeBandwidthLimit_reachesTheEngineOptions() {
+        var seenBwlimit: ULong? = null
+        val pipeline = pipeline(
+            backupScope = xyz.tetron.sync.scope.BackupScope(bwlimitKib = 1536),
+            transferRunner = { _, _, options, _ ->
+                seenBwlimit = options.bwlimitKib
+                outcome(filesCopied = 1, filesTotal = 1)
+            },
+        )
+
+        pipeline.run()
+
+        assertEquals(1536UL, seenBwlimit)
     }
 
     @Test

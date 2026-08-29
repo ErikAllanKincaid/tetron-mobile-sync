@@ -43,8 +43,19 @@ fun interface TargetProvider {
  * enumerates via `MediaStore` instead of a raw walk on API 29+ and stages the
  * result as this list; `null` (pre-29, or any future non-media source type)
  * falls back to oc-rsync's own recursive walk, unchanged from SYNC-008 v1.
+ *
+ * SYNC-012: [skippedOversizeCount] is how many entries the resolver's
+ * [xyz.tetron.sync.scope.BackupScope] dropped for exceeding the size cap
+ * (in-scope by type, only excluded by size). It rides here so the pipeline
+ * can put it in [RunRecord.skippedOversize] without a second query -- the
+ * count is a by-product of staging the `--files-from` list. `0` on the
+ * pre-29 walk path (no scope applied there).
  */
-data class SourceSpec(val rootPath: String, val filesFromPath: String? = null)
+data class SourceSpec(
+    val rootPath: String,
+    val filesFromPath: String? = null,
+    val skippedOversizeCount: Int = 0,
+)
 
 /**
  * Resolves the backup source for one run (SYNC-008 owns the real
@@ -102,6 +113,12 @@ data class RunRecord(
     val interrupted: Boolean,
     val failureReason: String?,
     val cancelled: Boolean = false,
+    /** SYNC-012 (decision A5): files the backup scope's size cap held back
+     *  this run -- distinct from [skipped] (which is dominated by rsync's
+     *  "already on the server" same-size-same-mtime skips). History surfaces
+     *  this as its own "N too large" line; there is no notification for it
+     *  (decision B5). `0` when no cap is set or on the pre-29 walk path. */
+    val skippedOversize: Int = 0,
 )
 
 /** Persists the most recent run (SYNC-009's History screen: last run time +

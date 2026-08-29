@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use oc_rsync_core::client::{
     BandwidthLimit, ClientConfig, ClientProgressObserver, ClientProgressUpdate, ClientSummary,
-    FilesFromSource, run_client_with_observer,
+    FilesFromSource, TransferTimeout, run_client_with_observer,
 };
 
 uniffi::setup_scaffolding!();
@@ -182,29 +182,7 @@ impl SyncEngine {
         fast_io::signal::reset_shutdown_for_testing();
         oc_rsync_core::signal::reset_for_testing();
 
-        let mut builder = ClientConfig::builder()
-            .transfer_args([source, destination])
-            .partial(true)
-            .recursive(options.recursive)
-            .times(options.times)
-            .links(options.links);
-
-        if let Some(path) = options.files_from_path {
-            builder = builder.files_from(FilesFromSource::LocalFile(std::path::PathBuf::from(path)));
-        }
-
-        if let Some(secs) = options.modify_window_secs {
-            builder = builder.modify_window(Some(secs));
-        }
-        if let Some(kib) = options.bwlimit_kib {
-            let bytes_per_second = NonZeroU64::new(kib.saturating_mul(1024))
-                .expect("bwlimit*1024 cannot be zero when bwlimit is Some");
-            builder = builder.bandwidth_limit(Some(BandwidthLimit::from_bytes_per_second(
-                bytes_per_second,
-            )));
-        }
-
-        let config = builder.build();
+        let config = build_client_config(source, destination, options);
         let mut bridge = progress.as_ref().map(|b| ProgressBridge::new(b.as_ref()));
         let summary = run_client_with_observer(
             config,
@@ -236,6 +214,60 @@ impl SyncEngine {
             oc_rsync_core::signal::ShutdownReason::UserRequested,
         );
     }
+}
+
+/// Builds the per-run oc-rsync `ClientConfig` for a
+/// [`SyncEngine::run_client`] call. Split out of `run_client` so the fixed
+/// engine policy (SYNC-012 item 7) is unit-testable without a live transfer.
+///
+/// Fixed, not user-facing (SYNC-012 -- decision A1: no `SyncRunOptions`
+/// field for any of these):
+/// - `--partial` always on (SYNC-002 semantics).
+/// - `--partial-dir .tetron-partial` -- an in-progress file never surfaces
+///   to the gallery/MediaStore as a truncated thumbnail mid-transfer.
+/// - `--timeout 120` / `--contimeout 30` -- a dead mesh path fails a
+///   background (WorkManager) run instead of hanging it indefinitely.
+///
+/// `compress` and `checksum` stay the oc-rsync builder defaults (both
+/// already `false`); photos/video are precompressed and `-c` would re-read
+/// every byte on both ends.
+fn build_client_config(
+    source: String,
+    destination: String,
+    options: SyncRunOptions,
+) -> ClientConfig {
+    const IO_TIMEOUT_SECS: u64 = 120;
+    const CONNECT_TIMEOUT_SECS: u64 = 30;
+
+    let mut builder = ClientConfig::builder()
+        .transfer_args([source, destination])
+        .partial(true)
+        .partial_directory(Some(".tetron-partial"))
+        .timeout(TransferTimeout::Seconds(
+            NonZeroU64::new(IO_TIMEOUT_SECS).expect("IO_TIMEOUT_SECS is nonzero"),
+        ))
+        .connect_timeout(TransferTimeout::Seconds(
+            NonZeroU64::new(CONNECT_TIMEOUT_SECS).expect("CONNECT_TIMEOUT_SECS is nonzero"),
+        ))
+        .recursive(options.recursive)
+        .times(options.times)
+        .links(options.links);
+
+    if let Some(path) = options.files_from_path {
+        builder = builder.files_from(FilesFromSource::LocalFile(std::path::PathBuf::from(path)));
+    }
+    if let Some(secs) = options.modify_window_secs {
+        builder = builder.modify_window(Some(secs));
+    }
+    if let Some(kib) = options.bwlimit_kib {
+        let bytes_per_second = NonZeroU64::new(kib.saturating_mul(1024))
+            .expect("bwlimit*1024 cannot be zero when bwlimit is Some");
+        builder = builder.bandwidth_limit(Some(BandwidthLimit::from_bytes_per_second(
+            bytes_per_second,
+        )));
+    }
+
+    builder.build()
 }
 
 /// Adapts the oc-rsync `ClientProgressObserver` (trait-object, mutable) to
@@ -294,5 +326,49 @@ mod tests {
     #[test]
     fn engine_version_is_crate_version() {
         assert_eq!(SyncEngine::new().version(), env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn client_config_carries_fixed_engine_policy() {
+        let cfg = build_client_config(
+            "/src".to_string(),
+            "rsync://host/module".to_string(),
+            SyncRunOptions::default(),
+        );
+        assert_eq!(
+            cfg.timeout().as_seconds().map(NonZeroU64::get),
+            Some(120),
+            "SYNC-012 item 7: fixed 120s I/O timeout"
+        );
+        assert_eq!(
+            cfg.connect_timeout().as_seconds().map(NonZeroU64::get),
+            Some(30),
+            "SYNC-012 item 7: fixed 30s connect timeout"
+        );
+        assert_eq!(
+            cfg.partial_directory(),
+            Some(std::path::Path::new(".tetron-partial")),
+            "SYNC-012 item 7: partial files land in .tetron-partial"
+        );
+    }
+
+    #[test]
+    fn client_config_maps_bwlimit_kib_to_bandwidth_limit() {
+        let opts = SyncRunOptions {
+            bwlimit_kib: Some(500),
+            ..SyncRunOptions::default()
+        };
+        let cfg = build_client_config("/src".to_string(), "/dst".to_string(), opts);
+        assert!(cfg.bandwidth_limit().is_some());
+    }
+
+    #[test]
+    fn client_config_no_bwlimit_by_default() {
+        let cfg = build_client_config(
+            "/src".to_string(),
+            "/dst".to_string(),
+            SyncRunOptions::default(),
+        );
+        assert!(cfg.bandwidth_limit().is_none());
     }
 }

@@ -6,6 +6,7 @@ import android.content.SharedPreferences
 import xyz.tetron.sync.delete.DeleteAfterBackupConfig
 import xyz.tetron.sync.gates.GateConfig
 import xyz.tetron.sync.pipeline.SyncTarget
+import xyz.tetron.sync.scope.BackupScope
 
 /**
  * SYNC-009: the production [SettingsStore] -- a single `SharedPreferences`
@@ -70,6 +71,33 @@ class SharedPreferencesSettingsStore(context: Context) : SettingsStore {
         prefs.edit().putBoolean(KEY_DELETE_ENABLED, config.enabled).apply()
     }
 
+    override fun backupScope(): BackupScope {
+        val d = BackupScope()
+        return BackupScope(
+            includeJpeg = prefs.getBoolean(KEY_SCOPE_JPEG, d.includeJpeg),
+            includeHeic = prefs.getBoolean(KEY_SCOPE_HEIC, d.includeHeic),
+            includeRaw = prefs.getBoolean(KEY_SCOPE_RAW, d.includeRaw),
+            includeVideos = prefs.getBoolean(KEY_SCOPE_VIDEOS, d.includeVideos),
+            includeOtherFiles = prefs.getBoolean(KEY_SCOPE_OTHER_FILES, d.includeOtherFiles),
+            // A real cap/limit is always > 0; -1 is the "unset" sentinel
+            // (SharedPreferences has no nullable Long).
+            maxSizeBytes = prefs.getLong(KEY_SCOPE_MAX_SIZE_BYTES, -1L).takeIf { it > 0 },
+            bwlimitKib = prefs.getLong(KEY_SCOPE_BWLIMIT_KIB, -1L).takeIf { it > 0 },
+        )
+    }
+
+    override fun setBackupScope(scope: BackupScope) {
+        prefs.edit()
+            .putBoolean(KEY_SCOPE_JPEG, scope.includeJpeg)
+            .putBoolean(KEY_SCOPE_HEIC, scope.includeHeic)
+            .putBoolean(KEY_SCOPE_RAW, scope.includeRaw)
+            .putBoolean(KEY_SCOPE_VIDEOS, scope.includeVideos)
+            .putBoolean(KEY_SCOPE_OTHER_FILES, scope.includeOtherFiles)
+            .putLong(KEY_SCOPE_MAX_SIZE_BYTES, scope.maxSizeBytes ?: -1L)
+            .putLong(KEY_SCOPE_BWLIMIT_KIB, scope.bwlimitKib ?: -1L)
+            .apply()
+    }
+
     override fun workCadenceHours(): Long =
         prefs.getLong(KEY_WORK_CADENCE_HOURS, DEFAULT_WORK_CADENCE_HOURS)
 
@@ -110,5 +138,12 @@ class SharedPreferencesSettingsStore(context: Context) : SettingsStore {
         private const val KEY_DELETE_ENABLED = "delete_after_backup_enabled"
         private const val KEY_WORK_CADENCE_HOURS = "work_cadence_hours"
         private const val KEY_COALESCE_WINDOW_HOURS = "coalesce_window_hours"
+        private const val KEY_SCOPE_JPEG = "scope_include_jpeg"
+        private const val KEY_SCOPE_HEIC = "scope_include_heic"
+        private const val KEY_SCOPE_RAW = "scope_include_raw"
+        private const val KEY_SCOPE_VIDEOS = "scope_include_videos"
+        private const val KEY_SCOPE_OTHER_FILES = "scope_include_other_files"
+        private const val KEY_SCOPE_MAX_SIZE_BYTES = "scope_max_size_bytes"
+        private const val KEY_SCOPE_BWLIMIT_KIB = "scope_bwlimit_kib"
     }
 }
