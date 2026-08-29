@@ -1,8 +1,6 @@
 # tetron-mobile-sync
 
-An Android app that backs up your phone's camera roll to a computer you own, automatically, over a private mesh network you control -- no cloud storage, no third-party server, no subscription. GPL-3.0 licensed.
-
-Working name only. The app/product name is not decided yet; `tetron-mobile-sync` is the repo and crate name until then.
+An Android app that backs up your phone's camera roll to a computer you own, automatically, over a private mesh network you control -- no cloud storage, no third-party server, no subscription. 
 
 ## What it does
 
