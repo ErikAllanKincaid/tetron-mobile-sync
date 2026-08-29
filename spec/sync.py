@@ -1114,6 +1114,31 @@ class SyncFilterControls(Requirement):
     (shape settled 2026-08-28; decisions confirmed and this requirement cut
     2026-08-28).
 
+    **IMPLEMENTED as of 2026-08-28** (`feat/sync-012-filter-controls`,
+    no PR yet). Rust: `build_client_config` split out of
+    `SyncEngine::run_client` with the fixed `--timeout 120` /
+    `--contimeout 30` / `--partial-dir .tetron-partial` policy (item 7,
+    no `SyncRunOptions` change -- decision A1). Kotlin scope model
+    (`xyz.tetron.sync.scope`): `BackupScope`, `ScopeFilter`
+    (MIME-first classify, `MediaTypeSets` a parameter for the v1.1
+    editor), `ScopeDecision`, `Preset` + `scopeForPreset`/`presetOf`,
+    and the pure `selectInScope` / `estimateBacklog` functions the
+    `--files-from` builder and the Settings estimate share -- 53 JVM
+    unit tests. `SettingsStore.backupScope()`/`setBackupScope()`
+    (thin-adapter convention, no unit test). `AndroidMediaAccess`
+    projection gains `MIME_TYPE`+`SIZE`; `resolve()` runs `selectInScope`
+    and returns `SourceSpec.skippedOversizeCount`; new `backlogEstimate()`.
+    `SyncPipeline` gains a `() -> BackupScope` supplier (only the
+    bandwidth ceiling reaches the engine); `RunRecord.skippedOversize`
+    (decision A5). `SettingsScreen` "What gets backed up" + "Advanced"
+    sections (five toggles, size cap, preset dropdown, estimate card,
+    Preview `ModalBottomSheet`) -- Compose, verified on-device per the
+    SYNC-009 convention. `cargo test`, `:app:testDebugUnitTest`,
+    `:app:assembleDebug`, `:app:compileDebugAndroidTestKotlin`,
+    `python3 reconcile.py` all green. Still open: the on-device scoped-run
+    + Preview pass (folds into SYNC-011); the v1.1 overflow-menu set
+    editors (decision B1); the deferred real server dry-run.
+
     Dependencies: SYNC-008 (the `--files-from` builder in
     `AndroidMediaAccess` is the single enforcement chokepoint), SYNC-005
     (the pipeline threads the scope through as a supplier and records the
