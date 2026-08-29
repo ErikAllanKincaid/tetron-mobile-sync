@@ -1100,6 +1100,30 @@ class SyncFinalDeviceVerification(Requirement):
     DO-NOT-COMMIT.
     ENFORCEMENT: manual, the live bar -- same as every MOBILE-* verification
     milestone; nothing automated that a passing build could substitute for.
+
+    **Verification pass 2026-08-28** (the API-29 reference device against
+    a `tetron-sync-receiver` over the tetron mesh; `main` at `cd0378c` =
+    SYNC-012 merged, plus the History-persistence fix in the same
+    changeset as this note). Full writeup + screenshots live in an
+    untracked `DO-NOT-COMMIT/` working folder.
+    - PASS: consent flow (ungranted -> `mesh-bridge-consent` notification
+      -> MOBILE-024 `GrantActivity` Allow -> "Mesh connected" + roster);
+      media permission via the real system dialog; full backup (17 real
+      files, byte-identical, clean daemon completion, History "17 added,
+      0 skipped, 0 failed" -- 5 genuinely-stale `MediaStore` rows dropped
+      by the SYNC-008 `File.exists()` guard, no false "Interrupted");
+      idempotent re-run (0 added / 17 skipped, file-list walk only);
+      interrupt/resume (`am force-stop` mid-transfer -> partial moved to
+      `.tetron-partial/` per SYNC-012's `--partial-dir` -> resume
+      transfers only the remainder, not a restart -> byte-identical ->
+      partial-dir cleaned up); the SYNC-012 scoped-run + Preview pass
+      (see the SYNC-012 docstring).
+    - NOT TESTABLE on the API-29 reference device, deferred (same as the
+      2026-08-20 handoff): delete-after-backup consent (the
+      `MediaStoreDeletionRequester` is API-33+-gated); the cellular
+      Direct-or-deferred test (the device has no SIM, so Wi-Fi-off is
+      fully offline, not "on cellular"). Both need an API-33+ device with
+      an active SIM.
     """
     req_id = "SYNC-011"
 
@@ -1135,9 +1159,31 @@ class SyncFilterControls(Requirement):
     Preview `ModalBottomSheet`) -- Compose, verified on-device per the
     SYNC-009 convention. `cargo test`, `:app:testDebugUnitTest`,
     `:app:assembleDebug`, `:app:compileDebugAndroidTestKotlin`,
-    `python3 reconcile.py` all green. Still open: the on-device scoped-run
-    + Preview pass (folds into SYNC-011); the v1.1 overflow-menu set
-    editors (decision B1); the deferred real server dry-run.
+    `python3 reconcile.py` all green.
+
+    **On-device scoped-run + Preview pass DONE 2026-08-28** as part of
+    SYNC-011: a scope of Raw OFF + 50 MB cap staged exactly the in-scope
+    files (type + size both enforced in the `--files-from` builder), the
+    excluded `.dng`/oversize videos never reached the receiver, and the
+    Settings estimate line + Preview `ModalBottomSheet` (per-type "Will
+    upload", "Skipped: Raw photos (off)" / "Over the size limit",
+    "Largest included") rendered with real numbers. The bandwidth ceiling
+    measurably throttled a transfer. **Bug found + fixed in the same
+    changeset as this note:**
+    `SharedPreferencesRunHistoryStore` (SYNC-009) predated
+    `RunRecord.skippedOversize` (this requirement) and `cancelled`
+    (TODO #8) and persisted neither, so a size-capped or cancelled run
+    read back after process death as a plain clean run and the History
+    screen showed no "N too large" line -- the exact silent-loss case
+    decisions A5/B5 exist to prevent (`InMemoryRunHistoryStore`, used by
+    `SyncPipelineTest`, carries every field, which is why the unit tests
+    missed it). Fixed by moving the record <-> key/value mapping into a
+    pure `RunRecordCodec` with a `RunRecordCodecTest` round-trip guard,
+    and `HistoryScreen` now renders the oversize line; verified on-device
+    through a force-stop + relaunch (see the SYNC-011 note).
+
+    Still open: the v1.1 overflow-menu set editors (decision B1); the
+    deferred real server dry-run.
 
     Dependencies: SYNC-008 (the `--files-from` builder in
     `AndroidMediaAccess` is the single enforcement chokepoint), SYNC-005
