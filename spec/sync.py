@@ -1286,12 +1286,16 @@ class SyncFilterControls(Requirement):
     `ScopeFilter` decision for every toggle state (each type individually
     excluded with the right reason, "Other files" OFF restricting to the
     known sets, the oversize path, MIME-vs-extension precedence), the
-    preset<->scope round trip and Custom-on-edit detection, and
-    `SettingsStore` persistence of every field. `AndroidMediaAccess`'s row
-    filtering and aggregate mode are covered by a fake-cursor test at the
-    pure-aggregation seam (same split as SYNC-008's
-    `resolveMediaAccessState`). `SyncPipelineTest` gains a case that a
-    scoped run stages only the in-scope names and records
+    preset<->scope round trip and Custom-on-edit detection, and the pure
+    scope-selection / backlog-aggregation functions the `--files-from`
+    builder and the estimate share. `SettingsStore`'s scope round trip
+    follows the existing thin-`SharedPreferences`-adapter convention (no
+    unit test, like `gateConfig` and `SharedPreferencesRunHistoryStore` --
+    verified on-device with the other Settings toggles, SYNC-009).
+    `AndroidMediaAccess`'s cursor-to-`MediaEntry` glue is the same
+    untested-by-design adapter as `resolveMediaAccessState`'s callers; the
+    aggregation it feeds is unit-tested directly. `SyncPipelineTest` gains
+    a case that a scoped run stages only the in-scope names and records
     `skippedOversizeCount`. `:app:testDebugUnitTest`,
     `:app:assembleDebug`, `cargo test`, and `python3 reconcile.py` all
     green. On-device verification (a real scoped run + Preview against the

@@ -4,6 +4,7 @@ package xyz.tetron.sync.settings
 import xyz.tetron.sync.delete.DeleteAfterBackupConfig
 import xyz.tetron.sync.gates.GateConfig
 import xyz.tetron.sync.pipeline.SyncTarget
+import xyz.tetron.sync.scope.BackupScope
 
 /**
  * SYNC-009: persisted app settings -- gate config, the backup target,
@@ -25,6 +26,15 @@ interface SettingsStore {
 
     fun deleteAfterBackupConfig(): DeleteAfterBackupConfig
     fun setDeleteAfterBackupConfig(config: DeleteAfterBackupConfig)
+
+    /** SYNC-012: the one persistent backup scope every trigger path applies
+     *  when it builds the `--files-from` list. Read fresh per run, same
+     *  live-read contract as [gateConfig] -- a Settings toggle takes effect
+     *  on the very next run. The selected [xyz.tetron.sync.scope.Preset] is
+     *  not stored: it is derived from the scope
+     *  ([xyz.tetron.sync.scope.presetOf]). */
+    fun backupScope(): BackupScope
+    fun setBackupScope(scope: BackupScope)
 
     /** [xyz.tetron.sync.trigger.SyncWorkScheduler]'s periodic interval, in
      *  hours (spec/sync.py SYNC-006's ~daily default, exposed here as the
