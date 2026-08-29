@@ -36,6 +36,13 @@ fun HistoryScreen(viewModel: HistoryViewModel) {
         )
         Spacer(Modifier.height(8.dp))
         Text("${r.added} added, ${r.skipped} skipped, ${r.failed} failed", style = MaterialTheme.typography.bodyLarge)
+        if (r.skippedOversize > 0) {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "${r.skippedOversize} skipped: larger than the size limit in Settings",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        }
         if (r.interrupted) {
             Spacer(Modifier.height(8.dp))
             Text("Interrupted -- will resume next run", style = MaterialTheme.typography.bodyMedium)
