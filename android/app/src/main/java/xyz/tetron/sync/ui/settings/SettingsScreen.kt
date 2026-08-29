@@ -328,6 +328,10 @@ private fun kindLabel(kind: MediaKind): String = when (kind) {
     MediaKind.Other -> "Other files"
 }
 
+/** "1 photo" / "3 photos" -- the estimate line has small counts often
+ *  enough that a bare "1 videos" reads wrong. */
+private fun countOf(n: Int, noun: String): String = "$n $noun" + if (n == 1) "" else "s"
+
 /** Coarse, human-readable byte size ("0 B", "4.2 MB", "61 GB"). Not exact
  *  -- this is an estimate surface. */
 private fun formatBytes(bytes: Long): String {
@@ -428,13 +432,13 @@ private fun BacklogEstimateCard(estimate: BacklogEstimate, loading: Boolean) {
         Column(Modifier.padding(16.dp)) {
             Text("On this phone", style = MaterialTheme.typography.labelMedium)
             Text(
-                "${estimate.photoCount} photos · ${estimate.videoCount} videos · ${formatBytes(estimate.totalBytes)}",
+                "${countOf(estimate.photoCount, "photo")} · ${countOf(estimate.videoCount, "video")} · ${formatBytes(estimate.totalBytes)}",
                 style = MaterialTheme.typography.bodyMedium,
             )
             Spacer(Modifier.height(8.dp))
             Text("This scope will upload", style = MaterialTheme.typography.labelMedium)
             Text(
-                if (loading) "estimating…" else "~ ${formatBytes(estimate.includedBytes)} · ${estimate.includedCount} files",
+                if (loading) "estimating…" else "~ ${formatBytes(estimate.includedBytes)} · ${countOf(estimate.includedCount, "file")}",
                 style = MaterialTheme.typography.bodyLarge,
                 fontWeight = FontWeight.SemiBold,
             )
