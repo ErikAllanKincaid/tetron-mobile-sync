@@ -11,11 +11,20 @@ import xyz.tetron.sync.gates.GateReason
  * roster is the only place peers are discovered (SYNC-003); [meshIp] is
  * matched against the bridge snapshot's peer list to find a `ConnKind` for
  * the direct-only gate.
+ *
+ * [deviceLabel] is the top path component the pipeline writes under on the
+ * receiver: `rsync://<meshIp>:<port>/<module>/<deviceLabel>/...` (SYNC-010).
+ * One receiver module holds every device; the client creates `<deviceLabel>/`
+ * itself with `--mkpath`. The persisted store guarantees a non-blank value
+ * (a stable first-run fallback if the user never sets one), so consumers do
+ * not handle blank here; `""` from a bare constructor means "let the store
+ * fill it in" and is only seen before [SettingsStore.setTarget] normalizes.
  */
 data class SyncTarget(
     val meshIp: String,
     val module: String,
     val port: Int = 28873,
+    val deviceLabel: String = "",
 )
 
 /**

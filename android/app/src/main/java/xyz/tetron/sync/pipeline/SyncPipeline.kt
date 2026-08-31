@@ -122,15 +122,24 @@ class SyncPipeline(
         if (target == null) return gated(GateReason.TargetUnreachable)
         val spec = sourcePathProvider.resolve() ?: return gated(GateReason.TargetUnreachable)
 
-        val destination = "rsync://${target.meshIp}:${target.port}/${target.module}/"
+        // SYNC-010: the phone writes into <module>/<device-label>/... so one
+        // receiver module holds every device; `--mkpath` (below) creates
+        // that component on first run. A blank label (only seen from a bare
+        // test target -- the persisted store always fills one in) degrades
+        // to the pre-SYNC-010 flat layout rather than emitting `//`.
+        val labelSegment = target.deviceLabel.trim().takeIf { it.isNotEmpty() }?.let { "$it/" } ?: ""
+        val destination = "rsync://${target.meshIp}:${target.port}/${target.module}/$labelSegment"
         // SYNC-012: the scope's bandwidth ceiling is the only scope field
         // that reaches the engine -- the type/size filtering already
         // happened in sourcePathProvider.resolve() when it staged the
         // --files-from list (that is also where spec.skippedOversizeCount
-        // comes from).
+        // comes from). SYNC-010: `mkpath` creates the <device-label>/ dir
+        // (and the mirrored DCIM/Camera/ tree from the relative --files-from
+        // entries) under the module root with no receiver pre-seeding.
         val effectiveRunOptions = runOptions.copy(
             filesFromPath = spec.filesFromPath ?: runOptions.filesFromPath,
             bwlimitKib = backupScope().bwlimitKib?.toULong() ?: runOptions.bwlimitKib,
+            mkpath = true,
         )
         val collector = TransferredFileCollector(progress)
         val record = try {
@@ -213,7 +222,8 @@ class SyncPipeline(
 
         /** `-rtl`, no bwlimit/modify-window override -- SYNC-009 exposes
          *  these as settings later; `--partial` is always on inside the
-         *  engine regardless (SYNC-002 semantics). */
+         *  engine regardless (SYNC-002 semantics). `mkpath` is set per-run
+         *  in [run] (SYNC-010), not here. */
         val DEFAULT_RUN_OPTIONS = SyncRunOptions(
             recursive = true,
             times = true,
@@ -221,6 +231,7 @@ class SyncPipeline(
             modifyWindowSecs = null,
             bwlimitKib = null,
             filesFromPath = null,
+            mkpath = false,
         )
     }
 }

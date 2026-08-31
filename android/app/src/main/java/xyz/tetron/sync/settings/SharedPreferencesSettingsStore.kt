@@ -47,7 +47,7 @@ class SharedPreferencesSettingsStore(context: Context) : SettingsStore {
         val meshIp = prefs.getString(KEY_TARGET_MESH_IP, null) ?: return null
         val module = prefs.getString(KEY_TARGET_MODULE, null) ?: return null
         val port = prefs.getInt(KEY_TARGET_PORT, DEFAULT_TARGET_PORT)
-        return SyncTarget(meshIp = meshIp, module = module, port = port)
+        return SyncTarget(meshIp = meshIp, module = module, port = port, deviceLabel = deviceLabel())
     }
 
     override fun setTarget(target: SyncTarget?) {
@@ -56,12 +56,29 @@ class SharedPreferencesSettingsStore(context: Context) : SettingsStore {
             editor.remove(KEY_TARGET_MESH_IP)
                 .remove(KEY_TARGET_MODULE)
                 .remove(KEY_TARGET_PORT)
+            // KEY_TARGET_DEVICE_LABEL is deliberately kept: the label
+            // identifies this phone on the receiver and should survive
+            // re-pointing at a different target.
         } else {
             editor.putString(KEY_TARGET_MESH_IP, target.meshIp)
                 .putString(KEY_TARGET_MODULE, target.module)
                 .putInt(KEY_TARGET_PORT, target.port)
+                .putString(
+                    KEY_TARGET_DEVICE_LABEL,
+                    DeviceLabel.normalizedOrNull(target.deviceLabel) ?: deviceLabel(),
+                )
         }
         editor.apply()
+    }
+
+    /** The persisted device label, generating and persisting a stable
+     *  first-run fallback the first time it is read so a fresh install has
+     *  a valid label with no setup (SYNC-010 / plan §1.2). */
+    private fun deviceLabel(): String {
+        prefs.getString(KEY_TARGET_DEVICE_LABEL, null)?.let { return it }
+        val fallback = DeviceLabel.generateFallback()
+        prefs.edit().putString(KEY_TARGET_DEVICE_LABEL, fallback).apply()
+        return fallback
     }
 
     override fun deleteAfterBackupConfig(): DeleteAfterBackupConfig =
@@ -135,6 +152,7 @@ class SharedPreferencesSettingsStore(context: Context) : SettingsStore {
         private const val KEY_TARGET_MESH_IP = "target_mesh_ip"
         private const val KEY_TARGET_MODULE = "target_module"
         private const val KEY_TARGET_PORT = "target_port"
+        private const val KEY_TARGET_DEVICE_LABEL = "target_device_label"
         private const val KEY_DELETE_ENABLED = "delete_after_backup_enabled"
         private const val KEY_WORK_CADENCE_HOURS = "work_cadence_hours"
         private const val KEY_COALESCE_WINDOW_HOURS = "coalesce_window_hours"
