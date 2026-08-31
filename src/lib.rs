@@ -63,6 +63,14 @@ pub struct SyncRunOptions {
     /// `None` (desktop, pre-29, or any future non-media source) falls back
     /// to oc-rsync's own recursive walk, unchanged from SYNC-002 v1.
     pub files_from_path: Option<String>,
+    /// `--mkpath` -- create missing destination path components. SYNC-010:
+    /// the push destination is `rsync://<ip>:<port>/<module>/<device-label>/`,
+    /// so the per-device `<device-label>/` directory under the module root
+    /// is created by the client on first use; the receiver never pre-seeds
+    /// it and needs no per-device config. The oc-rsync core honors this for
+    /// daemon sends (`client/remote/invocation/builder.rs`). Default `false`
+    /// keeps every pre-SYNC-010 caller unchanged.
+    pub mkpath: bool,
 }
 
 /// Per-file progress event pushed across the FFI while a transfer runs.
@@ -251,7 +259,8 @@ fn build_client_config(
         ))
         .recursive(options.recursive)
         .times(options.times)
-        .links(options.links);
+        .links(options.links)
+        .mkpath(options.mkpath);
 
     if let Some(path) = options.files_from_path {
         builder = builder.files_from(FilesFromSource::LocalFile(std::path::PathBuf::from(path)));
