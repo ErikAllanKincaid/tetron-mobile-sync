@@ -37,8 +37,8 @@ down/Standby/Suspended = sync defers and notifies.
 
 | # | Decision | Chosen |
 |---|---|---|
-| 1 | Receiver authorization | Explicit per-identity allow-list; materializes as rsyncd `hosts allow` keyed on mesh IP (deterministic per identity in core `addressing.rs`) |
-| 2 | Transfer mechanism | oc-rsync embedded, stock rsyncd home side; spike-verified 2026-08-19 (`--partial` resume, wire compat, Android build, progress API) |
+| 1 | Receiver authorization | Explicit per-identity allow-list, deny-by-default. Enforced as the `hosts allow` / `hosts deny = *` pair in the rsyncd.conf that `tetron-sync-receiver` generates: `allow add-peer <hostname>` resolves the mesh IP from the receiver host's own tetron IPC roster, `allow add <ip>` for the raw case. Re-confirmed 2026-08-31 over the PLAN receiver-layout brainstorm, which had floated dropping it. |
+| 2 | Transfer mechanism | oc-rsync embedded, stock rsyncd home side; spike-verified 2026-08-19 (`--partial` resume, wire compat, Android build, progress API). Amended 2026-08-31: the home-side stock `rsync --daemon` is provisioned by `tetron-sync-receiver` (MPL-2.0, separate repo) -- a config generator + per-user service supervisor around the system's own rsync, no receiver protocol code, no GPL contact. See SYNC-010. |
 | 3 | Retry/backoff when gated | Skip cycle + notify user, coalesced one-per-reason-per-N-hours |
 | 4 | Direct-only gate default | ON; per-target `ConnKind` via the bridge, never a network-type heuristic |
 | 5 | Charging gate default | OFF (configurable) |
@@ -53,6 +53,19 @@ down/Standby/Suspended = sync defers and notifies.
 | 14 | Background trigger | Opportunistic v1 (manual + WorkManager + network-change); foreground service v2 |
 | 15 | IPC bridge | Full read-only mesh status in tetron-mobile; IMPLEMENTED (MOBILE-024) |
 | 16 | oc-rsync license | ACCEPT GPL-3.0 for the sync app (route (a)); subprocess (b) and mechanism switch (c) closed |
+
+## Amendments
+
+- 2026-08-31 (PLAN_tetron-mobile-sync_receiver-layout-and-target-selection):
+  the receiver-layout brainstorm's PART 1 was resolved. Decisions #1 and #2
+  amended in place above. SYNC-010 rewritten: the home side is the separate
+  `tetron-sync-receiver` project + optional tetron-webui "Sync Receiver"
+  addon, not a sample rsyncd.conf shipped from this repo. Per-device
+  isolation is a single module plus a client-chosen `<device-label>/` top
+  path component (`--mkpath`), never module-per-device. The own-mesh-IP
+  copy button (SYNC-009) is removed -- the receiver allow-lists a phone by
+  hostname from its own roster. PART 2 (manual IP entry, decision #9) was
+  NOT decided and stays open.
 
 ## Still open (recorded from the plan; resolved during implementation, not
 ## presumed here)
@@ -74,8 +87,9 @@ down/Standby/Suspended = sync defers and notifies.
   "Transfer anyway?" confirm; provisional: respect gates with a confirm).
 - Whether delete-after-backup runs immediately after a run or defers the
   consent prompt.
-- Where the home-side setup docs live (sync repo README vs core tetron
-  docs; provisional: sync repo).
+- RESOLVED 2026-08-31: the home side is the `tetron-sync-receiver` project
+  (own repo, own README) plus the tetron-webui "Sync Receiver" addon; this
+  repo's README links to it and does not carry setup steps of its own.
 - v2 foreground-service scope details (deferred by definition).
 
 ## Repo layout
@@ -342,8 +356,10 @@ class SyncMeshBridgeClient(Requirement):
       any kind: uniform per-caller user grant is MOBILE-024's rule.
     - State mapping for gates (SYNC-004) and target selection (SYNC-009):
       tunnel state (Active / Standby / Suspended / Reconnecting /
-      NotJoined / CoreNotRunning), own mesh IP (enrollment UX: copy button),
-      peer roster as candidate targets with per-peer ConnKind. The roster is
+      NotJoined / CoreNotRunning), own mesh IP (informational only -- not
+      an enrollment step: the receiver allow-lists this phone by hostname
+      from its own mesh roster, SYNC-010), peer roster as candidate targets
+      with per-peer ConnKind. The roster is
       the only place mesh peers are ever discovered -- the user never types
       a mesh IP into v1's target settings (decision #9, plan §Auth).
     - Handling of a dead/absent main app: provider answers CoreNotRunning or
@@ -459,6 +475,16 @@ class SyncTransferPipeline(Requirement):
       logic, SYNC-007) -> stream progress events (SYNC-002's UniFFI
       callback) -> record run history -> emit completion/failure
       notification (coalesced per SYNC-004's policy).
+    - Destination path (amended 2026-08-31, SYNC-010): the client writes
+      into `rsync://<ip>:<port>/<module>/<device-label>/...`, i.e. the
+      configured module root plus a per-device top path component, so one
+      receiver module holds every device. `<device-label>` is a SYNC-009
+      setting (user-editable, stable first-run-UUID fallback); the run
+      passes `--mkpath` so rsync creates that component under the module
+      root on first use -- the receiver never pre-seeds it and needs no
+      per-device config. `--files-from` entries are staged as
+      MediaStore-relative paths (`DCIM/Camera/<name>`), not bare
+      filenames, so the receiver tree mirrors the phone's.
     - Run history: last run time, added/skipped/failed counts -- added and
       failed come from the per-file event stream + exit status; "skipped"
       is transferred-minus-added (rsync's default same-size-same-mtime skip
@@ -829,10 +855,12 @@ class SyncUi(Requirement):
       last failure reason.
     - Settings: gate toggles + values (Wi-Fi-only, cellular, direct-only,
       charging-required, low-battery threshold), target config (mesh-IP
-      picker is roster-based; module name; display name), delete-after-
-      backup opt-in, coercion window N, WorkManager cadence, notification
-      copy. Own-mesh-IP copy button for the rsyncd.conf enrollment edit
-      (plan §IPC bridge, enrollment UX).
+      picker is roster-based; module name; port; device label -- the
+      per-device top path component on the receiver, user-editable, with a
+      stable first-run-UUID fallback, SYNC-010), delete-after-backup
+      opt-in, coercion window N, WorkManager cadence, notification copy.
+      (No own-mesh-IP copy button -- removed 2026-08-31; the receiver
+      allow-lists this phone by hostname from its own roster, SYNC-010.)
     - Notifications: channels + copy for gate reasons and completion/
       failure (coalesced per SYNC-004); exact copy is implementation-time
       (open item), reachable from Settings preview within Accessibility.
@@ -950,11 +978,16 @@ class SyncUi(Requirement):
     `Modifier.weight()` is `RowScope`'s extension, not the internal
     `androidx.compose.foundation.layout.weight` val an IDE-style import
     guess pulled in by mistake), delete-after-backup opt-in, WorkManager
-    cadence, the coalescing window, and the own-mesh-IP copy button
-    (`LocalClipboardManager`) for `rsyncd.conf`'s `hosts allow` line
-    (SYNC-010) -- a late addition once the spec bullet was re-read
-    closely, since it doesn't come from any of the other requirements'
-    existing seams.
+    cadence, the coalescing window, and (as first built) an own-mesh-IP
+    copy button (`LocalClipboardManager`) for `rsyncd.conf`'s `hosts allow`
+    line.
+
+    **Copy button removed 2026-08-31** (PLAN receiver-layout, Conflict 4):
+    the home side is `tetron-sync-receiver`, which allow-lists a phone by
+    hostname resolved from its own tetron IPC roster (`allow add-peer`), so
+    the phone never needs to surface or copy its mesh IP. `LocalClipboard
+    Manager` and the button drop out; the device-label field (SYNC-010)
+    takes its place in target config.
 
     `TetronSyncTheme` (`xyz.tetron.sync.ui.Theme.kt`) matches
     tetron-mobile's own green brand palette (same hex values as
@@ -1033,39 +1066,90 @@ class SyncUi(Requirement):
 class SyncHomeSideDeliverable(Requirement):
     """REQUIREMENT-ID: SYNC-010
 
-    The home-side deliverable: config + setup docs + an optional install
-    script -- NO custom receiver code of any kind (plan §Home side setup;
-    decision #2: home side is a stock `rsync --daemon`).
+    The home-side deliverable. **Rewritten 2026-08-31** (PLAN receiver-
+    layout, PART 1): the original plan -- a sample `rsyncd.conf` + README
+    steps + optional `contrib/install.sh` shipped from THIS repo -- was
+    superseded by a real product that already exists:
 
-    Dependencies: none -- parallelizable from the start.
+    - `tetron-sync-receiver` (`~/code/tetron-sync-receiver`, MPL-2.0, own
+      repo): a small CLI-first binary that keeps a generated `rsyncd.conf`
+      in lockstep with a JSON state file and supervises the system's own
+      stock `rsync --daemon` as a per-user service (`systemd --user` /
+      launchd LaunchAgent). It embeds no GPL and no phone-app code -- it
+      only writes a plain daemon config and runs the OS's rsync -- so
+      decision #2's "zero receiver code" still holds: the wire peer is
+      stock rsyncd, and the manager is a separately-licensed sibling
+      program, not code in this repo.
+    - tetron-webui "Sync Receiver" addon (`tetron-webui/src/sync_receiver
+      .rs`): a thin point-and-click shell over that binary's `--json` CLI.
+      Optional; the CLI is fully usable alone.
 
-    Scope:
-    - Sample `rsyncd.conf` in this repo (e.g. `home/rsyncd.conf`): module
-      pointing ONLY at the backup directory, `read only = no`, `hosts allow`
-      keyed on the phone's mesh IP (decision #1 -- the mesh IP is
-      deterministic per identity in core's `addressing.rs`; a subnet change
-      invalidates entries, acceptable since the target is reconfigurable),
-      running as a dedicated non-root user (defense in depth; a
-      compromised allow-listed phone can then write only into the backup
-      dir).
-    - Setup section in this repo's README (provisional home; open item vs
-      core tetron docs): install rsync, create the user/dir, drop the
-      config, set `hosts allow` to the phone's mesh IP (from the sync
-      app's copy button), restart the daemon, firewall note (port 873 /
-      how to scope to the mesh subnet).
-    - Optional `contrib/install.sh` following the tetron-backup.sh precedent
-      (core tetron's contrib script): idempotent install of the config +
-      user + module dir with path/env overrides, `--dry-run`, uninstall.
-    - Explicit constraint: this requirement adds no receiver binary, no
-      daemon, no protocol surface. If the receiver ever needs code, that is
-      a new requirement, not an extension of this one.
+    So this repo's SYNC-010 deliverable shrinks to: a README section that
+    points at `tetron-sync-receiver` (install one command, or via the
+    tetron suite installer) and states the contract below. No config file,
+    no script, no per-repo receiver docs.
 
-    ACCEPTANCE: `sh -n` on any scripts; a fresh Ubuntu-24.04-style host
-    follows the README (or runs the script) and `rsync --daemon` serves the
-    module; an allow-listed mesh IP transfers and a non-allow-listed IP is
-    rejected (`rsync` error, no file written).
-    ENFORCEMENT: script lint + the manual follow-through above (a VM is
-    enough; tetron-testsuite-style is out of scope here -- no core change).
+    Dependencies: none for the pointer docs. The client-side path change
+    (below) sits on SYNC-002 (adds `--mkpath` to `SyncRunOptions`) and
+    SYNC-005 (destination construction, `--files-from` staging).
+
+    Operator model (the entire home side):
+    1. `tetron-sync-receiver allow add-peer <phone-hostname>` (or
+       `allow add <ip>`) -- deny-by-default; nothing connects until this.
+    2. `tetron-sync-receiver module add <name> <backup-root-dir>` -- a
+       module is just name -> path; runs as the operator, files owned by
+       the operator, `use chroot = false`.
+    That is it. Per-device isolation is NOT a receiver concern.
+
+    Cross-repo wire contract (must stay true in all three repos):
+    - The app writes to `rsync://<ip>:<port>/<module>/<device-label>/...`.
+      The receiver knows only `<module> -> <path>`. `<device-label>/` and
+      everything below it are created by the client (`--mkpath`, implied
+      dirs). One module serves every device; nobody adds module-per-device.
+    - Port default 28873 in all three (app `DEFAULT_TARGET_PORT`, receiver
+      `config::DEFAULT_PORT`, webui passes it through). A change is a
+      coordinated change.
+    - `tetron-sync-receiver`'s generated module block MUST carry
+      `write only = true` and `max connections = 1` (tracked change in
+      that repo's `config::write_rsyncd_conf` -- see the PLAN's cross-repo
+      task list; this app's acceptance below depends on it).
+
+    Client-side changes in THIS repo (see PLAN for the step list):
+    - `SyncRunOptions` gains `mkpath: bool`; `build_client_config` wires it
+      via `ClientConfig::builder().mkpath(true)` (fork already supports it
+      and honors it for daemon sends -- `vendor/oc-rsync/crates/core/src/
+      client/remote/invocation/builder.rs`; no fork patch). UniFFI regen.
+    - `SyncTarget` gains `deviceLabel`; SYNC-009 Settings field + validator
+      (one safe path component: no `/`, `..`, leading `.`, empty) + stable
+      first-run-UUID fallback; a label edit warns (starts a new receiver
+      dir, orphans the old).
+    - `SyncPipeline` appends `/<deviceLabel>` to the destination and sets
+      `mkpath = true`.
+    - `AndroidMediaAccess` stages `--files-from` entries as
+      `DCIM/Camera/<name>` and sets the rsync source root to the external-
+      storage root, so the receiver tree mirrors the phone's MediaStore
+      layout instead of landing flat in the module root.
+
+    ACCEPTANCE:
+    - Docs: this repo's README links to `tetron-sync-receiver` and states
+      the wire contract; no setup steps duplicated here.
+    - Wire behavior, `tests/engine_rsyncd.rs` against a real rsyncd: a push
+      with `--mkpath` into `<module>/<new-label>/DCIM/Camera/` creates the
+      full path with no pre-seeding; a client readback of a `write only`
+      module is refused; a second connection during a transfer is refused
+      (`max connections = 1`); a push from an un-allow-listed address is
+      refused before any file is written.
+    - End to end, manual (a VM is enough), recorded in DO-NOT-COMMIT:
+      install `tetron-sync-receiver` on a fresh Ubuntu-24.04-style host,
+      `module add` + `allow add-peer`, `receiver status` shows it serving
+      on 28873, the phone runs a backup, files land under
+      `<root>/<device-label>/DCIM/Camera/...` mirroring the phone.
+    ENFORCEMENT: the `engine_rsyncd` cases are the automated gate for the
+    wire contract; the install-and-transfer walk is manual, same bar as
+    every SYNC-011-style milestone. The `write only` / `max connections`
+    lines landing in `tetron-sync-receiver` is a cross-repo dependency,
+    tracked in the PLAN, not something a green build here can substitute
+    for.
     """
     req_id = "SYNC-010"
 
