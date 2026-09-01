@@ -71,4 +71,12 @@ class DeviceLabelTest {
         assertEquals(a, valid(a)?.label)
         assertNotEquals(a, b)
     }
+
+    @Test fun generated_fallback_prefers_the_mesh_hostname() {
+        assertEquals("my-pixel", DeviceLabel.generateFallback("  my-pixel  "))
+        // Unusable hostname -> the phone-<hex> fallback still applies.
+        assertTrue(DeviceLabel.generateFallback("bad/name").startsWith("phone-"))
+        assertTrue(DeviceLabel.generateFallback("").startsWith("phone-"))
+        assertTrue(DeviceLabel.generateFallback(null).startsWith("phone-"))
+    }
 }

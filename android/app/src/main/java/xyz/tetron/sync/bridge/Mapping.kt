@@ -25,6 +25,7 @@ internal fun WireSnapshot.toAppSnapshot(): BridgeSnapshot =
         subnet = subnet,
         peers = peers.map { BridgePeer(hostname = it.hostname, ip = it.ip, connKind = ConnKind.fromWireInt(it.connKind)) },
         updatedAtMillis = updatedAtMillis,
+        ownHostname = ownHostname,
     )
 
 /** Decides what a provider-returned bundle means. Consent-required wins

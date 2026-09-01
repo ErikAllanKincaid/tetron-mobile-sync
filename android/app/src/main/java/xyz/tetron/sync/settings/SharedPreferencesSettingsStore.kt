@@ -16,7 +16,15 @@ import xyz.tetron.sync.scope.BackupScope
  * real round-tripping is exercised by every Settings-screen toggle
  * on-device (SYNC-009 ACCEPTANCE).
  */
-class SharedPreferencesSettingsStore(context: Context) : SettingsStore {
+class SharedPreferencesSettingsStore(
+    context: Context,
+    /** The phone's own mesh hostname (MOBILE-024 `ownHostname`), read once
+     *  the first time a device label is needed so a fresh install labels
+     *  its receiver folder with the hostname instead of an opaque id.
+     *  Snapshot, not a live binding -- a later hostname change does not
+     *  move an already-persisted label. */
+    private val ownHostname: () -> String? = { null },
+) : SettingsStore {
     private val prefs: SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
@@ -45,7 +53,9 @@ class SharedPreferencesSettingsStore(context: Context) : SettingsStore {
 
     override fun target(): SyncTarget? {
         val meshIp = prefs.getString(KEY_TARGET_MESH_IP, null) ?: return null
-        val module = prefs.getString(KEY_TARGET_MODULE, null) ?: return null
+        // A missing module key is the normal case now: it means "the
+        // default". Only an advanced override is ever stored.
+        val module = prefs.getString(KEY_TARGET_MODULE, null) ?: SyncTarget.DEFAULT_MODULE
         val port = prefs.getInt(KEY_TARGET_PORT, DEFAULT_TARGET_PORT)
         return SyncTarget(meshIp = meshIp, module = module, port = port, deviceLabel = deviceLabel())
     }
@@ -61,22 +71,29 @@ class SharedPreferencesSettingsStore(context: Context) : SettingsStore {
             // re-pointing at a different target.
         } else {
             editor.putString(KEY_TARGET_MESH_IP, target.meshIp)
-                .putString(KEY_TARGET_MODULE, target.module)
                 .putInt(KEY_TARGET_PORT, target.port)
                 .putString(
                     KEY_TARGET_DEVICE_LABEL,
                     DeviceLabel.normalizedOrNull(target.deviceLabel) ?: deviceLabel(),
                 )
+            // Store the module only when it is a real override; the default
+            // is represented by the key's absence.
+            if (target.module == SyncTarget.DEFAULT_MODULE) {
+                editor.remove(KEY_TARGET_MODULE)
+            } else {
+                editor.putString(KEY_TARGET_MODULE, target.module)
+            }
         }
         editor.apply()
     }
 
-    /** The persisted device label, generating and persisting a stable
-     *  first-run fallback the first time it is read so a fresh install has
-     *  a valid label with no setup (SYNC-010 / plan §1.2). */
+    /** The persisted device label, generating and persisting a fallback the
+     *  first time it is read so a fresh install has a valid label with no
+     *  setup (SYNC-010). The fallback is the phone's own mesh hostname when
+     *  available, else `phone-<8hex>`. */
     private fun deviceLabel(): String {
         prefs.getString(KEY_TARGET_DEVICE_LABEL, null)?.let { return it }
-        val fallback = DeviceLabel.generateFallback()
+        val fallback = DeviceLabel.generateFallback(ownHostname())
         prefs.edit().putString(KEY_TARGET_DEVICE_LABEL, fallback).apply()
         return fallback
     }
@@ -115,30 +132,21 @@ class SharedPreferencesSettingsStore(context: Context) : SettingsStore {
             .apply()
     }
 
-    override fun workCadenceHours(): Long =
-        prefs.getLong(KEY_WORK_CADENCE_HOURS, DEFAULT_WORK_CADENCE_HOURS)
+    /** `null` (key absent) means "never" -- periodic backup is opt-in. A
+     *  previously-set interval (the key is present) is left as the user set
+     *  it; the migration never rewrites it. */
+    override fun workCadenceHours(): Long? =
+        if (prefs.contains(KEY_WORK_CADENCE_HOURS)) prefs.getLong(KEY_WORK_CADENCE_HOURS, 24L) else null
 
-    override fun setWorkCadenceHours(hours: Long) {
-        prefs.edit().putLong(KEY_WORK_CADENCE_HOURS, hours).apply()
-    }
-
-    override fun coalesceWindowHours(): Long =
-        prefs.getLong(KEY_COALESCE_WINDOW_HOURS, DEFAULT_COALESCE_WINDOW_HOURS)
-
-    override fun setCoalesceWindowHours(hours: Long) {
-        prefs.edit().putLong(KEY_COALESCE_WINDOW_HOURS, hours).apply()
+    override fun setWorkCadenceHours(hours: Long?) {
+        prefs.edit().apply {
+            if (hours == null) remove(KEY_WORK_CADENCE_HOURS) else putLong(KEY_WORK_CADENCE_HOURS, hours)
+        }.apply()
     }
 
     companion object {
         const val PREFS_NAME = "xyz.tetron.sync.settings"
 
-        /** Matches [xyz.tetron.sync.trigger.SyncWorkScheduler.DEFAULT_INTERVAL]
-         *  (1 day). */
-        const val DEFAULT_WORK_CADENCE_HOURS = 24L
-
-        /** Matches [xyz.tetron.sync.gates.GateNotificationCoalescer
-         *  .DEFAULT_WINDOW_MILLIS] (6 hours). */
-        const val DEFAULT_COALESCE_WINDOW_HOURS = 6L
         /** Matches [xyz.tetron.sync.pipeline.SyncTarget]'s own default and
          *  tetron-sync-receiver's `DEFAULT_PORT` -- 8873 collided with the
          *  heavily-squatted 8000-9000 dev-tool port range. */
@@ -155,7 +163,6 @@ class SharedPreferencesSettingsStore(context: Context) : SettingsStore {
         private const val KEY_TARGET_DEVICE_LABEL = "target_device_label"
         private const val KEY_DELETE_ENABLED = "delete_after_backup_enabled"
         private const val KEY_WORK_CADENCE_HOURS = "work_cadence_hours"
-        private const val KEY_COALESCE_WINDOW_HOURS = "coalesce_window_hours"
         private const val KEY_SCOPE_JPEG = "scope_include_jpeg"
         private const val KEY_SCOPE_HEIC = "scope_include_heic"
         private const val KEY_SCOPE_RAW = "scope_include_raw"

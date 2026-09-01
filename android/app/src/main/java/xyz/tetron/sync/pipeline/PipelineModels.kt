@@ -12,20 +12,35 @@ import xyz.tetron.sync.gates.GateReason
  * matched against the bridge snapshot's peer list to find a `ConnKind` for
  * the direct-only gate.
  *
+ * [module] is a fixed coordinated default ([DEFAULT_MODULE], `tetron-sync`):
+ * the receiver names its one rsync module the same thing, and normal setups
+ * never touch it on either side. An advanced user can override it, but then
+ * it must match the receiver exactly -- the same "coordinated value, no
+ * discovery" contract as [port].
+ *
  * [deviceLabel] is the top path component the pipeline writes under on the
  * receiver: `rsync://<meshIp>:<port>/<module>/<deviceLabel>/...` (SYNC-010).
  * One receiver module holds every device; the client creates `<deviceLabel>/`
  * itself with `--mkpath`. The persisted store guarantees a non-blank value
- * (a stable first-run fallback if the user never sets one), so consumers do
- * not handle blank here; `""` from a bare constructor means "let the store
- * fill it in" and is only seen before [SettingsStore.setTarget] normalizes.
+ * (defaults to the phone's own mesh hostname, else a stable first-run
+ * fallback), so consumers do not handle blank here; `""` from a bare
+ * constructor means "let the store fill it in" and is only seen before
+ * [SettingsStore.setTarget] normalizes.
  */
 data class SyncTarget(
     val meshIp: String,
-    val module: String,
+    val module: String = DEFAULT_MODULE,
     val port: Int = 28873,
     val deviceLabel: String = "",
-)
+) {
+    companion object {
+        /** The rsync module every phone uses unless an advanced user
+         *  overrides it on both sides. Must equal `tetron-sync-receiver`'s
+         *  `config::DEFAULT_MODULE`. Not photo-specific -- it is a protocol
+         *  token, not a folder. */
+        const val DEFAULT_MODULE = "tetron-sync"
+    }
+}
 
 /**
  * A settings-backed provider for the configured target (SYNC-009 owns the

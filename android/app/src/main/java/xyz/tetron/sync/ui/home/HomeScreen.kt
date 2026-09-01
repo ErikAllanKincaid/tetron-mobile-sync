@@ -38,15 +38,13 @@ import xyz.tetron.sync.ui.describeGateReason
 import xyz.tetron.sync.ui.describeTunnelState
 
 /**
- * SYNC-009 Home screen: the backup target editor (mesh peer + module,
- * moved here from Settings -- this is the thing you look at right before
- * tapping "Back up now", so it belongs beside that button, not on a
- * separate settings page), tunnel-state line, consent banner, media-access
- * banner, the "Back up now" button, and the current [RunPhase] (blocked
- * reason / in-progress / last result). Port stays on the Settings screen
- * instead (see SettingsScreen's own "Backup target" note) -- it is a
- * fixed, rarely-changed technical value tied to the receiver's own setup,
- * not something you reconsider each time you pick a peer/module.
+ * SYNC-009 Home screen: the backup target editor (just the mesh peer now --
+ * the module name is a fixed default, set only in Settings > Connection for
+ * advanced multi-folder receivers), tunnel-state line, consent banner,
+ * media-access banner, the "Back up now" button, and the current [RunPhase]
+ * (blocked reason / in-progress / last result). Port and the module-name
+ * override stay on the Settings screen -- fixed, rarely-changed values tied
+ * to the receiver's own setup, not reconsidered each time you pick a peer.
  *
  * The gated-run "Transfer anyway?" confirm is the decision from this
  * requirement's own open item (spec/sync.py SYNC-009): shown only when
@@ -209,11 +207,10 @@ private fun RunPhaseSummary(phase: RunPhase) {
 /**
  * Moved here from Settings (SYNC-009 revision, 2026-08-21): this is what
  * you look at right before tapping "Back up now", so it belongs on Home.
- * Only mesh peer + module -- no Display name (redundant with the peer's
- * own hostname shown right here, and could drift out of sync with it; see
- * [HomeViewModel]'s own note) and no Port (moved to Settings instead,
- * since it is a fixed technical value tied to the receiver's own setup,
- * not something reconsidered alongside peer/module).
+ * Just the mesh peer now -- the rsync module name is a fixed default
+ * (`tetron-sync`, matched by the receiver automatically), and the Port and
+ * module-name override live in Settings > Connection for the rare advanced
+ * setup that needs them.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -223,7 +220,6 @@ private fun TargetEditor(
     onSave: (SyncTarget?) -> Unit,
 ) {
     var selectedPeer by remember(target) { mutableStateOf<BridgePeer?>(rosterPeers.firstOrNull { it.ip == target?.meshIp }) }
-    var moduleName by remember(target) { mutableStateOf(target?.module ?: "") }
     var expanded by remember { mutableStateOf(false) }
 
     LaunchedEffect(rosterPeers, target) {
@@ -265,23 +261,15 @@ private fun TargetEditor(
     }
 
     Spacer(Modifier.height(8.dp))
-    OutlinedTextField(
-        value = moduleName,
-        onValueChange = { moduleName = it },
-        label = { Text("rsync module name") },
-        modifier = Modifier.fillMaxWidth(),
-    )
-    Spacer(Modifier.height(8.dp))
     Button(
         onClick = {
             val peer = selectedPeer
-            if (peer != null && moduleName.isNotBlank()) {
-                val newTarget = target?.copy(meshIp = peer.ip, module = moduleName)
-                    ?: SyncTarget(meshIp = peer.ip, module = moduleName)
+            if (peer != null) {
+                val newTarget = target?.copy(meshIp = peer.ip) ?: SyncTarget(meshIp = peer.ip)
                 onSave(newTarget)
             }
         },
-        enabled = selectedPeer != null && moduleName.isNotBlank(),
+        enabled = selectedPeer != null,
     ) {
         Text("Save target")
     }

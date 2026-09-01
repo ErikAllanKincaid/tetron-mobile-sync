@@ -11,7 +11,7 @@
 # (plan decision #16). See AGENTS.md and LICENSE.
 [package]
 name = "tetron-mobile-sync"
-version = "0.11.3"
+version = "0.11.5"
 edition = "2024"
 rust-version = "1.91"
 authors = ["ErikAllanKincaid"]

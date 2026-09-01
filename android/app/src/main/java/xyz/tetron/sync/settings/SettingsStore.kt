@@ -37,18 +37,10 @@ interface SettingsStore {
     fun setBackupScope(scope: BackupScope)
 
     /** [xyz.tetron.sync.trigger.SyncWorkScheduler]'s periodic interval, in
-     *  hours (spec/sync.py SYNC-006's ~daily default, exposed here as the
-     *  SYNC-009 "WorkManager cadence" setting). */
-    fun workCadenceHours(): Long
-    fun setWorkCadenceHours(hours: Long)
-
-    /** [xyz.tetron.sync.gates.GateNotificationCoalescer]'s per-reason
-     *  notification window, in hours (SYNC-004 decision #3's ~6h default;
-     *  SYNC-009's "coalescing window N" setting). Unlike `gateConfig`/
-     *  `deleteAfterBackupConfig`, the coalescer itself is not re-read live
-     *  -- same "takes effect at next app start" bar as [workCadenceHours]
-     *  (both are consumed once, at [xyz.tetron.sync.AppContainer]
-     *  construction, not per-run). */
-    fun coalesceWindowHours(): Long
-    fun setCoalesceWindowHours(hours: Long)
+     *  hours, or `null` for "never" (spec/sync.py SYNC-006: periodic backup
+     *  is opt-in, default off). A user change is applied immediately by
+     *  [xyz.tetron.sync.ui.settings.SettingsViewModel], not deferred to the
+     *  next app start. */
+    fun workCadenceHours(): Long?
+    fun setWorkCadenceHours(hours: Long?)
 }

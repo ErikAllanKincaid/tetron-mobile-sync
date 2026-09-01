@@ -30,9 +30,12 @@ data class SettingsUiState(
     val gateConfig: GateConfig = GateConfig(),
     val target: SyncTarget? = null,
     val deleteAfterBackupEnabled: Boolean = false,
-    val workCadenceHours: Long = 24L,
-    val coalesceWindowHours: Long = 6L,
+    /** `null` == "never" (periodic backup is opt-in, spec/sync.py SYNC-006). */
+    val workCadenceHours: Long? = null,
     val ownMeshIp: String? = null,
+    /** This phone's own mesh hostname (MOBILE-024). Used by the Advanced
+     *  device-label field to offer adopting it when it has changed. */
+    val ownHostname: String? = null,
     val engineInfoLine: String = "",
     /** SYNC-012: the persistent backup scope + its derived [Preset] + the
      *  local backlog estimate ([estimateLoading] while the `MediaStore`
@@ -44,13 +47,16 @@ data class SettingsUiState(
     /** SYNC-010: non-null while the device-label field holds an invalid
      *  value; the reason string to show inline. */
     val deviceLabelError: String? = null,
+    /** Non-null while the advanced "Receiver module name" override field
+     *  holds an invalid value. */
+    val moduleNameError: String? = null,
 )
 
 /**
  * SYNC-009 Settings screen state: gate toggles/values, the target's port
- * (peer/module selection moved to [xyz.tetron.sync.ui.home.HomeViewModel]),
- * delete-after-backup opt-in, WorkManager cadence, and the notification
- * coalescing window. Every setter writes straight through
+ * and the advanced module-name override (peer selection lives on
+ * [xyz.tetron.sync.ui.home.HomeViewModel]), delete-after-backup opt-in,
+ * and the WorkManager cadence. Every setter writes straight through
  * [xyz.tetron.sync.settings.SettingsStore] -- `SharedPreferences.apply()`
  * is non-blocking and main-thread-safe by design, so these do not need a
  * background dispatcher the way [refreshOwnMeshIp]'s cross-process bridge
@@ -79,7 +85,6 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
                 target = store.target(),
                 deleteAfterBackupEnabled = store.deleteAfterBackupConfig().enabled,
                 workCadenceHours = store.workCadenceHours(),
-                coalesceWindowHours = store.coalesceWindowHours(),
                 engineInfoLine = AppInfo.describeEngine("${BuildConfig.VERSION_NAME} (${BuildConfig.GIT_SHA})"),
                 backupScope = scope,
                 preset = presetOf(scope),
@@ -96,7 +101,7 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
     private suspend fun refreshOwnMeshIp() {
         val response = container.bridge.current()
         val snapshot = (response as? BridgeResponse.Snapshot)?.snapshot
-        _uiState.update { it.copy(ownMeshIp = snapshot?.ownMeshIp) }
+        _uiState.update { it.copy(ownMeshIp = snapshot?.ownMeshIp, ownHostname = snapshot?.ownHostname) }
     }
 
     fun setGateConfig(config: GateConfig) {
@@ -136,23 +141,42 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
 
     fun clearDeviceLabelError() = _uiState.update { it.copy(deviceLabelError = null) }
 
+    /** Advanced only: the rsync module name. It must match the receiver
+     *  exactly (same contract as [setTargetPort]) -- there is no discovery.
+     *  Empty or the literal default clears the override. Validated with the
+     *  same one-safe-path-component rules as the device label. */
+    fun setTargetModule(raw: String) {
+        val current = _uiState.value.target ?: return
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty() || trimmed == SyncTarget.DEFAULT_MODULE) {
+            val updated = current.copy(module = SyncTarget.DEFAULT_MODULE)
+            container.settingsStore.setTarget(updated)
+            _uiState.update { it.copy(target = updated, moduleNameError = null) }
+            return
+        }
+        when (val result = DeviceLabel.validate(trimmed)) {
+            is DeviceLabel.Result.Invalid ->
+                _uiState.update { it.copy(moduleNameError = result.reason) }
+            is DeviceLabel.Result.Valid -> {
+                val updated = current.copy(module = result.label)
+                container.settingsStore.setTarget(updated)
+                _uiState.update { it.copy(target = updated, moduleNameError = null) }
+            }
+        }
+    }
+
     fun setDeleteAfterBackupEnabled(enabled: Boolean) {
         container.settingsStore.setDeleteAfterBackupConfig(DeleteAfterBackupConfig(enabled = enabled))
         _uiState.update { it.copy(deleteAfterBackupEnabled = enabled) }
     }
 
-    /** Takes effect next app start (WorkManager `KEEP`, see
-     *  [AppContainer.schedulePeriodicWork]), not this instant. */
-    fun setWorkCadenceHours(hours: Long) {
+    /** `null` == never (cancels the job). Applied to WorkManager
+     *  immediately via [AppContainer.applyPeriodicSchedule] (`UPDATE`
+     *  policy), not deferred to the next app start. */
+    fun setWorkCadenceHours(hours: Long?) {
         container.settingsStore.setWorkCadenceHours(hours)
         _uiState.update { it.copy(workCadenceHours = hours) }
-    }
-
-    /** Takes effect next app start (the coalescer is constructed once, see
-     *  [AppContainer]), not this instant. */
-    fun setCoalesceWindowHours(hours: Long) {
-        container.settingsStore.setCoalesceWindowHours(hours)
-        _uiState.update { it.copy(coalesceWindowHours = hours) }
+        container.applyPeriodicSchedule()
     }
 
     // --- SYNC-012: backup scope, presets, backlog estimate ---

@@ -54,6 +54,7 @@ class MeshBridgeMappingTest {
                 state = WireTunnelState.Active,
                 network = "wifi",
                 ownMeshIp = "10.10.0.2",
+                ownHostname = "my-pixel",
                 subnet = "10.10.0.0/16",
                 peers =
                     listOf(
@@ -69,6 +70,7 @@ class MeshBridgeMappingTest {
         assertEquals(BridgeTunnelState.Active, app.state)
         assertEquals("wifi", app.network)
         assertEquals("10.10.0.2", app.ownMeshIp)
+        assertEquals("my-pixel", app.ownHostname)
         assertEquals("10.10.0.0/16", app.subnet)
         assertEquals(123456789L, app.updatedAtMillis)
         assertEquals(3, app.peers.size)
@@ -84,6 +86,7 @@ class MeshBridgeMappingTest {
         assertEquals(BridgeTunnelState.CoreNotRunning, app.state)
         assertEquals(null, app.network)
         assertEquals(null, app.ownMeshIp)
+        assertEquals(null, app.ownHostname)
         assertEquals(null, app.subnet)
         assertEquals(emptyList<BridgePeer>(), app.peers)
         assertEquals(0L, app.updatedAtMillis)

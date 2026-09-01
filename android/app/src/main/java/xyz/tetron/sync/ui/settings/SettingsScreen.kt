@@ -33,6 +33,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import xyz.tetron.sync.scope.BacklogEstimate
 import xyz.tetron.sync.scope.BackupScope
@@ -46,15 +47,15 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
 /**
- * SYNC-009 Settings screen: gate toggles + values, the target's port
- * (peer/module selection itself lives on Home now, see
- * [xyz.tetron.sync.ui.home.HomeScreen] -- this screen just carries the
- * receiver's port, since that's a fixed
- * technical value tied to the receiver's own setup, not something
- * reconsidered alongside picking a peer/module), delete-after-backup
- * opt-in, WorkManager cadence, notification coalescing window.
- * Notification channel copy itself is a separate, not-yet-built slice of
- * this requirement (spec/sync.py: "exact copy is implementation-time").
+ * SYNC-009 Settings screen. Mesh-peer selection lives on Home
+ * ([xyz.tetron.sync.ui.home.HomeScreen]); this screen carries gate toggles,
+ * what-gets-backed-up scope, an Advanced section (bandwidth cap + the
+ * device-label override), delete-after-backup opt-in, the periodic-backup
+ * interval (opt-in, "Never" by default), and a bottom "Connection" section
+ * holding the two values that must match the receiver exactly -- the port
+ * and, for advanced setups, the module name. Notification channel copy is a
+ * separate, not-yet-built slice (spec/sync.py: "exact copy is
+ * implementation-time").
  */
 @Composable
 fun SettingsScreen(viewModel: SettingsViewModel) {
@@ -94,24 +95,9 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
         OwnMeshIpRow(state.ownMeshIp)
         Spacer(Modifier.height(4.dp))
         Text(
-            "Which peer/module to back up to is configured on the Home screen.",
+            "Which mesh peer to back up to is configured on the Home screen.",
             style = MaterialTheme.typography.bodySmall,
         )
-
-        Spacer(Modifier.height(16.dp))
-        DeviceLabelField(
-            target = state.target,
-            error = state.deviceLabelError,
-            onCommit = viewModel::setDeviceLabel,
-        )
-
-        Spacer(Modifier.height(16.dp))
-        IntSettingRow(
-            label = "Port",
-            value = state.target?.port ?: 28873,
-            onValueChange = viewModel::setTargetPort,
-        )
-        PortWarning()
 
         Spacer(Modifier.height(24.dp))
         WhatGetsBackedUpSection(
@@ -127,6 +113,10 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
         AdvancedSection(
             scope = state.backupScope,
             onScopeChange = viewModel::setBackupScope,
+            target = state.target,
+            deviceLabelError = state.deviceLabelError,
+            ownHostname = state.ownHostname,
+            onCommitDeviceLabel = viewModel::setDeviceLabel,
         )
 
         Spacer(Modifier.height(24.dp))
@@ -141,34 +131,32 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
 
         Spacer(Modifier.height(24.dp))
         SectionHeader("Schedule")
-        HoursDropdownRow(
-            label = "Periodic backup interval",
+        PeriodicIntervalRow(
             value = state.workCadenceHours,
-            choices = PERIODIC_INTERVAL_CHOICES_HOURS,
             onValueChange = viewModel::setWorkCadenceHours,
         )
         Text(
-            "Takes effect next app launch.",
+            "Off by default. \"Back up now\" on the Home screen always works regardless of this.",
             style = MaterialTheme.typography.bodySmall,
         )
-        // A plain label line above a plain field, not the standard
-        // OutlinedTextField inset label -- that inset label is what
-        // clipped to just "(hours)" with no visible text before it on
-        // narrower screens/larger font scales (a real bug found in
-        // testing), because the label text here is long enough to
-        // overflow the notch it floats into.
-        Text(
-            "Notification coalescing window (hours)",
-            style = MaterialTheme.typography.bodySmall,
+
+        // Port and the module name are the two values that must match the
+        // receiver exactly or the connection fails -- install-once,
+        // rarely touched, so they sit in their own section at the bottom
+        // rather than up top.
+        Spacer(Modifier.height(24.dp))
+        SectionHeader("Connection")
+        IntSettingRow(
+            label = "Port",
+            value = state.target?.port ?: 28873,
+            onValueChange = viewModel::setTargetPort,
         )
-        Spacer(Modifier.height(4.dp))
-        PlainLongField(
-            value = state.coalesceWindowHours,
-            onValueChange = viewModel::setCoalesceWindowHours,
-        )
-        Text(
-            "Takes effect next app launch.",
-            style = MaterialTheme.typography.bodySmall,
+        PortWarning()
+        Spacer(Modifier.height(16.dp))
+        ModuleNameField(
+            target = state.target,
+            error = state.moduleNameError,
+            onCommit = viewModel::setTargetModule,
         )
 
         Spacer(Modifier.height(32.dp))
@@ -195,15 +183,16 @@ private fun OwnMeshIpRow(ownMeshIp: String?) {
 
 /**
  * SYNC-010: the per-device folder name the receiver stores this phone's
- * backup under (`<module>/<device-label>/...`). Editable only once a target
- * exists (like the port field). Changing it after backups have run starts a
- * fresh folder on the receiver and leaves the old one untouched, so a
- * confirm dialog gates the change.
+ * backup under. Defaults to this phone's mesh hostname (else `phone-<hex>`),
+ * so most people never touch it -- it lives in Advanced. Changing it after
+ * backups have run starts a fresh folder on the receiver and leaves the old
+ * one untouched, so a confirm dialog gates the change.
  */
 @Composable
 private fun DeviceLabelField(
     target: SyncTarget?,
     error: String?,
+    currentHostname: String?,
     onCommit: (String) -> Unit,
 ) {
     if (target == null) return
@@ -213,6 +202,10 @@ private fun DeviceLabelField(
     val trimmed = text.trim()
     val changed = trimmed != persisted
     val liveValid = DeviceLabel.validate(text) is DeviceLabel.Result.Valid
+    // M6c: the phone's mesh hostname changed since the label was snapshotted.
+    // Offer to adopt it (through the same confirm dialog), never silently.
+    val hostnameSuggestion = currentHostname
+        ?.takeIf { it != persisted && DeviceLabel.normalizedOrNull(it) == it }
 
     Text("Device label", style = MaterialTheme.typography.bodySmall)
     Spacer(Modifier.height(4.dp))
@@ -235,9 +228,20 @@ private fun DeviceLabelField(
     }
     Text(
         text = error
-            ?: "Files land in ${target.module}/$trimmed/ on the receiver.",
+            ?: "Files land in $trimmed/ inside your backup folder on the receiver.",
         style = MaterialTheme.typography.bodySmall,
     )
+
+    if (hostnameSuggestion != null) {
+        Text(
+            "This phone's mesh hostname is now \"$hostnameSuggestion\". Backups still go to \"$persisted\".",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        TextButton(onClick = {
+            text = hostnameSuggestion
+            showConfirm = true
+        }) { Text("Use \"$hostnameSuggestion\"") }
+    }
 
     if (showConfirm) {
         AlertDialog(
@@ -261,6 +265,51 @@ private fun DeviceLabelField(
             },
         )
     }
+}
+
+/**
+ * Advanced: the rsync module name. A fixed default (`tetron-sync`) that the
+ * receiver uses too; overriding it only makes sense for a multi-folder
+ * receiver, and then it must be set to match on both sides by hand -- the
+ * same "coordinated value, no discovery" contract as the port, which is why
+ * it sits beside it. Reachable only once a target exists. Blank or the
+ * literal default clears the override.
+ */
+@Composable
+private fun ModuleNameField(
+    target: SyncTarget?,
+    error: String?,
+    onCommit: (String) -> Unit,
+) {
+    if (target == null) return
+    val persisted = target.module
+    var text by remember(persisted) { mutableStateOf(persisted) }
+    val trimmed = text.trim()
+    val changed = trimmed != persisted
+
+    Text("Receiver module name", style = MaterialTheme.typography.bodySmall)
+    Spacer(Modifier.height(4.dp))
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        OutlinedTextField(
+            value = text,
+            onValueChange = { text = it },
+            singleLine = true,
+            isError = error != null,
+            placeholder = { Text(SyncTarget.DEFAULT_MODULE) },
+            modifier = Modifier.weight(1f),
+        )
+        TextButton(onClick = { onCommit(text) }, enabled = changed) { Text("Save") }
+    }
+    Text(
+        text = error
+            ?: "Leave as \"${SyncTarget.DEFAULT_MODULE}\" unless you changed it on the receiver. Must match exactly.",
+        style = MaterialTheme.typography.bodySmall,
+        color = if (error != null) MaterialTheme.colorScheme.error else Color.Unspecified,
+    )
 }
 
 @Composable
@@ -308,25 +357,37 @@ private fun IntSettingRow(label: String, value: Int, onValueChange: (Int) -> Uni
 
 private val PERIODIC_INTERVAL_CHOICES_HOURS = listOf(6L, 12L, 24L, 48L)
 
+/**
+ * "Periodic backup interval" -- a `null` value is "Never" (the default;
+ * periodic backup is opt-in). Applies immediately, so there is no
+ * "takes effect next launch" caption.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun HoursDropdownRow(label: String, value: Long, choices: List<Long>, onValueChange: (Long) -> Unit) {
+private fun PeriodicIntervalRow(value: Long?, onValueChange: (Long?) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
         OutlinedTextField(
-            value = "${value}h",
+            value = value?.let { "Every ${it}h" } ?: "Never",
             onValueChange = {},
             readOnly = true,
-            label = { Text(label) },
+            label = { Text("Periodic backup interval") },
             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
             modifier = Modifier
                 .fillMaxWidth()
                 .menuAnchor(),
         )
         ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            choices.forEach { hours ->
+            DropdownMenuItem(
+                text = { Text("Never") },
+                onClick = {
+                    onValueChange(null)
+                    expanded = false
+                },
+            )
+            PERIODIC_INTERVAL_CHOICES_HOURS.forEach { hours ->
                 DropdownMenuItem(
-                    text = { Text("${hours}h") },
+                    text = { Text("Every ${hours}h") },
                     onClick = {
                         onValueChange(hours)
                         expanded = false
@@ -335,25 +396,6 @@ private fun HoursDropdownRow(label: String, value: Long, choices: List<Long>, on
             }
         }
     }
-}
-
-/** No `label` slot at all -- the plain [Text] line just above the call
- *  site is this field's label instead (see the Schedule section comment
- *  on why). */
-@Composable
-private fun PlainLongField(value: Long, onValueChange: (Long) -> Unit) {
-    var text by remember(value) { mutableStateOf(value.toString()) }
-    OutlinedTextField(
-        value = text,
-        onValueChange = { input ->
-            text = input
-            input.toLongOrNull()?.takeIf { it > 0 }?.let(onValueChange)
-        },
-        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 4.dp),
-    )
 }
 
 /** Same warning-text convention [xyz.tetron.sync.ui.home.MediaAccessBanner]
@@ -604,7 +646,14 @@ private fun LargestRow(entry: MediaEntry) {
 }
 
 @Composable
-private fun AdvancedSection(scope: BackupScope, onScopeChange: (BackupScope) -> Unit) {
+private fun AdvancedSection(
+    scope: BackupScope,
+    onScopeChange: (BackupScope) -> Unit,
+    target: SyncTarget?,
+    deviceLabelError: String?,
+    ownHostname: String?,
+    onCommitDeviceLabel: (String) -> Unit,
+) {
     SectionHeader("Advanced")
     val limitOn = scope.bwlimitKib != null
     SwitchRow("Limit upload bandwidth", limitOn) { on ->
@@ -617,4 +666,12 @@ private fun AdvancedSection(scope: BackupScope, onScopeChange: (BackupScope) -> 
             onValueChange = { kbs -> onScopeChange(scope.copy(bwlimitKib = kbs.coerceAtLeast(1).toLong())) },
         )
     }
+
+    Spacer(Modifier.height(16.dp))
+    DeviceLabelField(
+        target = target,
+        error = deviceLabelError,
+        currentHostname = ownHostname,
+        onCommit = onCommitDeviceLabel,
+    )
 }

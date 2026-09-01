@@ -37,9 +37,9 @@ down/Standby/Suspended = sync defers and notifies.
 
 | # | Decision | Chosen |
 |---|---|---|
-| 1 | Receiver authorization | Explicit per-identity allow-list, deny-by-default. Enforced as the `hosts allow` / `hosts deny = *` pair in the rsyncd.conf that `tetron-sync-receiver` generates: `allow add-peer <hostname>` resolves the mesh IP from the receiver host's own tetron IPC roster, `allow add <ip>` for the raw case. Re-confirmed 2026-08-31 over the PLAN receiver-layout brainstorm, which had floated dropping it. |
-| 2 | Transfer mechanism | oc-rsync embedded, stock rsyncd home side; spike-verified 2026-08-19 (`--partial` resume, wire compat, Android build, progress API). Amended 2026-08-31: the home-side stock `rsync --daemon` is provisioned by `tetron-sync-receiver` (MPL-2.0, separate repo) -- a config generator + per-user service supervisor around the system's own rsync, no receiver protocol code, no GPL contact. See SYNC-010. |
-| 3 | Retry/backoff when gated | Skip cycle + notify user, coalesced one-per-reason-per-N-hours |
+| 1 | Receiver authorization | Explicit per-identity allow-list, deny-by-default. Enforced as the `hosts allow` / `hosts deny = *` pair in the rsyncd.conf that `tetron-sync-receiver` generates: `allow add <ip-or-hostname>` (a bare IP is stored directly; anything else is resolved to a mesh IP from the receiver host's own tetron IPC roster). Re-confirmed 2026-08-31 over the PLAN receiver-layout brainstorm, which had floated dropping it. |
+| 2 | Transfer mechanism | oc-rsync embedded, stock rsyncd home side; spike-verified 2026-08-19 (`--partial` resume, wire compat, Android build, progress API). Amended 2026-08-31: the home-side stock `rsync --daemon` is provisioned by `tetron-sync-receiver` (MPL-2.0, separate repo) -- a config generator + per-user service supervisor around the system's own rsync, no receiver protocol code, no GPL contact. The single rsync module is named `tetron-sync` on both sides by default (a coordinated value like the port; overridable only for advanced multi-folder receivers). See SYNC-010. |
+| 3 | Retry/backoff when gated | Skip cycle + notify user, coalesced one notification per reason per ~6h (fixed window; was briefly a Settings field, removed 2026-09-01 as jargon with no user value). |
 | 4 | Direct-only gate default | ON; per-target `ConnKind` via the bridge, never a network-type heuristic |
 | 5 | Charging gate default | OFF (configurable) |
 | 6 | Low-battery pause | ON (configurable, threshold ~20%) |
@@ -439,8 +439,9 @@ class SyncGateEvaluation(Requirement):
     (SYNC-003).
 
     Behavior when gated (decision #3): skip this cycle and notify, no silent
-    wait, no retry storm. Coalescing: one notification per reason per N
-    hours (N configurable, ~6h provisional), reasons: not on Wi-Fi,
+    wait, no retry storm. Coalescing: one notification per reason per ~6h
+    (a fixed window, `GateNotificationCoalescer.DEFAULT_WINDOW_MILLIS` --
+    not user-configurable), reasons: not on Wi-Fi,
     relay-only path, low battery, charging required, target unreachable,
     tunnel not Active.
 
@@ -521,8 +522,13 @@ class SyncTriggerModel(Requirement):
     Triggers:
     1. Manual "Back up now" button, always available on the home screen
        (UI wiring is SYNC-009; the trigger entry point itself is here).
-    2. Periodic WorkManager job -- cadence configurable, ~daily default
-       (provisional; OS runs it when convenient, typically overnight).
+    2. Periodic WorkManager job -- opt-in, default "Never" (USER decision
+       2026-09-01: periodic backup is off until the user picks an interval;
+       "Back up now" is unaffected). Enabled choices 6/12/24/48h; the OS
+       runs it when convenient. A user change is applied to WorkManager
+       immediately (`UPDATE` policy), not deferred to the next app start;
+       the app-start path still uses `KEEP` so a relaunch never resets a
+       running timer.
     3. Network-change callback for an immediate check while the app happens
        to be alive (a `ConnectivityManager` NetworkCallback registration;
        not a wake-up mechanism).
@@ -849,18 +855,37 @@ class SyncUi(Requirement):
       (picked from the bridge roster -- mesh peers are the only v1 source,
       plan §Auth), bridge consent banner (ungranted/CoreNotRunning per
       SYNC-003), tunnel-state line (from the bridge snapshot).
-    - Progress: per-file phase from SYNC-002's TransferProgressEvent stream
-      (files_done/total + per-file bytes), cancel affordance.
+    - Progress: a live view of the in-flight run, driven by SYNC-002's
+      per-file `SyncProgressEvent` stream (one event per *completed* file on
+      the rsync-daemon path -- there is no within-file byte tick; a "smooth
+      current-file bar" is a deferred fork-patch item). Shows a whole-run
+      progress bar (byte fraction from the summed sizes of completed files
+      over the in-scope backlog size, falling back to files_done/total when
+      no backlog size is available -- the engine's own `overall_transferred`
+      is NOT used, it counts matched/checksummed bytes and overshoots the
+      real send several-fold), an average send rate + ETA, and a newest-
+      first list of files as they land. The screen recognises a run's
+      completion from the history store even when another trigger
+      (periodic/network-change) owns it and the manual `pipeline.run` call
+      therefore returned `AlreadyRunning`. Cancel affordance still deferred
+      (no cancellation token in `run_client`'s surface).
     - History: last run time + added/skipped/failed counts (SYNC-005) and
       last failure reason.
     - Settings: gate toggles + values (Wi-Fi-only, cellular, direct-only,
-      charging-required, low-battery threshold), target config (mesh-IP
-      picker is roster-based; module name; port; device label -- the
-      per-device top path component on the receiver, user-editable, with a
-      stable first-run-UUID fallback, SYNC-010), delete-after-backup
-      opt-in, coercion window N, WorkManager cadence, notification copy.
-      (No own-mesh-IP copy button -- removed 2026-08-31; the receiver
-      allow-lists this phone by hostname from its own roster, SYNC-010.)
+      charging-required, low-battery threshold); a bottom "Connection"
+      section with the two must-match-the-receiver values -- the port and
+      (advanced) the module-name override, default `tetron-sync`, blank
+      clears it (revised 2026-09-01: the module name is no longer a
+      user-facing field on Home; it is a coordinated default set once, like
+      the port); an "Advanced" section with the bandwidth cap and the
+      device-label override -- the per-device top path component on the
+      receiver, defaulting to this phone's mesh hostname (else
+      `phone-<8hex>`), SYNC-010; delete-after-backup opt-in; the
+      periodic-backup interval (opt-in, default "Never"). The notification
+      coalescing window is NOT a setting (fixed ~6h). Mesh-peer selection
+      is on Home. (No own-mesh-IP copy button -- removed 2026-08-31; the
+      receiver allow-lists this phone by hostname from its own roster,
+      SYNC-010.)
     - Notifications: channels + copy for gate reasons and completion/
       failure (coalesced per SYNC-004); exact copy is implementation-time
       (open item), reachable from Settings preview within Accessibility.
@@ -918,13 +943,16 @@ class SyncUi(Requirement):
     factory never won.
 
     `xyz.tetron.sync.settings.SettingsStore` (`SharedPreferences`-backed)
-    persists gate config, target, delete-after-backup, WorkManager cadence,
-    and the notification coalescing window (new:
-    `GateNotificationCoalescer`'s ~6h default from SYNC-004, now a
-    setting). Cadence and the coalescing window both take effect next app
-    launch, not live like `gateConfig`/`deleteConfig` -- they size a
-    WorkManager job and construct a stateful per-reason timer respectively,
-    both read once at `AppContainer` construction.
+    persists gate config, target, delete-after-backup, and the WorkManager
+    cadence. Revised 2026-09-01: the cadence is nullable (`null` == "Never",
+    the default -- periodic backup is opt-in) and a user change is applied
+    to WorkManager immediately, not at next launch. The target's `module`
+    key is written only when it is a real override; its absence means the
+    `tetron-sync` default. The device label defaults to the phone's own
+    mesh hostname (MOBILE-024 `ownHostname`, read once from the bridge
+    cache). The notification coalescing window was briefly a setting here;
+    it was removed -- `GateNotificationCoalescer` keeps its fixed ~6h
+    `DEFAULT_WINDOW_MILLIS`.
 
     Four screens, `androidx.navigation-compose` bottom nav, `HomeViewModel`
     requested Activity-scoped (`viewModel(activity, factory = ...)`) so
@@ -977,17 +1005,18 @@ class SyncUi(Requirement):
     `ExposedDropdownMenuBoxScope`, not a top-level composable, and
     `Modifier.weight()` is `RowScope`'s extension, not the internal
     `androidx.compose.foundation.layout.weight` val an IDE-style import
-    guess pulled in by mistake), delete-after-backup opt-in, WorkManager
-    cadence, the coalescing window, and (as first built) an own-mesh-IP
-    copy button (`LocalClipboardManager`) for `rsyncd.conf`'s `hosts allow`
-    line.
+    guess pulled in by mistake), delete-after-backup opt-in, the
+    periodic-backup interval (opt-in, "Never" default, revised 2026-09-01),
+    and (as first built) an own-mesh-IP copy button
+    (`LocalClipboardManager`) for `rsyncd.conf`'s `hosts allow` line. The
+    coalescing-window field was later removed (jargon, no user value).
 
     **Copy button removed 2026-08-31** (PLAN receiver-layout, Conflict 4):
     the home side is `tetron-sync-receiver`, which allow-lists a phone by
-    hostname resolved from its own tetron IPC roster (`allow add-peer`), so
+    hostname resolved from its own tetron IPC roster (`allow add`), so
     the phone never needs to surface or copy its mesh IP. `LocalClipboard
-    Manager` and the button drop out; the device-label field (SYNC-010)
-    takes its place in target config.
+    Manager` and the button drop out; the device-label field (SYNC-010,
+    now under Advanced) takes its place.
 
     `TetronSyncTheme` (`xyz.tetron.sync.ui.Theme.kt`) matches
     tetron-mobile's own green brand palette (same hex values as
@@ -1093,12 +1122,13 @@ class SyncHomeSideDeliverable(Requirement):
     (below) sits on SYNC-002 (adds `--mkpath` to `SyncRunOptions`) and
     SYNC-005 (destination construction, `--files-from` staging).
 
-    Operator model (the entire home side):
-    1. `tetron-sync-receiver allow add-peer <phone-hostname>` (or
-       `allow add <ip>`) -- deny-by-default; nothing connects until this.
-    2. `tetron-sync-receiver module add <name> <backup-root-dir>` -- a
-       module is just name -> path; runs as the operator, files owned by
-       the operator, `use chroot = false`.
+    Operator model (the entire home side), revised 2026-09-01:
+    1. `tetron-sync-receiver allow add <phone-hostname-or-ip>` --
+       deny-by-default; nothing connects until this.
+    2. `tetron-sync-receiver module set-dir <backup-root-dir>` -- points the
+       one module (named `tetron-sync`) at a folder; runs as the operator,
+       files owned by the operator, `use chroot = false`. `module add
+       --name <other> <dir>` still exists for advanced multi-folder setups.
     That is it. Per-device isolation is NOT a receiver concern.
 
     Cross-repo wire contract (must stay true in all three repos):
@@ -1106,6 +1136,12 @@ class SyncHomeSideDeliverable(Requirement):
       The receiver knows only `<module> -> <path>`. `<device-label>/` and
       everything below it are created by the client (`--mkpath`, implied
       dirs). One module serves every device; nobody adds module-per-device.
+    - `<module>` defaults to `tetron-sync` on every side (app
+      `SyncTarget.DEFAULT_MODULE`, receiver `config::DEFAULT_MODULE`, webui
+      shows it). It is a coordinated value like the port: no discovery, an
+      override must be set to match on both sides by hand. On disk the
+      module token is not a directory -- the first real path level is
+      `<device-label>`.
     - Port default 28873 in all three (app `DEFAULT_TARGET_PORT`, receiver
       `config::DEFAULT_PORT`, webui passes it through). A change is a
       coordinated change.
@@ -1119,10 +1155,12 @@ class SyncHomeSideDeliverable(Requirement):
       via `ClientConfig::builder().mkpath(true)` (fork already supports it
       and honors it for daemon sends -- `vendor/oc-rsync/crates/core/src/
       client/remote/invocation/builder.rs`; no fork patch). UniFFI regen.
-    - `SyncTarget` gains `deviceLabel`; SYNC-009 Settings field + validator
-      (one safe path component: no `/`, `..`, leading `.`, empty) + stable
-      first-run-UUID fallback; a label edit warns (starts a new receiver
-      dir, orphans the old).
+    - `SyncTarget` gains `deviceLabel`; SYNC-009 Advanced field + validator
+      (one safe path component: no `/`, `..`, leading `.`, empty). The
+      first-run default is the phone's own mesh hostname (MOBILE-024
+      `ownHostname`), falling back to `phone-<8hex>` only when no usable
+      hostname is available; snapshot once, not live-bound. A label edit
+      warns (starts a new receiver dir, orphans the old).
     - `SyncPipeline` appends `/<deviceLabel>` to the destination and sets
       `mkpath = true`.
     - `AndroidMediaAccess` stages `--files-from` entries as
@@ -1141,8 +1179,9 @@ class SyncHomeSideDeliverable(Requirement):
       refused before any file is written.
     - End to end, manual (a VM is enough), recorded in DO-NOT-COMMIT:
       install `tetron-sync-receiver` on a fresh Ubuntu-24.04-style host,
-      `module add` + `allow add-peer`, `receiver status` shows it serving
-      on 28873, the phone runs a backup, files land under
+      `module set-dir` + `allow add`, `receiver status` shows it serving
+      on 28873, the phone runs a backup (module name entered nowhere),
+      files land under
       `<root>/<device-label>/DCIM/Camera/...` mirroring the phone.
     ENFORCEMENT: the `engine_rsyncd` cases are the automated gate for the
     wire contract; the install-and-transfer walk is manual, same bar as

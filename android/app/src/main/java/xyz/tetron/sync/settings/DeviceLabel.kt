@@ -16,10 +16,14 @@ object DeviceLabel {
      *  per-component limit and keeps the receiver path readable. */
     const val MAX_LENGTH = 64
 
-    /** A generated fallback so a fresh install backs up with no setup
-     *  (plan §1.2: "a generated stable fallback ... persisted in app
-     *  prefs"). Persisted once by the store and reused thereafter. */
-    fun generateFallback(): String = "phone-" + UUID.randomUUID().toString().take(8)
+    /** The default device label for a fresh install (persisted once by the
+     *  store, reused thereafter). Prefers the phone's own mesh [hostname]
+     *  normalised to a single safe path component -- so the receiver folder
+     *  is recognisable -- and falls back to `phone-<8hex>` only when no
+     *  usable hostname is available (not joined, or it normalises to
+     *  nothing). */
+    fun generateFallback(hostname: String? = null): String =
+        hostname?.let { normalizedOrNull(it) } ?: ("phone-" + UUID.randomUUID().toString().take(8))
 
     sealed interface Result {
         data class Valid(val label: String) : Result
