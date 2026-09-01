@@ -70,14 +70,25 @@ class AndroidMediaAccess(
      *  SYNC-012: the staged `--files-from` list is the current
      *  [BackupScope] applied to the `MediaStore` roster
      *  ([selectInScope]); [SourceSpec.skippedOversizeCount] is the
-     *  size-cap drop count that falls out of the same pass. */
+     *  size-cap drop count that falls out of the same pass.
+     *
+     *  SYNC-010: on API 29+ the rsync source root is the external-storage
+     *  root and each `--files-from` entry is `DCIM/Camera/<name>`, so
+     *  rsync's implied-dirs rebuild that tree under the push destination
+     *  (`<module>/<device-label>/DCIM/Camera/<name>`) and the receiver copy
+     *  mirrors the phone's MediaStore layout. The pre-29 recursive-walk
+     *  path keeps the DCIM/Camera root with no list; its files land flat
+     *  under `<device-label>/` (documented asymmetry -- no reference device
+     *  is pre-29, matches SYNC-012 decision A2). */
     override fun resolve(): SourceSpec? {
-        val root = currentState().sourcePath ?: return null
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return SourceSpec(rootPath = root)
-        val selection = selectInScope(queryCameraRollEntries(File(root)), scopeProvider())
+        val cameraDir = currentState().sourcePath ?: return null
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return SourceSpec(rootPath = cameraDir)
+        val selection = selectInScope(queryCameraRollEntries(File(cameraDir)), scopeProvider())
         return SourceSpec(
-            rootPath = root,
-            filesFromPath = writeFilesFromList(selection.includedNames),
+            rootPath = externalStorageRoot(),
+            filesFromPath = writeFilesFromList(
+                selection.includedNames.map { CAMERA_RELATIVE_PATH + it },
+            ),
             skippedOversizeCount = selection.oversizeSkippedCount,
         )
     }
@@ -186,6 +197,18 @@ class AndroidMediaAccess(
          */
         fun cameraRollDirectory(): File =
             File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "Camera")
+
+        /**
+         * SYNC-010: the rsync source root for API 29+ transfers. The
+         * `--files-from` entries are relative to this (`DCIM/Camera/<name>`,
+         * later other public dirs), so rsync recreates that tree under the
+         * push destination. Derived from [cameraRollDirectory] (Camera ->
+         * DCIM -> storage root) rather than the separately-deprecated
+         * `Environment.getExternalStorageDirectory()`, to keep one path
+         * source of truth.
+         */
+        fun externalStorageRoot(): String =
+            cameraRollDirectory().parentFile!!.parentFile!!.path
 
         /**
          * SYNC-009: the permission set to hand

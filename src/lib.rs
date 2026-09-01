@@ -63,6 +63,14 @@ pub struct SyncRunOptions {
     /// `None` (desktop, pre-29, or any future non-media source) falls back
     /// to oc-rsync's own recursive walk, unchanged from SYNC-002 v1.
     pub files_from_path: Option<String>,
+    /// `--mkpath` -- create missing destination path components. SYNC-010:
+    /// the push destination is `rsync://<ip>:<port>/<module>/<device-label>/`,
+    /// so the per-device `<device-label>/` directory under the module root
+    /// is created by the client on first use; the receiver never pre-seeds
+    /// it and needs no per-device config. The oc-rsync core honors this for
+    /// daemon sends (`client/remote/invocation/builder.rs`). Default `false`
+    /// keeps every pre-SYNC-010 caller unchanged.
+    pub mkpath: bool,
 }
 
 /// Per-file progress event pushed across the FFI while a transfer runs.
@@ -251,10 +259,20 @@ fn build_client_config(
         ))
         .recursive(options.recursive)
         .times(options.times)
-        .links(options.links);
+        .links(options.links)
+        .mkpath(options.mkpath);
 
     if let Some(path) = options.files_from_path {
         builder = builder.files_from(FilesFromSource::LocalFile(std::path::PathBuf::from(path)));
+        // Upstream rsync turns on `--relative` whenever `--files-from` is
+        // used (options.c: `relative_paths = 1`), so a listed entry like
+        // `DCIM/Camera/IMG.jpg` is recreated with its parent dirs at the
+        // destination instead of collapsing to the basename. The fork's
+        // builder does not imply this, so set it explicitly -- SYNC-010
+        // needs the receiver tree to mirror the phone's MediaStore layout
+        // (`<module>/<device-label>/DCIM/Camera/...`). Implied-dirs is
+        // already on by default, so the parent components are created.
+        builder = builder.relative_paths(true);
     }
     if let Some(secs) = options.modify_window_secs {
         builder = builder.modify_window(Some(secs));

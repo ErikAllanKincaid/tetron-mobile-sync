@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
@@ -37,9 +38,9 @@ import xyz.tetron.sync.scope.BacklogEstimate
 import xyz.tetron.sync.scope.BackupScope
 import xyz.tetron.sync.scope.MediaEntry
 import xyz.tetron.sync.scope.MediaKind
+import xyz.tetron.sync.pipeline.SyncTarget
 import xyz.tetron.sync.scope.Preset
-import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.text.AnnotatedString
+import xyz.tetron.sync.settings.DeviceLabel
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -95,6 +96,13 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
         Text(
             "Which peer/module to back up to is configured on the Home screen.",
             style = MaterialTheme.typography.bodySmall,
+        )
+
+        Spacer(Modifier.height(16.dp))
+        DeviceLabelField(
+            target = state.target,
+            error = state.deviceLabelError,
+            onCommit = viewModel::setDeviceLabel,
         )
 
         Spacer(Modifier.height(16.dp))
@@ -171,27 +179,87 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
 }
 
 /**
- * plan §IPC bridge enrollment UX: the phone's own mesh IP is what the home
- * side's `rsyncd.conf hosts allow` line needs (SYNC-010), so copying it
- * out of the app is the whole point -- typing a mesh IP by hand invites
- * transcription errors.
+ * The phone's own mesh IP, informational only (SYNC-010, amended
+ * 2026-08-31): the receiver allow-lists this phone by hostname from its own
+ * mesh roster (`tetron-sync-receiver allow add-peer <hostname>`), so there
+ * is nothing for the user to copy or transcribe here.
  */
 @Composable
 private fun OwnMeshIpRow(ownMeshIp: String?) {
-    val clipboard = LocalClipboardManager.current
+    Text(
+        text = ownMeshIp?.let { "This device's mesh IP: $it" } ?: "This device's mesh IP is not available yet",
+        style = MaterialTheme.typography.bodyMedium,
+        modifier = Modifier.fillMaxWidth(),
+    )
+}
+
+/**
+ * SYNC-010: the per-device folder name the receiver stores this phone's
+ * backup under (`<module>/<device-label>/...`). Editable only once a target
+ * exists (like the port field). Changing it after backups have run starts a
+ * fresh folder on the receiver and leaves the old one untouched, so a
+ * confirm dialog gates the change.
+ */
+@Composable
+private fun DeviceLabelField(
+    target: SyncTarget?,
+    error: String?,
+    onCommit: (String) -> Unit,
+) {
+    if (target == null) return
+    val persisted = target.deviceLabel
+    var text by remember(persisted) { mutableStateOf(persisted) }
+    var showConfirm by remember { mutableStateOf(false) }
+    val trimmed = text.trim()
+    val changed = trimmed != persisted
+    val liveValid = DeviceLabel.validate(text) is DeviceLabel.Result.Valid
+
+    Text("Device label", style = MaterialTheme.typography.bodySmall)
+    Spacer(Modifier.height(4.dp))
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(
-            text = ownMeshIp?.let { "Your mesh IP: $it" } ?: "Your mesh IP is not available yet",
-            style = MaterialTheme.typography.bodyMedium,
+        OutlinedTextField(
+            value = text,
+            onValueChange = { text = it },
+            singleLine = true,
+            isError = error != null || (text.isNotEmpty() && !liveValid),
             modifier = Modifier.weight(1f),
         )
-        if (ownMeshIp != null) {
-            TextButton(onClick = { clipboard.setText(AnnotatedString(ownMeshIp)) }) { Text("Copy") }
-        }
+        TextButton(
+            onClick = { showConfirm = true },
+            enabled = changed && liveValid,
+        ) { Text("Save") }
+    }
+    Text(
+        text = error
+            ?: "Files land in ${target.module}/$trimmed/ on the receiver.",
+        style = MaterialTheme.typography.bodySmall,
+    )
+
+    if (showConfirm) {
+        AlertDialog(
+            onDismissRequest = { showConfirm = false },
+            title = { Text("Change device label?") },
+            text = {
+                Text(
+                    "Photos already backed up under \"$persisted\" stay on the " +
+                        "receiver in that folder. New backups go to \"$trimmed\". " +
+                        "Nothing is moved.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showConfirm = false
+                    onCommit(text)
+                }) { Text("Change") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showConfirm = false }) { Text("Cancel") }
+            },
+        )
     }
 }
 

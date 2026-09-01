@@ -192,6 +192,50 @@ class SyncPipelineTest {
     }
 
     @Test
+    fun deviceLabel_isInsertedIntoDestination_andMkpathIsSet() {
+        // SYNC-010: push into <module>/<device-label>/, with --mkpath so the
+        // client creates that dir under the module root itself.
+        var seenSource: String? = null
+        var seenDestination: String? = null
+        var seenMkpath: Boolean? = null
+        val pipeline = pipeline(
+            targetProvider = TargetProvider {
+                SyncTarget(meshIp = "10.10.0.2", module = "photos", deviceLabel = "phone-abc12345")
+            },
+            sourcePathProvider = SourcePathProvider {
+                SourceSpec("/storage/emulated/0", filesFromPath = "/data/app/backup_files_from.txt")
+            },
+            transferRunner = { source, destination, options, _ ->
+                seenSource = source
+                seenDestination = destination
+                seenMkpath = options.mkpath
+                outcome(filesCopied = 1, filesTotal = 1)
+            },
+        )
+
+        pipeline.run()
+
+        assertEquals("/storage/emulated/0", seenSource)
+        assertEquals("rsync://10.10.0.2:28873/photos/phone-abc12345/", seenDestination)
+        assertEquals(true, seenMkpath)
+    }
+
+    @Test
+    fun blankDeviceLabel_degradesToFlatDestination() {
+        // Only a bare (test) target has a blank label -- the persisted store
+        // always fills one in. It must still produce a valid URL, not `//`.
+        var seenDestination: String? = null
+        val pipeline = pipeline(
+            targetProvider = TargetProvider { SyncTarget(meshIp = "10.10.0.2", module = "photos") },
+            transferRunner = { _, destination, _, _ -> seenDestination = destination; outcome(1, 1) },
+        )
+
+        pipeline.run()
+
+        assertEquals("rsync://10.10.0.2:28873/photos/", seenDestination)
+    }
+
+    @Test
     fun interruptedTransfer_isNotRecordedAsFailure() {
         val pipeline = pipeline(
             transferRunner = { _, _, _, _ -> outcome(filesCopied = 2, filesTotal = 4, ioErrorExitCode = 23) },

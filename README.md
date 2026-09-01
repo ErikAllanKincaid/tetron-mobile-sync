@@ -15,8 +15,9 @@ Everything runs one-way, phone to home: this app never deletes or modifies anyth
 3. Open this app. If it's the first time it has talked to the mesh, you'll see a banner asking you to grant it access -- tap through and allow it.
 4. Grant photo/video access when prompted.
 5. In Settings, pick your home computer from the device list, and enter the folder name you shared in step 2.
-6. Adjust the Wi-Fi/battery/charging rules if the defaults don't suit you, or leave them as they are.
-7. Tap "Back up now" once to confirm everything works, or just leave the app alone -- it checks in on its own afterward.
+6. Optionally set a **device label** in Settings. This is the sub-folder this phone's photos land in on the receiver (`<shared-folder>/<device-label>/DCIM/Camera/...`), so one shared folder can hold backups from several phones. A label is generated for you if you skip this; changing it later starts a new sub-folder and leaves the old one in place.
+7. Adjust the Wi-Fi/battery/charging rules if the defaults don't suit you, or leave them as they are.
+8. Tap "Back up now" once to confirm everything works, or just leave the app alone -- it checks in on its own afterward.
 
 ## Using the app
 
@@ -24,7 +25,7 @@ Everything runs one-way, phone to home: this app never deletes or modifies anyth
 
 **Settings screen.** Everything you can configure:
 
-- **Backup target** -- which computer to back up to (picked from your mesh network's device list) and the shared-folder name it's exposing.
+- **Backup target** -- which computer to back up to (picked from your mesh network's device list), the shared-folder name it's exposing, and the device label (the per-phone sub-folder inside it).
 - **Gates** -- Wi-Fi only, direct connection only, require charging, and a low-battery cutoff. All are meant to keep a background backup from costing you mobile data, a slow relayed connection, or your battery.
 - **Delete after backup** -- off by default. When on, a file is only ever deleted once a backup run has actually finished copying it.
 - **Schedule** -- how often the app checks in on its own in the background, separate from the manual button.

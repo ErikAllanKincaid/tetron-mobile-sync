@@ -10,6 +10,14 @@
 //! - an interrupted push leaves a `--partial` file at the receiver and the
 //!   next run resumes from it (delta-matched, not re-sent);
 //! - the engine forces `--partial` even when the caller never asks for it.
+//!
+//! Plus, per SYNC-010's cross-repo wire contract:
+//! - `--mkpath` creates the `<module>/<device-label>/DCIM/Camera/` path on
+//!   first push with no pre-seeding; without it the same push is refused;
+//! - a `write only = true` module refuses a readback;
+//! - a push from an address outside `hosts allow` is refused before any
+//!   file is written;
+//! - `max connections = 1` refuses a second connection while one is live.
 
 use std::fs;
 use std::net::{TcpListener, TcpStream};
@@ -21,7 +29,6 @@ use tetron_mobile_sync::{SyncEngine, SyncRunOptions};
 
 struct Daemon {
     child: Child,
-    root: PathBuf,
     module: PathBuf,
     port: u16,
 }
@@ -47,20 +54,59 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// Knobs the SYNC-010 wire-contract tests need on the generated
+/// `rsyncd.conf`. `Default` reproduces the historical single-module config
+/// (`start_daemon`), so the SYNC-002 tests are unaffected.
+struct DaemonConfig {
+    hosts_allow: &'static str,
+    read_only: bool,
+    write_only: bool,
+    max_connections: Option<u32>,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            hosts_allow: "127.0.0.1",
+            read_only: false,
+            write_only: false,
+            max_connections: None,
+        }
+    }
+}
+
 fn start_daemon() -> Daemon {
-    let root = tempfile::tempdir().unwrap().into_path();
+    start_daemon_with(DaemonConfig::default())
+}
+
+fn start_daemon_with(cfg: DaemonConfig) -> Daemon {
+    let root = tempfile::tempdir().unwrap().keep();
     let module = root.join("backup");
     fs::create_dir_all(&module).unwrap();
     let conf = root.join("rsyncd.conf");
+    let mut module_block = format!(
+        "[backup]\n\
+         path = {}\n\
+         read only = {}\n\
+         write only = {}\n",
+        module.display(),
+        if cfg.read_only { "yes" } else { "no" },
+        if cfg.write_only { "yes" } else { "no" },
+    );
+    if let Some(n) = cfg.max_connections {
+        module_block.push_str(&format!("max connections = {n}\n"));
+        // `max connections` needs a writable lock file; the rsyncd default
+        // (/var/run/rsyncd.lock) is unwritable to a non-root daemon, which
+        // would fail the connection outright rather than just cap it.
+        module_block.push_str(&format!("lock file = {}\n", root.join("rsyncd.lock").display()));
+    }
     fs::write(
         &conf,
         format!(
             "use chroot = no\n\
-             hosts allow = 127.0.0.1\n\
-             [backup]\n\
-             path = {}\n\
-             read only = no\n",
-            module.display()
+             hosts allow = {}\n\
+             {}",
+            cfg.hosts_allow, module_block,
         ),
     )
     .unwrap();
@@ -91,7 +137,6 @@ fn start_daemon() -> Daemon {
 
     Daemon {
         child,
-        root,
         module,
         port,
     }
@@ -290,4 +335,243 @@ fn killed_push_keeps_partial_and_next_run_resumes() {
         "resumed file must be byte-identical"
     );
     assert!(outcome.matched_bytes > 0, "resume must have matched data");
+}
+
+// ---- SYNC-010 wire-contract tests --------------------------------------
+
+fn mkpath_options() -> SyncRunOptions {
+    SyncRunOptions {
+        recursive: true,
+        times: true,
+        mkpath: true,
+        ..Default::default()
+    }
+}
+
+/// The push destination is `rsync://<ip>:<port>/<module>/<device-label>/...`;
+/// `--mkpath` must create `<device-label>/DCIM/Camera/` under the module
+/// root on the first run, with the receiver holding no pre-seeded per-device
+/// directory. This is what lets one receiver module serve every device.
+#[test]
+#[ignore]
+fn push_with_mkpath_creates_device_label_path() {
+    let daemon = start_daemon();
+    let src = tempfile::tempdir().unwrap();
+    let body = vec![0x33u8; 200 * 1024];
+    fs::write(src.path().join("IMG_9001.jpg"), &body).unwrap();
+    let src_arg = format!("{}/", src.path().display());
+    let dest = format!(
+        "rsync://127.0.0.1:{}/backup/dev-abc123/DCIM/Camera/",
+        daemon.port
+    );
+
+    let engine = SyncEngine::new();
+    engine
+        .run_client(src_arg, dest, mkpath_options(), None)
+        .expect("push with --mkpath should succeed into a non-existent dest path");
+
+    assert_eq!(
+        bytes_at(&daemon.module.join("dev-abc123/DCIM/Camera/IMG_9001.jpg")),
+        body,
+        "the whole <device-label>/DCIM/Camera/ path must have been created by the client"
+    );
+}
+
+/// The real app path: a `--files-from` list whose entries carry a
+/// `DCIM/Camera/` prefix must land nested at the receiver
+/// (`<module>/<device-label>/DCIM/Camera/<name>`), not collapsed to the
+/// basename. rsync implies `--relative` for `--files-from`; the embedding
+/// wrapper sets it explicitly since the fork's builder does not.
+#[test]
+#[ignore]
+fn files_from_with_dir_prefix_lands_nested_at_receiver() {
+    let daemon = start_daemon();
+    let src = tempfile::tempdir().unwrap();
+    let camera = src.path().join("DCIM").join("Camera");
+    fs::create_dir_all(&camera).unwrap();
+    fs::write(camera.join("IMG_7001.jpg"), vec![0x21u8; 128 * 1024]).unwrap();
+    fs::write(camera.join("IMG_7002.jpg"), vec![0x22u8; 96 * 1024]).unwrap();
+
+    let list = src.path().join("files_from.txt");
+    fs::write(&list, "DCIM/Camera/IMG_7001.jpg\nDCIM/Camera/IMG_7002.jpg\n").unwrap();
+
+    let engine = SyncEngine::new();
+    engine
+        .run_client(
+            format!("{}/", src.path().display()),
+            format!("rsync://127.0.0.1:{}/backup/phone-xyz/", daemon.port),
+            SyncRunOptions {
+                recursive: true,
+                times: true,
+                mkpath: true,
+                files_from_path: Some(list.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("files-from push should succeed");
+
+    assert_eq!(
+        bytes_at(&daemon.module.join("phone-xyz/DCIM/Camera/IMG_7001.jpg")),
+        vec![0x21u8; 128 * 1024],
+        "the DCIM/Camera/ prefix from the file list must be recreated at the receiver"
+    );
+    assert!(
+        daemon.module.join("phone-xyz/DCIM/Camera/IMG_7002.jpg").exists(),
+        "every listed entry lands under its prefix, not flattened"
+    );
+    assert!(
+        !daemon.module.join("phone-xyz/IMG_7001.jpg").exists(),
+        "entries must not collapse to the basename"
+    );
+}
+
+/// Same push without `--mkpath` is refused by the daemon (the multi-level
+/// destination path does not exist) -- proving `--mkpath` is load-bearing,
+/// not incidental.
+#[test]
+#[ignore]
+fn push_without_mkpath_into_missing_path_is_refused() {
+    let daemon = start_daemon();
+    let src = tempfile::tempdir().unwrap();
+    fs::write(src.path().join("IMG_9002.jpg"), vec![0x44u8; 64 * 1024]).unwrap();
+    let src_arg = format!("{}/", src.path().display());
+    let dest = format!(
+        "rsync://127.0.0.1:{}/backup/dev-nope/DCIM/Camera/",
+        daemon.port
+    );
+
+    let engine = SyncEngine::new();
+    let result = engine.run_client(
+        src_arg,
+        dest,
+        SyncRunOptions {
+            recursive: true,
+            times: true,
+            ..Default::default()
+        },
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "a push into a missing multi-level dest path without --mkpath must fail"
+    );
+    assert!(
+        !daemon.module.join("dev-nope").exists(),
+        "nothing should have been created under the module root"
+    );
+}
+
+/// The receiver module is `write only = true` (SYNC-010 / plan §1.3): the
+/// phone pushes but must not be able to read anything already there. A pull
+/// from the module is refused and writes no local file.
+#[test]
+#[ignore]
+fn readback_from_write_only_module_is_refused() {
+    let daemon = start_daemon_with(DaemonConfig {
+        write_only: true,
+        ..DaemonConfig::default()
+    });
+    fs::write(daemon.module.join("secret.jpg"), vec![0x55u8; 128 * 1024]).unwrap();
+
+    let dst = tempfile::tempdir().unwrap();
+    let engine = SyncEngine::new();
+    let result = engine.run_client(
+        daemon.url(),
+        format!("{}/", dst.path().display()),
+        default_options(),
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "a readback from a write-only module must be refused"
+    );
+    assert!(
+        !dst.path().join("secret.jpg").exists(),
+        "no file may be pulled from a write-only module"
+    );
+}
+
+/// A push from an address outside `hosts allow` is refused before any file
+/// is written (SYNC-010 decision #1: explicit per-identity allow-list,
+/// deny-by-default).
+#[test]
+#[ignore]
+fn push_from_unlisted_address_is_refused() {
+    let daemon = start_daemon_with(DaemonConfig {
+        hosts_allow: "10.255.255.1",
+        ..DaemonConfig::default()
+    });
+    let src = tempfile::tempdir().unwrap();
+    fs::write(src.path().join("IMG_9003.jpg"), vec![0x66u8; 96 * 1024]).unwrap();
+
+    let engine = SyncEngine::new();
+    let result = engine.run_client(
+        format!("{}/", src.path().display()),
+        daemon.url(),
+        default_options(),
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "a push from a non-allow-listed address must be refused"
+    );
+    let entries: Vec<_> = fs::read_dir(&daemon.module).unwrap().collect();
+    assert!(entries.is_empty(), "no file may be written for a refused peer");
+}
+
+/// `max connections = 1` refuses a second connection while one transfer is
+/// still live (SYNC-010 / plan §1.3: stops overlapping runs from the same
+/// phone).
+#[test]
+#[ignore]
+fn second_connection_is_refused_while_one_is_live() {
+    let daemon = start_daemon_with(DaemonConfig {
+        max_connections: Some(1),
+        ..DaemonConfig::default()
+    });
+    let src = tempfile::tempdir().unwrap();
+    // Big + bandwidth-limited so the first connection stays open long enough
+    // to overlap a second attempt.
+    let full = pseudo_random_bytes(40 * 1024 * 1024, 0x5EC02D);
+    fs::write(src.path().join("big.mp4"), &full).unwrap();
+    let src_arg = format!("{}/", src.path().display());
+    let url = daemon.url();
+
+    let mut child = run_helper_in_child(&src_arg, &url, Some(3_000));
+
+    // Wait until the receiver holds a growing partial (connection 1 is live).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let bytes: u64 = fs::read_dir(&daemon.module)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+            .sum();
+        if bytes > 1024 * 1024 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "connection 1 never established before timeout"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let other = tempfile::tempdir().unwrap();
+    fs::write(other.path().join("other.jpg"), vec![0x77u8; 64 * 1024]).unwrap();
+    let engine = SyncEngine::new();
+    let result = engine.run_client(
+        format!("{}/", other.path().display()),
+        url,
+        default_options(),
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "a second connection must be refused while one is live (max connections = 1)"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
 }
