@@ -264,6 +264,15 @@ fn build_client_config(
 
     if let Some(path) = options.files_from_path {
         builder = builder.files_from(FilesFromSource::LocalFile(std::path::PathBuf::from(path)));
+        // Upstream rsync turns on `--relative` whenever `--files-from` is
+        // used (options.c: `relative_paths = 1`), so a listed entry like
+        // `DCIM/Camera/IMG.jpg` is recreated with its parent dirs at the
+        // destination instead of collapsing to the basename. The fork's
+        // builder does not imply this, so set it explicitly -- SYNC-010
+        // needs the receiver tree to mirror the phone's MediaStore layout
+        // (`<module>/<device-label>/DCIM/Camera/...`). Implied-dirs is
+        // already on by default, so the parent components are created.
+        builder = builder.relative_paths(true);
     }
     if let Some(secs) = options.modify_window_secs {
         builder = builder.modify_window(Some(secs));

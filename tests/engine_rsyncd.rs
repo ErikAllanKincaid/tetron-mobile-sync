@@ -377,6 +377,55 @@ fn push_with_mkpath_creates_device_label_path() {
     );
 }
 
+/// The real app path: a `--files-from` list whose entries carry a
+/// `DCIM/Camera/` prefix must land nested at the receiver
+/// (`<module>/<device-label>/DCIM/Camera/<name>`), not collapsed to the
+/// basename. rsync implies `--relative` for `--files-from`; the embedding
+/// wrapper sets it explicitly since the fork's builder does not.
+#[test]
+#[ignore]
+fn files_from_with_dir_prefix_lands_nested_at_receiver() {
+    let daemon = start_daemon();
+    let src = tempfile::tempdir().unwrap();
+    let camera = src.path().join("DCIM").join("Camera");
+    fs::create_dir_all(&camera).unwrap();
+    fs::write(camera.join("IMG_7001.jpg"), vec![0x21u8; 128 * 1024]).unwrap();
+    fs::write(camera.join("IMG_7002.jpg"), vec![0x22u8; 96 * 1024]).unwrap();
+
+    let list = src.path().join("files_from.txt");
+    fs::write(&list, "DCIM/Camera/IMG_7001.jpg\nDCIM/Camera/IMG_7002.jpg\n").unwrap();
+
+    let engine = SyncEngine::new();
+    engine
+        .run_client(
+            format!("{}/", src.path().display()),
+            format!("rsync://127.0.0.1:{}/backup/phone-xyz/", daemon.port),
+            SyncRunOptions {
+                recursive: true,
+                times: true,
+                mkpath: true,
+                files_from_path: Some(list.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("files-from push should succeed");
+
+    assert_eq!(
+        bytes_at(&daemon.module.join("phone-xyz/DCIM/Camera/IMG_7001.jpg")),
+        vec![0x21u8; 128 * 1024],
+        "the DCIM/Camera/ prefix from the file list must be recreated at the receiver"
+    );
+    assert!(
+        daemon.module.join("phone-xyz/DCIM/Camera/IMG_7002.jpg").exists(),
+        "every listed entry lands under its prefix, not flattened"
+    );
+    assert!(
+        !daemon.module.join("phone-xyz/IMG_7001.jpg").exists(),
+        "entries must not collapse to the basename"
+    );
+}
+
 /// Same push without `--mkpath` is refused by the daemon (the multi-level
 /// destination path does not exist) -- proving `--mkpath` is load-bearing,
 /// not incidental.
