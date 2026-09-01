@@ -26,7 +26,12 @@ import android.os.Parcelable
  *   1 Relay, 2 Tor, 3 Unknown)
  * - StatusSnapshot: state (enum name String), network String?, ownMeshIp
  *   String?, subnet String?, peer count Int, N x BridgePeer,
- *   updatedAtMillis Long
+ *   updatedAtMillis Long, ownHostname String?
+ *
+ * `ownHostname` is LAST on purpose: a provider that predates it (an older
+ * tetron-mobile) writes a parcel that ends after `updatedAtMillis`, and
+ * `Parcel.readString()` past the end returns null -- so this mirror stays
+ * compatible with both provider versions. Never move it earlier.
  */
 enum class BridgeTunnelState {
     Active,
@@ -81,14 +86,21 @@ class StatusSnapshot(
     val subnet: String?,
     val peers: List<BridgePeer>,
     val updatedAtMillis: Long,
+    // Trailing for Kotlin source-compat with existing call sites; the wire
+    // position is mid-record (right after ownMeshIp) to match the
+    // provider's @Parcelize declaration order -- see the read/write below.
+    val ownHostname: String? = null,
 ) : Parcelable {
     private constructor(parcel: Parcel) : this(
-        BridgeTunnelState.fromName(parcel.readString()),
-        parcel.readString(),
-        parcel.readString(),
-        parcel.readString(),
-        List(maxOf(parcel.readInt(), 0)) { BridgePeer(parcel) },
-        parcel.readLong(),
+        state = BridgeTunnelState.fromName(parcel.readString()),
+        network = parcel.readString(),
+        ownMeshIp = parcel.readString(),
+        subnet = parcel.readString(),
+        peers = List(maxOf(parcel.readInt(), 0)) { BridgePeer(parcel) },
+        updatedAtMillis = parcel.readLong(),
+        // Last, and read past-the-end-safe: an older provider's parcel
+        // stops after updatedAtMillis and this yields null.
+        ownHostname = parcel.readString(),
     )
 
     override fun writeToParcel(dest: Parcel, flags: Int) {
@@ -99,6 +111,7 @@ class StatusSnapshot(
         dest.writeInt(peers.size)
         peers.forEach { it.writeToParcel(dest, flags) }
         dest.writeLong(updatedAtMillis)
+        dest.writeString(ownHostname)
     }
 
     override fun describeContents(): Int = 0

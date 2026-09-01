@@ -236,6 +236,24 @@ class SyncPipelineTest {
     }
 
     @Test
+    fun noExplicitModule_usesTheTetronSyncDefault() {
+        // A target built without a module name uses SyncTarget.DEFAULT_MODULE
+        // ("tetron-sync"), matching the receiver's own default -- nothing to
+        // configure on either side.
+        var seenDestination: String? = null
+        val pipeline = pipeline(
+            targetProvider = TargetProvider {
+                SyncTarget(meshIp = "10.10.0.2", deviceLabel = "phone-abc12345")
+            },
+            transferRunner = { _, destination, _, _ -> seenDestination = destination; outcome(1, 1) },
+        )
+
+        pipeline.run()
+
+        assertEquals("rsync://10.10.0.2:28873/tetron-sync/phone-abc12345/", seenDestination)
+    }
+
+    @Test
     fun interruptedTransfer_isNotRecordedAsFailure() {
         val pipeline = pipeline(
             transferRunner = { _, _, _, _ -> outcome(filesCopied = 2, filesTotal = 4, ioErrorExitCode = 23) },

@@ -51,6 +51,12 @@ data class BridgeSnapshot(
     val subnet: String?,
     val peers: List<BridgePeer>,
     val updatedAtMillis: Long,
+    /** MOBILE-024 `ownHostname`: this phone's own mesh hostname. Used to
+     *  default the SYNC-010 device label to the hostname instead of an
+     *  opaque id. Trailing with a default so a provider that predates the
+     *  field (older tetron-mobile) still maps -- the two APKs update
+     *  independently. */
+    val ownHostname: String? = null,
 )
 
 /** The only things the bridge can answer. The bridge never throws to UI:

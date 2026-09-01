@@ -3,11 +3,13 @@ package xyz.tetron.sync
 
 import android.content.Context
 import android.net.ConnectivityManager
+import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.WorkManager
 import java.time.Duration
 import java.util.concurrent.Executors
 import uniffi.tetron_mobile_sync.SyncEngine
 import uniffi.tetron_mobile_sync.SyncEngineInterface
+import xyz.tetron.sync.bridge.BridgeResponse
 import xyz.tetron.sync.bridge.MeshBridge
 import xyz.tetron.sync.bridge.ProviderStatusCaller
 import xyz.tetron.sync.delete.DeleteIntentSenderLauncher
@@ -59,19 +61,23 @@ import xyz.tetron.sync.trigger.SyncWorkerFactory
 class AppContainer(context: Context) {
     private val appContext = context.applicationContext
 
-    val settingsStore: SettingsStore = SharedPreferencesSettingsStore(appContext)
     val bridge = MeshBridge(ProviderStatusCaller(appContext.contentResolver))
+
+    /** `ownHostname` is read from the bridge's short-TTL cache lazily, only
+     *  the first time a device label is needed (and by then a roster-facing
+     *  screen has already warmed the cache), so this never forces a fresh
+     *  cross-process call on the caller's thread. */
+    val settingsStore: SettingsStore = SharedPreferencesSettingsStore(appContext) {
+        (bridge.current() as? BridgeResponse.Snapshot)?.snapshot?.ownHostname
+    }
     val mediaAccess = AndroidMediaAccess(appContext, scopeProvider = { settingsStore.backupScope() })
     val deviceState = AndroidDeviceStateProvider(appContext)
     val historyStore: RunHistoryStore = SharedPreferencesRunHistoryStore(appContext)
 
-    /** Read once at construction, not live like `gateConfig`/`deleteConfig`
-     *  -- same "takes effect at next app start" bar as [schedulePeriodicWork],
-     *  since the coalescer (unlike those two suppliers) is a stateful
-     *  per-reason timer, not a pure per-run read. */
-    private val coalescer = GateNotificationCoalescer(
-        windowMillis = Duration.ofHours(settingsStore.coalesceWindowHours()).toMillis(),
-    )
+    /** Fixed ~6h window ([GateNotificationCoalescer.DEFAULT_WINDOW_MILLIS]).
+     *  It used to be a Settings field; that was jargon with no user value
+     *  and was removed. */
+    private val coalescer = GateNotificationCoalescer()
     private val notifier = SyncNotifier(appContext)
 
     /** Set by [xyz.tetron.sync.MainActivity] once its `ActivityResultLauncher`
@@ -121,15 +127,22 @@ class AppContainer(context: Context) {
         dispatcher = NetworkChangeDispatcher(pipelineRunner, networkChangeExecutor),
     )
 
-    /** Called once at app startup ([TetronSyncApplication]). `KEEP` (inside
-     *  [SyncWorkScheduler]) means a cadence change here only takes effect
-     *  the next time the app process starts, not retroactively -- v1's
-     *  accepted bar (spec/sync.py SYNC-006: relaunching the app must not
-     *  reset an already-running timer). */
-    fun schedulePeriodicWork() {
-        SyncWorkScheduler.schedule(
-            WorkManager.getInstance(appContext),
-            interval = Duration.ofHours(settingsStore.workCadenceHours()),
-        )
+    /** Called once at app startup ([TetronSyncApplication]). Uses `KEEP` so
+     *  relaunching never resets an already-scheduled timer (spec/sync.py
+     *  SYNC-006). A `null` cadence ("never") cancels any existing job. */
+    fun schedulePeriodicWork() = applyPeriodicSchedule(ExistingPeriodicWorkPolicy.KEEP)
+
+    /** Apply the current [SettingsStore.workCadenceHours] to WorkManager
+     *  now. The Settings screen calls this on a user change with the
+     *  default `UPDATE` policy so the new interval (or "never") takes effect
+     *  immediately, not at next launch. */
+    fun applyPeriodicSchedule(policy: ExistingPeriodicWorkPolicy = ExistingPeriodicWorkPolicy.UPDATE) {
+        val workManager = WorkManager.getInstance(appContext)
+        val hours = settingsStore.workCadenceHours()
+        if (hours == null) {
+            SyncWorkScheduler.cancel(workManager)
+        } else {
+            SyncWorkScheduler.schedule(workManager, Duration.ofHours(hours), policy)
+        }
     }
 }

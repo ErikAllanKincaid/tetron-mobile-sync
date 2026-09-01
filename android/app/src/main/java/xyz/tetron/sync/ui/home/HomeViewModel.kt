@@ -117,11 +117,14 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
         )
     }
 
-    /** The backup target is edited directly from Home now (module + mesh
-     *  peer), not a separate Settings section -- port stays untouched here,
-     *  it's edited from Settings instead (see SettingsViewModel.setTargetPort). */
+    /** The backup target is edited directly from Home now (just the mesh
+     *  peer -- module name and port are Settings > Connection). Written on
+     *  IO: the first save on a fresh install is where the store seeds the
+     *  device label, which reads the mesh hostname from the bridge cache. */
     fun setTarget(target: SyncTarget?) {
-        container.settingsStore.setTarget(target)
+        viewModelScope.launch(Dispatchers.IO) {
+            container.settingsStore.setTarget(target)
+        }
     }
 
     private inner class LiveProgressListener : SyncProgressListener {

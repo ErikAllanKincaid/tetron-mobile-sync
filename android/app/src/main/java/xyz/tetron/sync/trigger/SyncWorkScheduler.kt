@@ -32,13 +32,26 @@ object SyncWorkScheduler {
             )
             .build()
 
-    /** [ExistingPeriodicWorkPolicy.KEEP]: re-launching the app must not
-     *  reset an already-scheduled job's timer. */
-    fun schedule(workManager: WorkManager, interval: Duration = DEFAULT_INTERVAL) {
+    /** [policy] defaults to [ExistingPeriodicWorkPolicy.KEEP] (the app-start
+     *  path -- re-launching must not reset an already-scheduled job's
+     *  timer); the Settings screen passes [ExistingPeriodicWorkPolicy.UPDATE]
+     *  so a user's interval change takes effect immediately. */
+    fun schedule(
+        workManager: WorkManager,
+        interval: Duration = DEFAULT_INTERVAL,
+        policy: ExistingPeriodicWorkPolicy = ExistingPeriodicWorkPolicy.KEEP,
+    ) {
         workManager.enqueueUniquePeriodicWork(
             UNIQUE_WORK_NAME,
-            ExistingPeriodicWorkPolicy.KEEP,
+            policy,
             buildPeriodicRequest(interval),
         )
+    }
+
+    /** Cancel the periodic job -- the "never" cadence (spec/sync.py
+     *  SYNC-006: periodic backup is opt-in). Manual "Back up now" is
+     *  unaffected. */
+    fun cancel(workManager: WorkManager) {
+        workManager.cancelUniqueWork(UNIQUE_WORK_NAME)
     }
 }
