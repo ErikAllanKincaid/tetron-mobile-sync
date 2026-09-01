@@ -855,8 +855,20 @@ class SyncUi(Requirement):
       (picked from the bridge roster -- mesh peers are the only v1 source,
       plan §Auth), bridge consent banner (ungranted/CoreNotRunning per
       SYNC-003), tunnel-state line (from the bridge snapshot).
-    - Progress: per-file phase from SYNC-002's TransferProgressEvent stream
-      (files_done/total + per-file bytes), cancel affordance.
+    - Progress: a live view of the in-flight run, driven by SYNC-002's
+      per-file `SyncProgressEvent` stream (one event per *completed* file on
+      the rsync-daemon path -- there is no within-file byte tick; a "smooth
+      current-file bar" is a deferred fork-patch item). Shows a whole-run
+      progress bar (byte fraction from the summed sizes of completed files
+      over the in-scope backlog size, falling back to files_done/total when
+      no backlog size is available -- the engine's own `overall_transferred`
+      is NOT used, it counts matched/checksummed bytes and overshoots the
+      real send several-fold), an average send rate + ETA, and a newest-
+      first list of files as they land. The screen recognises a run's
+      completion from the history store even when another trigger
+      (periodic/network-change) owns it and the manual `pipeline.run` call
+      therefore returned `AlreadyRunning`. Cancel affordance still deferred
+      (no cancellation token in `run_client`'s surface).
     - History: last run time + added/skipped/failed counts (SYNC-005) and
       last failure reason.
     - Settings: gate toggles + values (Wi-Fi-only, cellular, direct-only,

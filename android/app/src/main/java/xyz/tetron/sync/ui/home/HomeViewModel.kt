@@ -31,7 +31,19 @@ import xyz.tetron.sync.pipeline.SyncTarget
  *  started from Home must be observable from Progress). */
 sealed class RunPhase {
     data object Idle : RunPhase()
-    data class Running(val progress: SyncProgressEvent?) : RunPhase()
+
+    /** [progress] is the raw last engine event (kept for the Home
+     *  screen's one-line summary); [detail] is the aggregated view the
+     *  Progress screen renders (rate, ETA, live file list).
+     *  [startedAtMillis] is wall-clock at run start -- used to recognise a
+     *  run's completion in the history store even when it was started by
+     *  another trigger (periodic/network-change) and this ViewModel's own
+     *  `pipeline.run` call therefore returned [PipelineResult.AlreadyRunning]. */
+    data class Running(
+        val progress: SyncProgressEvent? = null,
+        val detail: RunProgressSnapshot? = null,
+        val startedAtMillis: Long = 0,
+    ) : RunPhase()
 
     /** [canOverride] mirrors [relaxedGateConfig] returning non-null --
      *  drives whether Home offers "Transfer anyway?" at all. */
@@ -46,6 +58,10 @@ data class HomeUiState(
     val rosterPeers: List<BridgePeer> = emptyList(),
     val mediaAccessGrant: MediaAccessGrant = MediaAccessGrant.NotGranted,
     val runPhase: RunPhase = RunPhase.Idle,
+    /** Most recent recorded run, polled from the history store -- lets the
+     *  screen fall out of [RunPhase.Running] when a run started elsewhere
+     *  (periodic/network-change trigger) finishes. */
+    val lastRun: RunRecord? = null,
 )
 
 /**
@@ -60,16 +76,40 @@ data class HomeUiState(
 class HomeViewModel(private val container: AppContainer) : ViewModel() {
     private val runPhase = MutableStateFlow<RunPhase>(RunPhase.Idle)
 
+    /** A failing [pollNow] (e.g. the cross-process bridge Binder call
+     *  throwing while tetron-mobile is saturated mid-transfer) must never
+     *  terminate this flow -- doing so would freeze [uiState] on its last
+     *  value for the rest of the process, so a run could complete with the
+     *  screen stuck on "Backing up…". On failure keep emitting the last
+     *  good snapshot and try again next tick. */
     private val polled = flow {
+        var last = HomeUiState()
         while (true) {
-            emit(pollNow())
+            last = runCatching { pollNow() }.getOrDefault(last)
+            emit(last)
             delay(POLL_INTERVAL_MILLIS)
         }
     }.flowOn(Dispatchers.IO)
 
     val uiState: StateFlow<HomeUiState> =
-        combine(polled, runPhase) { polled, phase -> polled.copy(runPhase = phase) }
-            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), HomeUiState())
+        combine(polled, runPhase) { polled, phase ->
+            // If we believe a run is in progress but the history store has
+            // recorded a run that started at/after this one, that run has
+            // finished (possibly one started by another trigger while our
+            // own `pipeline.run` call got AlreadyRunning) -- surface it so
+            // the screen never wedges on "Backing up…".
+            val effective = if (
+                phase is RunPhase.Running &&
+                phase.startedAtMillis > 0 &&
+                polled.lastRun != null &&
+                polled.lastRun.timestampMillis >= phase.startedAtMillis
+            ) {
+                RunPhase.Finished(polled.lastRun)
+            } else {
+                phase
+            }
+            polled.copy(runPhase = effective)
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), HomeUiState())
 
     fun backUpNow() = runInternal(overrideReason = null)
 
@@ -91,15 +131,53 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
     private fun runInternal(overrideReason: GateReason?) {
         if (runPhase.value is RunPhase.Running) return
         viewModelScope.launch(Dispatchers.IO) {
-            runPhase.value = RunPhase.Running(progress = null)
-            when (val result = container.pipeline.run(progress = LiveProgressListener(), overrideReason = overrideReason)) {
-                is PipelineResult.Ran -> runPhase.value = RunPhase.Finished(result.record)
-                is PipelineResult.Gated -> runPhase.value = RunPhase.Gated(
-                    reason = result.reason,
-                    canOverride = relaxedGateConfig(result.reason, container.settingsStore.gateConfig()) != null,
+            // Best-effort whole-run denominator for the byte progress bar +
+            // ETA. The engine's daemon path never reports an overall total
+            // (spec/sync.py SYNC-009 Progress), so use the in-scope backlog
+            // size -- close to the real transfer on a first backup, an
+            // over-estimate on a mostly-idempotent re-run (bar just fills
+            // fast then). `0` -> the Progress screen falls back to the
+            // file-count fraction.
+            val totalBytes = runCatching {
+                container.mediaAccess.backlogEstimate(container.settingsStore.backupScope()).includedBytes
+            }.getOrDefault(0L)
+            val startedAt = System.currentTimeMillis()
+            val tracker = RunProgressTracker(totalBytes)
+            runPhase.value = RunPhase.Running(detail = tracker.snapshot(), startedAtMillis = startedAt)
+            // The pipeline already turns a SyncException into a failed
+            // RunRecord; this guard is only for an unexpected throw (an FFI
+            // surprise, an observer callback fault) so a run can never leave
+            // the UI wedged on RunPhase.Running with no way out.
+            val phase = try {
+                when (val result = container.pipeline.run(
+                    progress = LiveProgressListener(tracker, startedAt),
+                    overrideReason = overrideReason,
+                )) {
+                    is PipelineResult.Ran -> RunPhase.Finished(result.record)
+                    is PipelineResult.Gated -> RunPhase.Gated(
+                        reason = result.reason,
+                        canOverride = relaxedGateConfig(result.reason, container.settingsStore.gateConfig()) != null,
+                    )
+                    // Another trigger owns the run; the history-store poll in
+                    // [uiState] will surface its completion.
+                    PipelineResult.AlreadyRunning -> null
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                android.util.Log.e("HomeViewModel", "backup run failed unexpectedly", e)
+                RunPhase.Finished(
+                    RunRecord(
+                        timestampMillis = System.currentTimeMillis(),
+                        added = 0,
+                        skipped = 0,
+                        failed = 1,
+                        interrupted = false,
+                        failureReason = e.message ?: e.javaClass.simpleName,
+                    ),
                 )
-                PipelineResult.AlreadyRunning -> Unit
             }
+            phase?.let { runPhase.value = it }
         }
     }
 
@@ -114,6 +192,7 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
             target = container.settingsStore.target(),
             rosterPeers = snapshot?.peers ?: emptyList(),
             mediaAccessGrant = container.mediaAccess.currentState().grant,
+            lastRun = container.historyStore.lastRun(),
         )
     }
 
@@ -127,9 +206,16 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
         }
     }
 
-    private inner class LiveProgressListener : SyncProgressListener {
+    private inner class LiveProgressListener(
+        private val tracker: RunProgressTracker,
+        private val startedAtMillis: Long,
+    ) : SyncProgressListener {
         override fun onProgress(event: SyncProgressEvent) {
-            runPhase.value = RunPhase.Running(progress = event)
+            runPhase.value = RunPhase.Running(
+                progress = event,
+                detail = tracker.onEvent(event),
+                startedAtMillis = startedAtMillis,
+            )
         }
     }
 
