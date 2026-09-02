@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 package xyz.tetron.sync.ui.progress
 
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -11,8 +10,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -21,12 +18,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import xyz.tetron.sync.pipeline.RunRecord
 import xyz.tetron.sync.pipeline.TransferredFileLine
+import xyz.tetron.sync.ui.TransferredFileList
 import xyz.tetron.sync.ui.describeGateReason
+import xyz.tetron.sync.ui.formatFileSize
 import xyz.tetron.sync.ui.home.HomeViewModel
 import xyz.tetron.sync.ui.home.RunPhase
 import xyz.tetron.sync.ui.home.RunProgressSnapshot
@@ -99,34 +97,7 @@ private fun LastRunView(lastRun: RunRecord?, files: List<TransferredFileLine>) {
         if (files.isEmpty()) {
             Text("Nothing new to back up", style = MaterialTheme.typography.bodyMedium)
         } else {
-            FileList(files, Modifier.fillMaxSize())
-        }
-    }
-}
-
-/** The newest-first "✓ path  ·  size" transfer list, shared by the live and
- *  the persisted views. */
-@Composable
-private fun FileList(lines: List<TransferredFileLine>, modifier: Modifier = Modifier) {
-    LazyColumn(modifier = modifier) {
-        items(lines) { line ->
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 3.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Text(
-                    "✓ ${line.path}",
-                    style = MaterialTheme.typography.bodySmall,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier
-                        .weight(1f, fill = false)
-                        .padding(end = 12.dp),
-                )
-                Text(formatBytes(line.bytes), style = MaterialTheme.typography.bodySmall)
-            }
+            TransferredFileList(files, Modifier.fillMaxSize())
         }
     }
 }
@@ -166,23 +137,12 @@ private fun RunningView(d: RunProgressSnapshot) {
         if (d.files.isEmpty()) {
             Text("Waiting for the first file…", style = MaterialTheme.typography.bodySmall)
         } else {
-            FileList(d.files, Modifier.fillMaxSize())
+            TransferredFileList(d.files, Modifier.fillMaxSize())
         }
     }
 }
 
-/** Coarse, human-readable byte size ("0 B", "4.2 MB", "61 GB"). */
-private fun formatBytes(bytes: Long): String {
-    if (bytes < 1024) return "$bytes B"
-    val units = listOf("KB", "MB", "GB", "TB")
-    var value = bytes.toDouble() / 1024
-    var unit = 0
-    while (value >= 1024 && unit < units.lastIndex) {
-        value /= 1024
-        unit++
-    }
-    return if (value >= 100) "${value.toInt()} ${units[unit]}" else "%.1f %s".format(value, units[unit])
-}
+private fun formatBytes(bytes: Long): String = formatFileSize(bytes)
 
 private fun formatRate(bytesPerSec: Double): String =
     if (bytesPerSec < 1.0) "—" else "${formatBytes(bytesPerSec.toLong())}/s"
