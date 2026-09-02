@@ -869,8 +869,36 @@ class SyncUi(Requirement):
       (periodic/network-change) owns it and the manual `pipeline.run` call
       therefore returned `AlreadyRunning`. Cancel affordance still deferred
       (no cancellation token in `run_client`'s surface).
-    - History: last run time + added/skipped/failed counts (SYNC-005) and
-      last failure reason.
+      Persistence (revised 2026-09-02): the transferred-file list is not
+      lost when the run ends. On completion it is written to a single file
+      in `context.filesDir` (newline-delimited `path` + tab + `bytes`),
+      overwritten when the next run enters its Running phase; the Progress
+      screen loads and shows it in the finished/idle state, not only while
+      Running. The in-run live list keeps its `MAX_LINES` (200) cap for
+      render performance under rapid updates; the retained/persisted view
+      is uncapped and scrolls in full. Only files that actually transferred
+      appear (skips, directories, symlinks do not), so a run that sent
+      nothing shows an explicit "Nothing new to back up", not a blank pane.
+    - History (revised 2026-09-02): a multi-run log, not a single record.
+      The last N run summaries (N = 25) are kept newest-first in a
+      `context.filesDir` JSONL file, one `RunRecord` per line (the existing
+      fields -- timestamp, added/skipped/failed, skippedOversize,
+      interrupted, cancelled, failureReason), oldest rotated out past N.
+      This supersedes the single-record `SharedPreferencesRunHistoryStore`
+      as the History-tab source (that store may stay as a fast-path mirror
+      of just the latest for Home's `lastRun()`, or be dropped --
+      implementation choice; `RunRecordCodec` is reused per line either
+      way). The transferred-file list from the Progress slice is retained
+      only for the most recent run; older rows carry the summary alone. The
+      History tab becomes a scrollable list, newest first; the top
+      (current/last) row expands to that file list, older rows show
+      timestamp + counts + interrupted/failure status. Clearable: a "Clear
+      history" text button at the bottom of the tab removes the past-run
+      rows but keeps the single most recent run, so Home's last-run line
+      and the Progress list stay meaningful. Clearing is informational only
+      -- it does not touch what is already on the receiver, `--partial`
+      resume state, or the next run's scope -- and the confirm dialog says
+      so. The N-cap already bounds growth, so there is no retention picker.
     - Settings: by default only two sections show -- gate toggles + values
       (Wi-Fi-only, cellular, direct-only, charging-required, low-battery
       threshold) and "What gets backed up" (scope). Everything a normal
@@ -1102,6 +1130,18 @@ class SyncUi(Requirement):
     device. SYNC-011 (final device verification) is the next requirement
     with a hard dependency on this one; SYNC-010 (home-side deliverable)
     remains independently parallelizable and still not started.
+
+    Revision 2026-09-02 (pending build): the Progress and History bullets
+    above gained persistence scope -- the transferred-file list survives a
+    run's end and process death, and History becomes a rotating 25-run log
+    with a Clear action. Pure app-side work (one `filesDir` file each, a
+    scrollable list, a confirm dialog); no FFI, no receiver change, no new
+    storage technology. Verified the same way as the rest of this
+    requirement: unit tests for log rotation / clear-keeps-latest / codec
+    round-trip, plus on-device (run, switch away and back, force-stop and
+    reopen -- list still there; a second run replaces it; Clear keeps the
+    latest row). Separately, SYNC-013 removes the preset selector from this
+    requirement's Settings screen.
     """
     req_id = "SYNC-009"
 
@@ -1491,6 +1531,14 @@ class SyncFilterControls(Requirement):
         notification (paired with A5's separate count).
     B6  Default extension sets as listed under control 1 -- accepted for v1.
 
+    Superseded by SYNC-013 (2026-09-02): A4 and B2 (the preset mechanism is
+    removed entirely). A2 STANDS for pre-29 (API 26-28) -- `RELATIVE_PATH`
+    is an API 29 column, so those devices keep the `DCIM/Camera`-only
+    recursive walk with no type or folder scope. B3 (size cap off by
+    default) stands. The default extension sets (B6) are widened with
+    `jpe`, `jfif`, `hif`. The `BackupScope()` default gains Raw = OFF for
+    new installs.
+
     ACCEPTANCE: JVM unit tests cover the scope model end to end -- the
     `ScopeFilter` decision for every toggle state (each type individually
     excluded with the right reason, "Other files" OFF restricting to the
@@ -1514,3 +1562,153 @@ class SyncFilterControls(Requirement):
     as SYNC-009.
     """
     req_id = "SYNC-012"
+
+
+class SyncSourceFolders(Requirement):
+    """REQUIREMENT-ID: SYNC-013
+
+    Source folders beyond `DCIM/Camera`, a tightened default backup scope,
+    and removal of the preset mechanism. Extends SYNC-008
+    (`AndroidMediaAccess`) and SYNC-012 (the `BackupScope` model); replaces
+    neither.
+
+    Design record: `DO-NOT-COMMIT/PLAN_tetron-mobile-sync_multi-source-
+    directories_2026-08-22.md` -- the 2026-08-22 narrowing to a fixed set,
+    then the "Consensus revision" (updated 2026-09-02) which is the current
+    shape and reverses that plan's "no toggle UI" line.
+
+    Dependencies: SYNC-008 (media access + `--files-from` staging),
+    SYNC-012 (scope model, backlog estimate, Preview sheet), SYNC-009 (the
+    Settings section these toggles live in). Should land after SYNC-011 is
+    closed out.
+
+    ## Folders
+
+    A fixed, closed set of standard MediaStore public directories -- no
+    SAF, no picker, no arbitrary user paths (SAF would mean `content://`
+    tree URIs oc-rsync cannot walk; ruled out with USER 2026-08-22). Two
+    of the three are user toggles; `DCIM/Camera` is the always-on baseline.
+
+    | Relative path  | Media types  | API  | Default                   |
+    |----------------|--------------|------|---------------------------|
+    | `DCIM/Camera/` | image, video | all  | always on, not a toggle   |
+    | `Pictures/`    | image, video | all  | OFF (toggle)              |
+    | `Recordings/`  | audio, video | 31+  | OFF (toggle, hidden < 31) |
+
+    `Pictures/` is matched with an EXACT `RELATIVE_PATH = 'Pictures/'`
+    predicate, not a `LIKE` prefix, so `Pictures/Screenshots/` and every
+    other subfolder is excluded by construction -- no extra rule needed.
+    The folder toggles live in the SYNC-009 "What gets backed up" section
+    under a "Folders" sub-label, styled like the existing type switches;
+    `DCIM/Camera` shows there as always-included.
+
+    `Recordings/` BYPASSES the type filters -- it mixes audio and video and
+    the SYNC-012 type model has no Audio bucket, so if the folder toggle is
+    on, everything the query returns transfers. `Pictures/` RESPECTS the
+    type filters, the same as `DCIM/Camera`.
+
+    ## Tightened default scope (new installs only)
+
+    The `BackupScope()` constructor defaults change:
+
+    | Flag              | Old | New     |
+    |-------------------|-----|---------|
+    | includeJpeg       | on  | on      |
+    | includeHeic       | on  | on      |
+    | includeVideos     | on  | on      |
+    | includeOtherFiles | on  | on      |
+    | includeRaw        | on  | **off** |
+
+    plus the two folder flags default off. Rationale: Raw is 25-80 MB/file
+    and a deliberate choice; `Pictures`/`Recordings` are opt-in with the
+    backlog estimate showing the one-time cost first. HEIC MUST stay on or
+    every HEIC-shooting phone backs up nothing. This affects fresh installs
+    only -- an existing install has its scope persisted and keeps it
+    (silently narrowing someone's backup is the "fails open" failure
+    SYNC-012 warns about).
+
+    ## Preset mechanism removed
+
+    `Preset`, `scopeForPreset`, `presetOf`, `PresetDropdownRow`, the
+    `preset` / `selectPreset` `SettingsViewModel` members, and their tests
+    all come out. With a short, fully-visible toggle list the presets were
+    pure sugar and spent most of their life showing "Custom". The default
+    is now just the `BackupScope()` constructor values. The only real loss
+    is Lean's bundle (raw-off + size-cap + bwlimit), which is three toggles
+    in the Advanced section. SYNC-012 decision-register entries A4 / B2
+    (preset behaviour) are void; B3 (size cap off by default) stands.
+
+    ## Classifier robustness
+
+    `MediaTypeSets.DEFAULT` gains `jpe`, `jfif` in the jpeg set and `hif`
+    in the heic set. Classification is already MIME-first with the
+    lowercased-extension set as fallback, so case (`.JPG`, `.MP4`) and the
+    common variants are handled; this closes the null-MIME + odd-extension
+    gap, which matters more once `Pictures/` (proportionally more
+    imported / edited files) is in scope.
+
+    ## Architecture (from the plan, unchanged)
+
+    - `AndroidMediaAccess`: replace the single `CAMERA_RELATIVE_PATH`
+      constant with a `MediaSourceDir` table (relative path, media types,
+      min API level). For each active dir (toggle on AND
+      `Build.VERSION.SDK_INT >= minApi`) run the existing per-directory
+      `MediaStore.Files` query, prefix each `DISPLAY_NAME` with the dir's
+      relative path, keep the SYNC-011 stale-row `File(root, prefixed)
+      .exists()` guard, append to ONE combined staged list. Single file,
+      single transfer run.
+    - `rootPath` is the external-storage root (already true for the API 29+
+      path); `--files-from` entries carry the directory prefix
+      (`DCIM/Camera/x.jpg`, `Pictures/y.png`, `Recordings/z.m4a`).
+      oc-rsync rebuilds that tree under the push destination, so the
+      receiver mirrors it with NO receiver-side change -- one shared
+      module, subdirectories for free.
+    - Keep the pre-API-29 (26-28) branch as the `DCIM/Camera`-only recursive
+      walk it already is: `RELATIVE_PATH` is an API 29 column, so the
+      multi-directory MediaStore query cannot run there, and the type scope
+      never applied there either (SYNC-012 A2 stands). Folder toggles are
+      an API 29+ feature. The multi-dir MediaStore staging IS unconditional
+      from API 29 up (there is no separate pre-33 path).
+    - The SYNC-012 backlog estimate and Preview bottom sheet MUST union in
+      the enabled folders -- they scan only `DCIM/Camera` today, and the
+      estimate is the only thing that shows the one-time cost before a
+      folder toggle is committed.
+
+    ## Non-goals
+
+    SAF / arbitrary picked folders; `Pictures/Screenshots`, `Movies`,
+    `Download`, and the WhatsApp / Telegram / Signal app folders (the
+    "replaceable" set); a per-directory retention or age filter; multiple
+    backup targets (unrelated axis).
+
+    ## Device gap
+
+    `Pictures/` is fully verifiable on the LG V40 (API 29).
+    `Environment.DIRECTORY_RECORDINGS` is API 31+ and no roster device
+    covers API 30+, so the `Recordings/` path -- and any confidence about
+    API 33/34 Scoped-Storage behaviour for this feature at all -- blocks on
+    a device acquisition (the same gap SYNC-011's delete-consent flow has).
+    Option: ship `Pictures/` first, `Recordings/` as a follow-up once a
+    device exists.
+
+    ACCEPTANCE: JVM unit tests -- the `MediaSourceDir` table drives the
+    per-directory query construction; API-level gating excludes
+    `Recordings/` below 31; the exact-match predicate excludes
+    `Pictures/Screenshots/`; the combined staged list carries prefixed
+    paths with no cross-directory name collision; `Recordings/` entries
+    bypass the type filters while `Pictures/` entries obey them; the
+    widened `MediaTypeSets` classifies `.jpe` / `.jfif` / `.hif`; the
+    `BackupScope()` defaults are the tightened set; every `Preset` symbol
+    is gone and nothing references it. `SettingsStore`'s scope round trip
+    keeps the thin-adapter convention (no unit test). `:app:
+    testDebugUnitTest`, `:app:assembleDebug`, `cargo test`, and `python3
+    reconcile.py` all green. On-device (LG V40): a run with `Pictures/`
+    toggled on stages and transfers `Pictures/`-prefixed entries, the
+    receiver tree mirrors it, the stale-row guard still holds, and the
+    backlog estimate reflects the folder before the run.
+    ENFORCEMENT: the media-source + scope-model unit tests are the
+    automated gate; the Compose toggles and the on-device multi-folder run
+    are manual, same bar as SYNC-009 / 012. `Recordings/` on-device
+    verification is explicitly deferred to an API 31+ device.
+    """
+    req_id = "SYNC-013"

@@ -12,7 +12,9 @@ import org.junit.Test
  */
 class ScopeFilterTest {
 
-    private val all = BackupScope() // every include ON, no caps
+    // every include ON, no caps -- Raw is off in the SYNC-013 default, so
+    // set it explicitly to keep this an "everything permitted" baseline.
+    private val all = BackupScope(includeRaw = true)
 
     // --- classify: MIME first (decision A3) ---
 
@@ -46,6 +48,13 @@ class ScopeFilterTest {
     @Test fun classify_jpeg_by_extension_case_insensitive() {
         assertEquals(MediaKind.Jpeg, ScopeFilter.classify("PHOTO.JPG", null))
         assertEquals(MediaKind.Jpeg, ScopeFilter.classify("photo.jpeg", null))
+    }
+
+    @Test fun classify_sync013_jpeg_heic_variants_by_extension() {
+        // SYNC-013 widened MediaTypeSets.DEFAULT for the null-MIME case.
+        assertEquals(MediaKind.Jpeg, ScopeFilter.classify("scan.jpe", null))
+        assertEquals(MediaKind.Jpeg, ScopeFilter.classify("download.JFIF", null))
+        assertEquals(MediaKind.Heic, ScopeFilter.classify("IMG.hif", null))
     }
 
     @Test fun classify_unknown_is_other() {

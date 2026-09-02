@@ -44,7 +44,7 @@ import xyz.tetron.sync.scope.BackupScope
 import xyz.tetron.sync.scope.MediaEntry
 import xyz.tetron.sync.scope.MediaKind
 import xyz.tetron.sync.pipeline.SyncTarget
-import xyz.tetron.sync.scope.Preset
+import xyz.tetron.sync.ui.EyebrowTextStyle
 import xyz.tetron.sync.ui.MonoTextStyle
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -109,11 +109,9 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
         Spacer(Modifier.height(24.dp))
         WhatGetsBackedUpSection(
             scope = state.backupScope,
-            preset = state.preset,
             estimate = state.estimate,
             estimateLoading = state.estimateLoading,
             onScopeChange = viewModel::setBackupScope,
-            onPresetChange = viewModel::selectPreset,
         )
 
         Spacer(Modifier.height(24.dp))
@@ -321,13 +319,6 @@ private const val DEFAULT_BWLIMIT_KIB = 1_024L
 
 private const val BYTES_PER_MB = 1024L * 1024L
 
-private fun presetLabel(preset: Preset): String = when (preset) {
-    Preset.Everything -> "Everything"
-    Preset.PhotosOnly -> "Photos only"
-    Preset.Lean -> "Lean"
-    Preset.Custom -> "Custom"
-}
-
 private fun kindLabel(kind: MediaKind): String = when (kind) {
     MediaKind.Jpeg -> "JPEG photos"
     MediaKind.Heic -> "HEIC photos"
@@ -357,16 +348,11 @@ private fun formatBytes(bytes: Long): String {
 @Composable
 private fun WhatGetsBackedUpSection(
     scope: BackupScope,
-    preset: Preset,
     estimate: BacklogEstimate,
     estimateLoading: Boolean,
     onScopeChange: (BackupScope) -> Unit,
-    onPresetChange: (Preset) -> Unit,
 ) {
     SectionHeader("What gets backed up")
-
-    PresetDropdownRow(preset = preset, onPresetChange = onPresetChange)
-    Spacer(Modifier.height(8.dp))
 
     SwitchRow("JPEG photos", scope.includeJpeg) { onScopeChange(scope.copy(includeJpeg = it)) }
     SwitchRow("HEIC photos", scope.includeHeic) { onScopeChange(scope.copy(includeHeic = it)) }
@@ -375,6 +361,16 @@ private fun WhatGetsBackedUpSection(
     SwitchRow("Other files", scope.includeOtherFiles) { onScopeChange(scope.copy(includeOtherFiles = it)) }
     Text(
         "\"Other files\" covers anything new your camera starts saving. Turn it off and only the types above are backed up.",
+        style = MaterialTheme.typography.bodySmall,
+    )
+
+    Spacer(Modifier.height(16.dp))
+    Text("FOLDERS", style = MaterialTheme.typography.labelLarge.merge(EyebrowTextStyle))
+    Spacer(Modifier.height(4.dp))
+    Text("Camera roll (always backed up)", style = MaterialTheme.typography.bodyLarge)
+    SwitchRow("Pictures", scope.includePictures) { onScopeChange(scope.copy(includePictures = it)) }
+    Text(
+        "Loose photos and videos in your Pictures folder (app exports, saved images). Screenshots and app subfolders are not included. The types above still apply.",
         style = MaterialTheme.typography.bodySmall,
     )
 
@@ -395,38 +391,6 @@ private fun WhatGetsBackedUpSection(
 
     Spacer(Modifier.height(12.dp))
     BacklogEstimateCard(estimate = estimate, loading = estimateLoading)
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun PresetDropdownRow(preset: Preset, onPresetChange: (Preset) -> Unit) {
-    var expanded by remember { mutableStateOf(false) }
-    // Custom is shown as the current value once a field is hand-edited, but
-    // it is not a selectable template.
-    val choices = listOf(Preset.Everything, Preset.PhotosOnly, Preset.Lean)
-    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
-        OutlinedTextField(
-            value = presetLabel(preset),
-            onValueChange = {},
-            readOnly = true,
-            label = { Text("Preset") },
-            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-            modifier = Modifier
-                .fillMaxWidth()
-                .menuAnchor(),
-        )
-        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            choices.forEach { choice ->
-                DropdownMenuItem(
-                    text = { Text(presetLabel(choice)) },
-                    onClick = {
-                        onPresetChange(choice)
-                        expanded = false
-                    },
-                )
-            }
-        }
-    }
 }
 
 @Composable

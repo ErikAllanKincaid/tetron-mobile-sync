@@ -22,9 +22,6 @@ import xyz.tetron.sync.pipeline.SyncTarget
 import xyz.tetron.sync.settings.DeviceLabel
 import xyz.tetron.sync.scope.BacklogEstimate
 import xyz.tetron.sync.scope.BackupScope
-import xyz.tetron.sync.scope.Preset
-import xyz.tetron.sync.scope.presetOf
-import xyz.tetron.sync.scope.scopeForPreset
 
 data class SettingsUiState(
     val gateConfig: GateConfig = GateConfig(),
@@ -34,11 +31,10 @@ data class SettingsUiState(
     val workCadenceHours: Long? = null,
     val ownMeshIp: String? = null,
     val engineInfoLine: String = "",
-    /** SYNC-012: the persistent backup scope + its derived [Preset] + the
-     *  local backlog estimate ([estimateLoading] while the `MediaStore`
-     *  aggregate query is in flight). */
+    /** SYNC-012: the persistent backup scope + the local backlog estimate
+     *  ([estimateLoading] while the `MediaStore` aggregate query is in
+     *  flight). */
     val backupScope: BackupScope = BackupScope(),
-    val preset: Preset = Preset.Everything,
     val estimate: BacklogEstimate = BacklogEstimate.EMPTY,
     val estimateLoading: Boolean = false,
     /** Non-null while the advanced "Receiver module name" override field
@@ -81,7 +77,6 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
                 workCadenceHours = store.workCadenceHours(),
                 engineInfoLine = AppInfo.describeEngine("${BuildConfig.VERSION_NAME} (${BuildConfig.GIT_SHA})"),
                 backupScope = scope,
-                preset = presetOf(scope),
             )
         }
         refreshEstimate(scope)
@@ -152,25 +147,16 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
         container.applyPeriodicSchedule()
     }
 
-    // --- SYNC-012: backup scope, presets, backlog estimate ---
+    // --- SYNC-012: backup scope, backlog estimate ---
 
     private var estimateJob: Job? = null
 
-    /** Persist [scope], recompute the derived [Preset] (editing any field
-     *  is what flips the selector to [Preset.Custom]), and kick a fresh
-     *  estimate. Straight-through write like the gate setters. */
+    /** Persist [scope] and kick a fresh estimate. Straight-through write
+     *  like the gate setters. */
     fun setBackupScope(scope: BackupScope) {
         container.settingsStore.setBackupScope(scope)
-        _uiState.update { it.copy(backupScope = scope, preset = presetOf(scope)) }
+        _uiState.update { it.copy(backupScope = scope) }
         refreshEstimate(scope)
-    }
-
-    /** One-tap preset: expand it to a [BackupScope] and persist. Selecting
-     *  [Preset.Custom] is a no-op (it is not a template -- it is what the
-     *  selector shows once a field has been hand-edited). */
-    fun selectPreset(preset: Preset) {
-        if (preset == Preset.Custom) return
-        setBackupScope(scopeForPreset(preset, _uiState.value.backupScope))
     }
 
     /** Recompute the local backlog estimate off the main thread. The

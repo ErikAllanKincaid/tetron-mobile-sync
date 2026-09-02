@@ -24,9 +24,32 @@ class ScopeSelectionTest {
 
     // --- selectInScope ---
 
-    @Test fun default_scope_includes_everything() {
-        val sel = selectInScope(roll, BackupScope())
+    @Test fun everything_on_includes_everything() {
+        val sel = selectInScope(roll, BackupScope(includeRaw = true))
         assertEquals(roll.map { it.displayName }, sel.includedNames)
+        assertEquals(0, sel.oversizeSkippedCount)
+    }
+
+    @Test fun sync013_default_scope_flags() {
+        val d = BackupScope()
+        assertEquals(true, d.includeJpeg)
+        assertEquals(true, d.includeHeic)
+        assertEquals(true, d.includeVideos)
+        assertEquals(true, d.includeOtherFiles)
+        assertEquals(false, d.includeRaw)
+        assertEquals(false, d.includePictures)
+        assertEquals(null, d.maxSizeBytes)
+        assertEquals(null, d.bwlimitKib)
+    }
+
+    @Test fun sync013_default_scope_drops_raw() {
+        // SYNC-013: the new-install default has Raw OFF -- the two .dng
+        // siblings are excluded, everything else in the roll stays.
+        val sel = selectInScope(roll, BackupScope())
+        assertEquals(
+            listOf("IMG_1.jpg", "IMG_2.jpg", "VID_1.mp4", "VID_2.mp4", "MOTION.webp"),
+            sel.includedNames,
+        )
         assertEquals(0, sel.oversizeSkippedCount)
     }
 
@@ -48,7 +71,7 @@ class ScopeSelectionTest {
     }
 
     @Test fun other_files_off_restricts_to_known_sets() {
-        val sel = selectInScope(roll, BackupScope(includeOtherFiles = false))
+        val sel = selectInScope(roll, BackupScope(includeRaw = true, includeOtherFiles = false))
         assertEquals(false, sel.includedNames.contains("MOTION.webp"))
         assertEquals(roll.size - 1, sel.includedNames.size)
     }

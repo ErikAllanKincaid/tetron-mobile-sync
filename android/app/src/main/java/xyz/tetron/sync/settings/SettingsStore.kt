@@ -30,9 +30,8 @@ interface SettingsStore {
     /** SYNC-012: the one persistent backup scope every trigger path applies
      *  when it builds the `--files-from` list. Read fresh per run, same
      *  live-read contract as [gateConfig] -- a Settings toggle takes effect
-     *  on the very next run. The selected [xyz.tetron.sync.scope.Preset] is
-     *  not stored: it is derived from the scope
-     *  ([xyz.tetron.sync.scope.presetOf]). */
+     *  on the very next run. SYNC-013 removed the preset layer: the scope is
+     *  just the toggle values. */
     fun backupScope(): BackupScope
     fun setBackupScope(scope: BackupScope)
 

@@ -11,27 +11,39 @@ package xyz.tetron.sync.scope
  * all at once). Files "come back" only when the user widens this scope,
  * which correctly means "back these up from now on too".
  *
- * The five include flags all default ON, so the out-of-the-box behavior is
- * "everything in DCIM/Camera". [includeOtherFiles] is the catch-all: it is
- * the only flag that stops an *unrecognised* type from uploading, so a new
- * capture format (`.webp`, a motion-photo container, a burst format) is
- * never dropped silently -- it stays covered until the user makes a
- * deliberate choice to turn the catch-all off.
+ * SYNC-013: the out-of-the-box scope for a NEW install is JPEG + HEIC +
+ * Video + Other on, Raw **off** (`.dng` files are 25-80 MB each and a
+ * deliberate choice). An existing install keeps whatever it had --
+ * `SharedPreferencesSettingsStore.backupScope()` only applies the tighter
+ * Raw default when the prefs file is empty, so a running backup is never
+ * silently narrowed. [includeOtherFiles] is the catch-all: it is the only
+ * flag that stops an *unrecognised* type from uploading, so a new capture
+ * format (`.webp`, a motion-photo container, a burst format) is never
+ * dropped silently -- it stays covered until the user makes a deliberate
+ * choice to turn the catch-all off, which is why it defaults on even in the
+ * tightened set.
  *
  * [bwlimitKib] is not a file-selection field -- [ScopeFilter] ignores it --
- * but it rides in this class because it is persisted in the same place and
- * the [Preset]s span it (Lean sets a ceiling). The pipeline copies it into
- * `SyncRunOptions.bwlimit_kib` (SYNC-002's existing FFI field).
+ * but it rides in this class because it is persisted in the same place. The
+ * pipeline copies it into `SyncRunOptions.bwlimit_kib` (SYNC-002's existing
+ * FFI field).
+ *
+ * SYNC-013: [includePictures] is a source-*directory* flag, not a file
+ * type -- it adds the top level of `Pictures/` (never its subfolders, so
+ * `Pictures/Screenshots/` stays out) to the roster. It defaults off and is
+ * orthogonal to the type flags: a `Pictures/` file still has to pass the
+ * JPEG/HEIC/Raw/Video/Other toggles.
  *
  * `null` for [maxSizeBytes] / [bwlimitKib] means "no cap" / "no limit"
- * (both default OFF, decision B3/B4).
+ * (both default OFF, decision B3).
  */
 data class BackupScope(
     val includeJpeg: Boolean = true,
     val includeHeic: Boolean = true,
-    val includeRaw: Boolean = true,
+    val includeRaw: Boolean = false,
     val includeVideos: Boolean = true,
     val includeOtherFiles: Boolean = true,
+    val includePictures: Boolean = false,
     val maxSizeBytes: Long? = null,
     val bwlimitKib: Long? = null,
 )
@@ -64,9 +76,10 @@ sealed interface ScopeDecision {
 
 /**
  * The extension sets backing the named [MediaKind]s. v1 ships [DEFAULT]
- * (decision B6); the v1.1 overflow-menu editor mutates a stored copy of
- * this and hands it to [ScopeFilter] -- which is exactly why the sets are a
- * parameter, not inlined into the classifier (decision B1).
+ * (decision B6, widened by SYNC-013 with the common JPEG/HEIC variants);
+ * the v1.1 overflow-menu editor mutates a stored copy of this and hands it
+ * to [ScopeFilter] -- which is exactly why the sets are a parameter, not
+ * inlined into the classifier (decision B1).
  *
  * Extensions are lowercase, no leading dot.
  */
@@ -78,55 +91,10 @@ data class MediaTypeSets(
 ) {
     companion object {
         val DEFAULT = MediaTypeSets(
-            jpeg = setOf("jpg", "jpeg"),
-            heic = setOf("heic", "heif"),
+            jpeg = setOf("jpg", "jpeg", "jpe", "jfif"),
+            heic = setOf("heic", "heif", "hif"),
             raw = setOf("dng", "raw", "arw", "nef", "cr2", "cr3", "rw2", "orf", "raf", "srw"),
             video = setOf("mp4", "mov", "3gp", "m4v", "mkv", "webm"),
         )
     }
-}
-
-/**
- * SYNC-012: one-tap layers over [BackupScope]. Selecting a preset populates
- * the fields; editing any field flips the selection back to [Custom]
- * ([presetOf] recomputes it). Only "which preset is selected" plus the
- * field values are persisted -- there is no independent preset store.
- */
-enum class Preset { Everything, PhotosOnly, Lean, Custom }
-
-/**
- * Lean's size cap and bandwidth ceiling. Starting values, tunable -- the
- * spec calls them "~1 GB" and "a single unconditional value"; nothing in
- * the decision register pins an exact number.
- */
-const val LEAN_MAX_SIZE_BYTES: Long = 1L * 1024 * 1024 * 1024
-const val LEAN_BWLIMIT_KIB: Long = 2048
-
-/**
- * The [BackupScope] a [preset] expands to. [Preset.Custom] is not a
- * template -- it returns [current] unchanged (the caller keeps whatever the
- * user has set).
- */
-fun scopeForPreset(preset: Preset, current: BackupScope): BackupScope = when (preset) {
-    Preset.Everything -> BackupScope()
-    Preset.PhotosOnly -> BackupScope(includeVideos = false)
-    Preset.Lean -> BackupScope(
-        includeRaw = false,
-        maxSizeBytes = LEAN_MAX_SIZE_BYTES,
-        bwlimitKib = LEAN_BWLIMIT_KIB,
-    )
-    Preset.Custom -> current
-}
-
-/**
- * Which [Preset] a scope currently represents -- [Preset.Custom] when it
- * matches none of the built-in templates. The `current` argument passed to
- * [scopeForPreset] is irrelevant for the non-Custom cases (they ignore it),
- * so plain data-class equality is the match.
- */
-fun presetOf(scope: BackupScope): Preset = when (scope) {
-    scopeForPreset(Preset.Everything, scope) -> Preset.Everything
-    scopeForPreset(Preset.PhotosOnly, scope) -> Preset.PhotosOnly
-    scopeForPreset(Preset.Lean, scope) -> Preset.Lean
-    else -> Preset.Custom
 }

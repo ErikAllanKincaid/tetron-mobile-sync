@@ -107,12 +107,24 @@ class SharedPreferencesSettingsStore(
 
     override fun backupScope(): BackupScope {
         val d = BackupScope()
+        // SYNC-013: Raw defaults OFF for a new install, but an existing
+        // install that never opened the scope UI has no KEY_SCOPE_RAW and
+        // must keep the old ON -- never silently narrow a running backup.
+        // "Existing" == the prefs file already holds some other key; a
+        // genuinely fresh install has an empty file. Once any scope toggle
+        // is saved, setBackupScope writes every key and this stops
+        // mattering.
+        val rawDefault = if (prefs.all.isEmpty()) d.includeRaw else true
         return BackupScope(
             includeJpeg = prefs.getBoolean(KEY_SCOPE_JPEG, d.includeJpeg),
             includeHeic = prefs.getBoolean(KEY_SCOPE_HEIC, d.includeHeic),
-            includeRaw = prefs.getBoolean(KEY_SCOPE_RAW, d.includeRaw),
+            includeRaw = prefs.getBoolean(KEY_SCOPE_RAW, rawDefault),
             includeVideos = prefs.getBoolean(KEY_SCOPE_VIDEOS, d.includeVideos),
             includeOtherFiles = prefs.getBoolean(KEY_SCOPE_OTHER_FILES, d.includeOtherFiles),
+            // SYNC-013 folder flag: default off, safe for a new or existing
+            // install alike (an existing user just does not get Pictures
+            // until they opt in).
+            includePictures = prefs.getBoolean(KEY_SCOPE_PICTURES, d.includePictures),
             // A real cap/limit is always > 0; -1 is the "unset" sentinel
             // (SharedPreferences has no nullable Long).
             maxSizeBytes = prefs.getLong(KEY_SCOPE_MAX_SIZE_BYTES, -1L).takeIf { it > 0 },
@@ -127,6 +139,7 @@ class SharedPreferencesSettingsStore(
             .putBoolean(KEY_SCOPE_RAW, scope.includeRaw)
             .putBoolean(KEY_SCOPE_VIDEOS, scope.includeVideos)
             .putBoolean(KEY_SCOPE_OTHER_FILES, scope.includeOtherFiles)
+            .putBoolean(KEY_SCOPE_PICTURES, scope.includePictures)
             .putLong(KEY_SCOPE_MAX_SIZE_BYTES, scope.maxSizeBytes ?: -1L)
             .putLong(KEY_SCOPE_BWLIMIT_KIB, scope.bwlimitKib ?: -1L)
             .apply()
@@ -168,6 +181,7 @@ class SharedPreferencesSettingsStore(
         private const val KEY_SCOPE_RAW = "scope_include_raw"
         private const val KEY_SCOPE_VIDEOS = "scope_include_videos"
         private const val KEY_SCOPE_OTHER_FILES = "scope_include_other_files"
+        private const val KEY_SCOPE_PICTURES = "scope_include_pictures"
         private const val KEY_SCOPE_MAX_SIZE_BYTES = "scope_max_size_bytes"
         private const val KEY_SCOPE_BWLIMIT_KIB = "scope_bwlimit_kib"
     }
