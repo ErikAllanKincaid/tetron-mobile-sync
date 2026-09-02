@@ -479,11 +479,11 @@ class SyncTransferPipeline(Requirement):
     - Destination path (amended 2026-08-31, SYNC-010): the client writes
       into `rsync://<ip>:<port>/<module>/<device-label>/...`, i.e. the
       configured module root plus a per-device top path component, so one
-      receiver module holds every device. `<device-label>` is a SYNC-009
-      setting (user-editable, stable first-run-UUID fallback); the run
-      passes `--mkpath` so rsync creates that component under the module
-      root on first use -- the receiver never pre-seeds it and needs no
-      per-device config. `--files-from` entries are staged as
+      receiver module holds every device. `<device-label>` is derived once
+      from the phone's mesh hostname (fallback `phone-<8hex>`), not a user
+      setting (revised 2026-09-01); the run passes `--mkpath` so rsync
+      creates that component under the module root on first use -- the
+      receiver never pre-seeds it and needs no per-device config. `--files-from` entries are staged as
       MediaStore-relative paths (`DCIM/Camera/<name>`), not bare
       filenames, so the receiver tree mirrors the phone's.
     - Run history: last run time, added/skipped/failed counts -- added and
@@ -877,11 +877,11 @@ class SyncUi(Requirement):
       (advanced) the module-name override, default `tetron-sync`, blank
       clears it (revised 2026-09-01: the module name is no longer a
       user-facing field on Home; it is a coordinated default set once, like
-      the port); an "Advanced" section with the bandwidth cap and the
-      device-label override -- the per-device top path component on the
-      receiver, defaulting to this phone's mesh hostname (else
-      `phone-<8hex>`), SYNC-010; delete-after-backup opt-in; the
-      periodic-backup interval (opt-in, default "Never"). The notification
+      the port); a collapsed "Advanced" expander (bandwidth cap only --
+      closed by default; revised 2026-09-01, the device-label field was
+      removed, the per-device folder is derived from the mesh hostname,
+      SYNC-010); delete-after-backup opt-in; the periodic-backup interval
+      (opt-in, default "Never"). The notification
       coalescing window is NOT a setting (fixed ~6h). Mesh-peer selection
       is on Home. (No own-mesh-IP copy button -- removed 2026-08-31; the
       receiver allow-lists this phone by hostname from its own roster,
@@ -1015,8 +1015,9 @@ class SyncUi(Requirement):
     the home side is `tetron-sync-receiver`, which allow-lists a phone by
     hostname resolved from its own tetron IPC roster (`allow add`), so
     the phone never needs to surface or copy its mesh IP. `LocalClipboard
-    Manager` and the button drop out; the device-label field (SYNC-010,
-    now under Advanced) takes its place.
+    Manager` and the button drop out. (A device-label field briefly stood
+    in its place under Advanced; removed 2026-09-01 -- the label is derived
+    from the mesh hostname with no user field, SYNC-010.)
 
     `TetronSyncTheme` (`xyz.tetron.sync.ui.Theme.kt`) matches
     tetron-mobile's own green brand palette (same hex values as
@@ -1155,12 +1156,13 @@ class SyncHomeSideDeliverable(Requirement):
       via `ClientConfig::builder().mkpath(true)` (fork already supports it
       and honors it for daemon sends -- `vendor/oc-rsync/crates/core/src/
       client/remote/invocation/builder.rs`; no fork patch). UniFFI regen.
-    - `SyncTarget` gains `deviceLabel`; SYNC-009 Advanced field + validator
-      (one safe path component: no `/`, `..`, leading `.`, empty). The
-      first-run default is the phone's own mesh hostname (MOBILE-024
-      `ownHostname`), falling back to `phone-<8hex>` only when no usable
-      hostname is available; snapshot once, not live-bound. A label edit
-      warns (starts a new receiver dir, orphans the old).
+    - `SyncTarget` gains `deviceLabel`; NOT a user field (revised
+      2026-09-01). The store seeds it once from the phone's own mesh
+      hostname (MOBILE-024 `ownHostname`), normalised to one safe path
+      component, falling back to `phone-<8hex>` only when no usable
+      hostname is available; snapshot once, not live-bound. Cross-network
+      hostname repeat (a rare multi-phone / multi-network case) is a known
+      edge -- a future fallback could append a digit -- not worth a field.
     - `SyncPipeline` appends `/<deviceLabel>` to the destination and sets
       `mkpath = true`.
     - `AndroidMediaAccess` stages `--files-from` entries as
