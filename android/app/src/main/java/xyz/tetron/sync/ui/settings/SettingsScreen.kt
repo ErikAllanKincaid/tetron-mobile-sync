@@ -45,21 +45,24 @@ import xyz.tetron.sync.scope.MediaEntry
 import xyz.tetron.sync.scope.MediaKind
 import xyz.tetron.sync.pipeline.SyncTarget
 import xyz.tetron.sync.scope.Preset
+import xyz.tetron.sync.ui.MonoTextStyle
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
 /**
  * SYNC-009 Settings screen. Mesh-peer selection lives on Home
- * ([xyz.tetron.sync.ui.home.HomeScreen]); this screen carries gate toggles,
- * what-gets-backed-up scope, a collapsed "Advanced" expander (bandwidth
- * cap), delete-after-backup opt-in, the periodic-backup interval (opt-in,
- * "Never" by default), and a bottom "Connection" section holding the two
- * values that must match the receiver exactly -- the port and, for advanced
- * setups, the module name. The per-device folder name is derived from the
- * phone's mesh hostname automatically (SYNC-010) and has no field here.
- * Notification channel copy is a separate, not-yet-built slice (spec/sync.py:
- * "exact copy is implementation-time").
+ * ([xyz.tetron.sync.ui.home.HomeScreen]). By default this screen shows only
+ * two sections -- gate toggles and what-gets-backed-up scope. Everything a
+ * normal user never touches is folded into one collapsed "Advanced"
+ * expander ([AdvancedSection]), in order: upload bandwidth cap,
+ * delete-after-backup opt-in, the periodic-backup interval (opt-in, "Never"
+ * by default), and a "Connection" block with the two values that must match
+ * the receiver exactly -- the port and the module-name override. The
+ * per-device folder name is derived from the phone's mesh hostname
+ * automatically (SYNC-010) and has no field here. Notification channel copy
+ * is a separate, not-yet-built slice (spec/sync.py: "exact copy is
+ * implementation-time").
  */
 @Composable
 fun SettingsScreen(viewModel: SettingsViewModel) {
@@ -117,52 +120,23 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
         AdvancedSection(
             scope = state.backupScope,
             onScopeChange = viewModel::setBackupScope,
-        )
-
-        Spacer(Modifier.height(24.dp))
-        SectionHeader("Delete after backup")
-        SwitchRow("Delete photos from this device once backed up", state.deleteAfterBackupEnabled) {
-            viewModel.setDeleteAfterBackupEnabled(it)
-        }
-        Text(
-            "Off by default. Only files this run actually transferred are ever deleted, and the system always asks to confirm. Types you turn off above stay on your phone.",
-            style = MaterialTheme.typography.bodySmall,
-        )
-
-        Spacer(Modifier.height(24.dp))
-        SectionHeader("Schedule")
-        PeriodicIntervalRow(
-            value = state.workCadenceHours,
-            onValueChange = viewModel::setWorkCadenceHours,
-        )
-        Text(
-            "Off by default. \"Back up now\" on the Home screen always works regardless of this.",
-            style = MaterialTheme.typography.bodySmall,
-        )
-
-        // Port and the module name are the two values that must match the
-        // receiver exactly or the connection fails -- install-once,
-        // rarely touched, so they sit in their own section at the bottom
-        // rather than up top.
-        Spacer(Modifier.height(24.dp))
-        SectionHeader("Connection")
-        IntSettingRow(
-            label = "Port",
-            value = state.target?.port ?: 28873,
-            onValueChange = viewModel::setTargetPort,
-        )
-        PortWarning()
-        Spacer(Modifier.height(16.dp))
-        ModuleNameField(
+            deleteAfterBackupEnabled = state.deleteAfterBackupEnabled,
+            onDeleteAfterBackupChange = viewModel::setDeleteAfterBackupEnabled,
+            workCadenceHours = state.workCadenceHours,
+            onWorkCadenceChange = viewModel::setWorkCadenceHours,
             target = state.target,
-            error = state.moduleNameError,
-            onCommit = viewModel::setTargetModule,
+            moduleNameError = state.moduleNameError,
+            onPortChange = viewModel::setTargetPort,
+            onModuleCommit = viewModel::setTargetModule,
         )
 
         Spacer(Modifier.height(32.dp))
         HorizontalDivider()
         Spacer(Modifier.height(8.dp))
-        Text(state.engineInfoLine, style = MaterialTheme.typography.bodySmall)
+        Text(
+            state.engineInfoLine,
+            style = MaterialTheme.typography.bodySmall.merge(MonoTextStyle),
+        )
     }
 }
 
@@ -170,13 +144,23 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
  * The phone's own mesh IP, informational only (SYNC-010, amended
  * 2026-08-31): the receiver allow-lists this phone by hostname from its own
  * mesh roster (`tetron-sync-receiver allow add-peer <hostname>`), so there
- * is nothing for the user to copy or transcribe here.
+ * is nothing for the user to copy or transcribe here. The address itself is
+ * rendered in [MonoTextStyle], the same as tetron-mobile shows mesh IPs.
  */
 @Composable
 private fun OwnMeshIpRow(ownMeshIp: String?) {
+    if (ownMeshIp == null) {
+        Text(
+            "This device's mesh IP is not available yet",
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        return
+    }
+    Text("This device's mesh IP", style = MaterialTheme.typography.bodySmall)
     Text(
-        text = ownMeshIp?.let { "This device's mesh IP: $it" } ?: "This device's mesh IP is not available yet",
-        style = MaterialTheme.typography.bodyMedium,
+        ownMeshIp,
+        style = MaterialTheme.typography.bodyMedium.merge(MonoTextStyle),
         modifier = Modifier.fillMaxWidth(),
     )
 }
@@ -560,19 +544,31 @@ private fun LargestRow(entry: MediaEntry) {
 }
 
 /**
- * Collapsed by default -- a normal user never needs anything in here. Just
- * the bandwidth cap now; the per-device folder name is derived from the
- * mesh hostname automatically (SYNC-010) with no field.
+ * Collapsed by default -- a normal user never needs anything in here. Holds,
+ * in order: the upload bandwidth cap, delete-after-backup opt-in, the
+ * periodic-backup interval, and a "Connection" block with the port and the
+ * rsync module-name override (the two values that must match the receiver
+ * exactly). The per-device folder name is derived from the mesh hostname
+ * automatically (SYNC-010) with no field.
  */
 @Composable
 private fun AdvancedSection(
     scope: BackupScope,
     onScopeChange: (BackupScope) -> Unit,
+    deleteAfterBackupEnabled: Boolean,
+    onDeleteAfterBackupChange: (Boolean) -> Unit,
+    workCadenceHours: Long?,
+    onWorkCadenceChange: (Long?) -> Unit,
+    target: SyncTarget?,
+    moduleNameError: String?,
+    onPortChange: (Int) -> Unit,
+    onModuleCommit: (String) -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
     ExpanderHeader("Advanced", expanded) { expanded = !expanded }
     if (!expanded) return
 
+    // 1. Upload bandwidth cap.
     val limitOn = scope.bwlimitKib != null
     SwitchRow("Limit upload bandwidth", limitOn) { on ->
         onScopeChange(scope.copy(bwlimitKib = if (on) DEFAULT_BWLIMIT_KIB else null))
@@ -584,6 +580,45 @@ private fun AdvancedSection(
             onValueChange = { kbs -> onScopeChange(scope.copy(bwlimitKib = kbs.coerceAtLeast(1).toLong())) },
         )
     }
+
+    // 2. Delete after backup.
+    Spacer(Modifier.height(24.dp))
+    SectionHeader("Delete after backup")
+    SwitchRow(
+        "Delete photos from this device once backed up",
+        deleteAfterBackupEnabled,
+        onDeleteAfterBackupChange,
+    )
+    Text(
+        "Off by default. Only files this run actually transferred are ever deleted, and the system always asks to confirm. Types you turn off above stay on your phone.",
+        style = MaterialTheme.typography.bodySmall,
+    )
+
+    // 3. Schedule (periodic backup interval).
+    Spacer(Modifier.height(24.dp))
+    SectionHeader("Schedule")
+    PeriodicIntervalRow(value = workCadenceHours, onValueChange = onWorkCadenceChange)
+    Text(
+        "Off by default. \"Back up now\" on the Home screen always works regardless of this.",
+        style = MaterialTheme.typography.bodySmall,
+    )
+
+    // 4. Connection -- the port and the module name must match the receiver
+    //    exactly or the connection fails. Install-once, rarely touched.
+    Spacer(Modifier.height(24.dp))
+    SectionHeader("Connection")
+    IntSettingRow(
+        label = "Port",
+        value = target?.port ?: 28873,
+        onValueChange = onPortChange,
+    )
+    PortWarning()
+    Spacer(Modifier.height(16.dp))
+    ModuleNameField(
+        target = target,
+        error = moduleNameError,
+        onCommit = onModuleCommit,
+    )
 }
 
 /** A tappable `<details>`-style section header with an expand/collapse

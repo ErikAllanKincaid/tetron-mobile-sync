@@ -34,6 +34,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import xyz.tetron.sync.bridge.BridgePeer
 import xyz.tetron.sync.media.MediaAccessGrant
 import xyz.tetron.sync.pipeline.SyncTarget
+import xyz.tetron.sync.ui.EyebrowTextStyle
 import xyz.tetron.sync.ui.describeGateReason
 import xyz.tetron.sync.ui.describeTunnelState
 
@@ -74,7 +75,10 @@ fun HomeScreen(viewModel: HomeViewModel, onRequestMediaPermission: () -> Unit) {
         Text("tetron sync", style = MaterialTheme.typography.headlineMedium)
         Spacer(Modifier.height(16.dp))
 
-        Text("BACKUP TARGET", style = MaterialTheme.typography.labelLarge)
+        Text(
+            "BACKUP TARGET",
+            style = MaterialTheme.typography.labelLarge.merge(EyebrowTextStyle),
+        )
         Spacer(Modifier.height(8.dp))
         TargetEditor(target = state.target, rosterPeers = state.rosterPeers, onSave = viewModel::setTarget)
 

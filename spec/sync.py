@@ -871,21 +871,21 @@ class SyncUi(Requirement):
       (no cancellation token in `run_client`'s surface).
     - History: last run time + added/skipped/failed counts (SYNC-005) and
       last failure reason.
-    - Settings: gate toggles + values (Wi-Fi-only, cellular, direct-only,
-      charging-required, low-battery threshold); a bottom "Connection"
-      section with the two must-match-the-receiver values -- the port and
-      (advanced) the module-name override, default `tetron-sync`, blank
-      clears it (revised 2026-09-01: the module name is no longer a
-      user-facing field on Home; it is a coordinated default set once, like
-      the port); a collapsed "Advanced" expander (bandwidth cap only --
-      closed by default; revised 2026-09-01, the device-label field was
-      removed, the per-device folder is derived from the mesh hostname,
-      SYNC-010); delete-after-backup opt-in; the periodic-backup interval
-      (opt-in, default "Never"). The notification
-      coalescing window is NOT a setting (fixed ~6h). Mesh-peer selection
-      is on Home. (No own-mesh-IP copy button -- removed 2026-08-31; the
-      receiver allow-lists this phone by hostname from its own roster,
-      SYNC-010.)
+    - Settings: by default only two sections show -- gate toggles + values
+      (Wi-Fi-only, cellular, direct-only, charging-required, low-battery
+      threshold) and "What gets backed up" (scope). Everything a normal
+      user never touches is inside one collapsed "Advanced" expander
+      (revised 2026-09-01), closed by default, in this order: upload
+      bandwidth cap; delete-after-backup opt-in; the periodic-backup
+      interval (opt-in, default "Never"); and a "Connection" block with
+      the two must-match-the-receiver values -- the port and the
+      module-name override (default `tetron-sync`, blank clears it; not a
+      Home field, it is a coordinated default set once like the port). The
+      device-label field was removed 2026-09-01 (per-device folder derived
+      from the mesh hostname, SYNC-010). The notification coalescing window
+      is NOT a setting (fixed ~6h). Mesh-peer selection is on Home. (No
+      own-mesh-IP copy button -- removed 2026-08-31; the receiver
+      allow-lists this phone by hostname from its own roster, SYNC-010.)
     - Notifications: channels + copy for gate reasons and completion/
       failure (coalesced per SYNC-004); exact copy is implementation-time
       (open item), reachable from Settings preview within Accessibility.
@@ -1032,6 +1032,19 @@ class SyncUi(Requirement):
     left the bottom nav bar's selected-item pill and container purple;
     the fix sets `secondary`/`secondaryContainer`/`surfaceContainer`/etc.
     explicitly too.
+
+    Light/dark parity pass (2026-09-01): a slot-by-slot audit confirms every
+    core Material slot both apps set -- `primary`, `background`, `surface`,
+    `onBackground`, `onSurface`, `outline`, `onPrimary` -- is hex-identical
+    to tetron-mobile in both modes (this app additionally pins the container
+    / secondary slots, which tetron-mobile leaves to M3 because it has no
+    bottom nav). Two shared text styles are brought across with the same
+    definitions as `xyz.tetron.mobile.ui.Theme.kt`: `MonoTextStyle`
+    (`FontFamily.Monospace`, applied to the own-mesh-IP address and the
+    engine/build line) and `EyebrowTextStyle` (SemiBold + 0.09em tracking,
+    merged onto the "BACKUP TARGET" label). No manual dark-mode override is
+    added -- nothing in scope calls for one; the theme follows
+    `isSystemInDarkTheme()`.
 
     SYNC-008's deferred runtime permission request and SYNC-007's deferred
     real `DeletionRequester` both close out here, both via the same
