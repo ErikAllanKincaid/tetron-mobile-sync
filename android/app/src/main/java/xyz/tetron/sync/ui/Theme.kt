@@ -3,10 +3,15 @@ package xyz.tetron.sync.ui
 
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.em
 
 /**
  * SYNC-009: matches tetron-mobile's brand palette (green primary,
@@ -18,6 +23,14 @@ import androidx.compose.ui.graphics.Color
  * consistency does not implicate that boundary. Unlike tetron-mobile this
  * app has no manual dark-mode override setting (nothing in SYNC-009's
  * scope calls for one), so this always follows [isSystemInDarkTheme].
+ *
+ * Every core Material slot both apps set (primary, background, surface,
+ * onBackground, onSurface, outline, onPrimary) is hex-identical to
+ * tetron-mobile in both modes; this app additionally pins the container /
+ * secondary slots M3 would otherwise fill with baseline purple. The two
+ * shared text styles below ([MonoTextStyle], [EyebrowTextStyle]) carry the
+ * same definitions as tetron-mobile so technical strings and section
+ * eyebrows render the same in both apps.
  */
 // Material3's darkColorScheme()/lightColorScheme() builders default every
 // unspecified slot to the library's own baseline purple tonal palette, not
@@ -63,10 +76,24 @@ private val LightColorScheme = lightColorScheme(
     outline = Color(0xFFDCE4E1),
 )
 
+/** Technical data (IPs, hostnames, build SHA) -- tabular precision, same
+ *  definition as `xyz.tetron.mobile.ui.MonoTextStyle`. */
+val MonoTextStyle = TextStyle(fontFamily = FontFamily.Monospace)
+
+/** Small uppercase section labels ("BACKUP TARGET") -- same definition as
+ *  `xyz.tetron.mobile.ui.EyebrowTextStyle`. Callers uppercase the text. */
+val EyebrowTextStyle =
+    TextStyle(
+        fontFamily = FontFamily.Default,
+        fontWeight = FontWeight.SemiBold,
+        letterSpacing = 0.09.em,
+    )
+
 @Composable
 fun TetronSyncTheme(content: @Composable () -> Unit) {
     MaterialTheme(
         colorScheme = if (isSystemInDarkTheme()) DarkColorScheme else LightColorScheme,
+        typography = Typography(),
         content = content,
     )
 }

@@ -45,6 +45,7 @@ import xyz.tetron.sync.scope.MediaEntry
 import xyz.tetron.sync.scope.MediaKind
 import xyz.tetron.sync.pipeline.SyncTarget
 import xyz.tetron.sync.scope.Preset
+import xyz.tetron.sync.ui.MonoTextStyle
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -132,7 +133,10 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
         Spacer(Modifier.height(32.dp))
         HorizontalDivider()
         Spacer(Modifier.height(8.dp))
-        Text(state.engineInfoLine, style = MaterialTheme.typography.bodySmall)
+        Text(
+            state.engineInfoLine,
+            style = MaterialTheme.typography.bodySmall.merge(MonoTextStyle),
+        )
     }
 }
 
@@ -140,13 +144,23 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
  * The phone's own mesh IP, informational only (SYNC-010, amended
  * 2026-08-31): the receiver allow-lists this phone by hostname from its own
  * mesh roster (`tetron-sync-receiver allow add-peer <hostname>`), so there
- * is nothing for the user to copy or transcribe here.
+ * is nothing for the user to copy or transcribe here. The address itself is
+ * rendered in [MonoTextStyle], the same as tetron-mobile shows mesh IPs.
  */
 @Composable
 private fun OwnMeshIpRow(ownMeshIp: String?) {
+    if (ownMeshIp == null) {
+        Text(
+            "This device's mesh IP is not available yet",
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        return
+    }
+    Text("This device's mesh IP", style = MaterialTheme.typography.bodySmall)
     Text(
-        text = ownMeshIp?.let { "This device's mesh IP: $it" } ?: "This device's mesh IP is not available yet",
-        style = MaterialTheme.typography.bodyMedium,
+        ownMeshIp,
+        style = MaterialTheme.typography.bodyMedium.merge(MonoTextStyle),
         modifier = Modifier.fillMaxWidth(),
     )
 }

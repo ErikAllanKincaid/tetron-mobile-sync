@@ -1033,6 +1033,19 @@ class SyncUi(Requirement):
     the fix sets `secondary`/`secondaryContainer`/`surfaceContainer`/etc.
     explicitly too.
 
+    Light/dark parity pass (2026-09-01): a slot-by-slot audit confirms every
+    core Material slot both apps set -- `primary`, `background`, `surface`,
+    `onBackground`, `onSurface`, `outline`, `onPrimary` -- is hex-identical
+    to tetron-mobile in both modes (this app additionally pins the container
+    / secondary slots, which tetron-mobile leaves to M3 because it has no
+    bottom nav). Two shared text styles are brought across with the same
+    definitions as `xyz.tetron.mobile.ui.Theme.kt`: `MonoTextStyle`
+    (`FontFamily.Monospace`, applied to the own-mesh-IP address and the
+    engine/build line) and `EyebrowTextStyle` (SemiBold + 0.09em tracking,
+    merged onto the "BACKUP TARGET" label). No manual dark-mode override is
+    added -- nothing in scope calls for one; the theme follows
+    `isSystemInDarkTheme()`.
+
     SYNC-008's deferred runtime permission request and SYNC-007's deferred
     real `DeletionRequester` both close out here, both via the same
     Activity-owned-launcher seam split already established by this app's
