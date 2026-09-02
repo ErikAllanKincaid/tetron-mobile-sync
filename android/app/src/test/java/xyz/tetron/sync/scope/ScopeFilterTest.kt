@@ -12,7 +12,9 @@ import org.junit.Test
  */
 class ScopeFilterTest {
 
-    private val all = BackupScope() // every include ON, no caps
+    // every include ON, no caps -- Raw is off in the SYNC-013 default, so
+    // set it explicitly to keep this an "everything permitted" baseline.
+    private val all = BackupScope(includeRaw = true)
 
     // --- classify: MIME first (decision A3) ---
 
