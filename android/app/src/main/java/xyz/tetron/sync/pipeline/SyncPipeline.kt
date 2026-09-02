@@ -72,6 +72,12 @@ class SyncPipeline(
     private val deleteConfig: () -> DeleteAfterBackupConfig = { DeleteAfterBackupConfig() },
     private val deletionRequester: DeletionRequester = DeletionRequester {},
     private val onRunCompleted: (RunRecord) -> Unit = {},
+    /** SYNC-009: when set, the run's transferred-file list is persisted here
+     *  once it ends (success, interrupted, or failed alike) for the
+     *  Progress screen -- covers every trigger, not just Home-started runs.
+     *  A gated run never reaches the write, so a stale list is only ever
+     *  replaced by a run that actually transferred. */
+    private val runFileLog: RunFileLog? = null,
 ) {
     private val running = AtomicBoolean(false)
 
@@ -142,8 +148,9 @@ class SyncPipeline(
             mkpath = true,
         )
         val collector = TransferredFileCollector(progress)
+        val logCollector = RunFileLogCollector(collector)
         val record = try {
-            val outcome = transferRunner.run(spec.rootPath, destination, effectiveRunOptions, collector)
+            val outcome = transferRunner.run(spec.rootPath, destination, effectiveRunOptions, logCollector)
             val added = outcome.filesCopied.toInt()
             val total = outcome.filesTotal.toInt()
             // SYNC-007: interrupted is explicitly NOT a failure (below), so
@@ -177,6 +184,7 @@ class SyncPipeline(
                 cancelled = cancelled,
             )
         }
+        runFileLog?.write(logCollector.lines())
         historyStore.recordRun(record)
         onRunCompleted(record)
         return PipelineResult.Ran(record)

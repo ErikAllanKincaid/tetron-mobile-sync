@@ -145,12 +145,23 @@ data class RunRecord(
     val skippedOversize: Int = 0,
 )
 
-/** Persists the most recent run (SYNC-009's History screen: last run time +
- *  counts + last failure reason). SYNC-009 owns the real persisted store;
- *  [InMemoryRunHistoryStore] is a usable default until then. */
+/** Persists run history for SYNC-009's History screen. Originally a single
+ *  last-run record; since 2026-09-02 the production store ([FileRunHistoryStore])
+ *  keeps a short rotating log ([recentRuns]) and is user-[clear]able. The
+ *  two newer methods have single-record defaults so [InMemoryRunHistoryStore]
+ *  and any test fake stay valid without change. */
 interface RunHistoryStore {
     fun recordRun(record: RunRecord)
     fun lastRun(): RunRecord?
+
+    /** The most recent runs, newest first, at most [limit]. Default: just
+     *  [lastRun] -- a store that keeps only one record has nothing older. */
+    fun recentRuns(limit: Int): List<RunRecord> = listOfNotNull(lastRun()).take(limit)
+
+    /** Drop the history down to the single most recent run (SYNC-009 "Clear
+     *  history" -- it keeps the latest so Home's last-run line and the
+     *  Progress list stay meaningful). No-op for a single-record store. */
+    fun clear() {}
 }
 
 class InMemoryRunHistoryStore : RunHistoryStore {

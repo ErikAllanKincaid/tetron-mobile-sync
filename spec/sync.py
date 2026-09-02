@@ -880,15 +880,16 @@ class SyncUi(Requirement):
       appear (skips, directories, symlinks do not), so a run that sent
       nothing shows an explicit "Nothing new to back up", not a blank pane.
     - History (revised 2026-09-02): a multi-run log, not a single record.
-      The last N run summaries (N = 25) are kept newest-first in a
-      `context.filesDir` JSONL file, one `RunRecord` per line (the existing
-      fields -- timestamp, added/skipped/failed, skippedOversize,
-      interrupted, cancelled, failureReason), oldest rotated out past N.
-      This supersedes the single-record `SharedPreferencesRunHistoryStore`
-      as the History-tab source (that store may stay as a fast-path mirror
-      of just the latest for Home's `lastRun()`, or be dropped --
-      implementation choice; `RunRecordCodec` is reused per line either
-      way). The transferred-file list from the Progress slice is retained
+      The last N run summaries (N = 25, `FileRunHistoryStore.MAX_RUNS`) are
+      kept newest-first in a `context.filesDir` file, one line per run (a
+      pure `RunRecordLineCodec` -- `v1`-tagged, pipe-delimited, the
+      free-text `failureReason` Base64'd so a delimiter or newline in it is
+      safe; a line that does not parse is skipped, not fatal), oldest
+      rotated out past N. This replaces the single-record
+      `SharedPreferencesRunHistoryStore` as the store; `FileRunHistoryStore`
+      seeds itself once from that old store so an existing install's last
+      run survives the upgrade. The transferred-file list from the Progress
+      slice is retained
       only for the most recent run; older rows carry the summary alone. The
       History tab becomes a scrollable list, newest first; the top
       (current/last) row expands to that file list, older rows show
@@ -1131,17 +1132,24 @@ class SyncUi(Requirement):
     with a hard dependency on this one; SYNC-010 (home-side deliverable)
     remains independently parallelizable and still not started.
 
-    Revision 2026-09-02 (pending build): the Progress and History bullets
-    above gained persistence scope -- the transferred-file list survives a
-    run's end and process death, and History becomes a rotating 25-run log
-    with a Clear action. Pure app-side work (one `filesDir` file each, a
-    scrollable list, a confirm dialog); no FFI, no receiver change, no new
-    storage technology. Verified the same way as the rest of this
-    requirement: unit tests for log rotation / clear-keeps-latest / codec
-    round-trip, plus on-device (run, switch away and back, force-stop and
-    reopen -- list still there; a second run replaces it; Clear keeps the
-    latest row). Separately, SYNC-013 removes the preset selector from this
-    requirement's Settings screen.
+    Revision 2026-09-02 (IMPLEMENTED): the Progress and History bullets
+    above gained persistence scope. `pipeline/RunFileLog.kt` persists the
+    transferred-file list (`RunFileLogCollector` tees the progress-listener
+    chain; `SyncPipeline` writes it once a run ends, so every trigger path
+    persists a list, not just Home-started runs). `pipeline/FileRunHistoryStore.kt`
+    is the rotating 25-run log (pure `RunRecordLineCodec`, self-seeding
+    from the old `SharedPreferences` store). `ProgressScreen` renders Idle
+    and Finished identically -- last-run summary from the store + the
+    persisted list in a shared, uncapped `ui/TransferredFileList.kt`.
+    `HistoryScreen` is a scrollable `LazyColumn` with an expandable top
+    row and a Clear-history confirm dialog. No FFI, no receiver change.
+    Verified: `RunFileLogTest` / `FileRunHistoryStoreTest` (round-trip,
+    rotation at MAX_RUNS, clear-keeps-latest, garbled-line skip), plus
+    on-device (full backup then force-stop + reopen with Wi-Fi off -- the
+    Progress list and summary are still there; a no-op re-run shows
+    "Nothing new to back up"; History shows 3 rows, the top one expands to
+    its file list, Clear leaves just the newest). Separately, SYNC-013
+    removes the preset selector from this requirement's Settings screen.
     """
     req_id = "SYNC-009"
 

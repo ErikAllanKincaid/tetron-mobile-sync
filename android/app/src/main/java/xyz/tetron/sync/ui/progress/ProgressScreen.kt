@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 package xyz.tetron.sync.ui.progress
 
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -11,8 +10,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -21,10 +18,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import xyz.tetron.sync.pipeline.RunRecord
+import xyz.tetron.sync.pipeline.TransferredFileLine
+import xyz.tetron.sync.ui.TransferredFileList
 import xyz.tetron.sync.ui.describeGateReason
+import xyz.tetron.sync.ui.formatFileSize
 import xyz.tetron.sync.ui.home.HomeViewModel
 import xyz.tetron.sync.ui.home.RunPhase
 import xyz.tetron.sync.ui.home.RunProgressSnapshot
@@ -39,6 +39,13 @@ import xyz.tetron.sync.ui.home.RunProgressSnapshot
  * list of files as they land, newest first. A CircularProgressIndicator
  * keeps visible motion while a single large file is transferring and the
  * numbers are momentarily static.
+ *
+ * SYNC-009 (2026-09-02): the transferred-file list survives the run. After
+ * a Home-triggered run finishes it stays visible in the finished/idle
+ * state (from [xyz.tetron.sync.pipeline.RunFileLog], so it also survives
+ * process death), scrollable in full -- the in-run list keeps its 200-row
+ * cap for render performance, this one does not. A run that transferred
+ * nothing shows "Nothing new to back up", not a blank pane.
  *
  * A cancel affordance is spec'd but not built here: the engine's
  * `run_client` (src/lib.rs) is a fully synchronous, blocking FFI call with
@@ -55,19 +62,42 @@ fun ProgressScreen(viewModel: HomeViewModel) {
             .padding(24.dp),
     ) {
         when (val phase = state.runPhase) {
-            RunPhase.Idle -> Text("No backup in progress", style = MaterialTheme.typography.bodyLarge)
             is RunPhase.Running -> RunningView(phase.detail ?: RunProgressSnapshot())
             is RunPhase.Gated -> Text(
                 "Last attempt was blocked: ${describeGateReason(phase.reason)}",
                 style = MaterialTheme.typography.bodyLarge,
             )
-            is RunPhase.Finished -> {
-                val record = phase.record
-                Text(
-                    "Last run: ${record.added} added, ${record.skipped} skipped, ${record.failed} failed",
-                    style = MaterialTheme.typography.bodyLarge,
-                )
-            }
+            // Idle and Finished are the same view -- a Home-started run
+            // reaches Finished, a periodic/network-change run leaves this
+            // ViewModel at Idle, and both should show the last run's
+            // summary (from the history store, [state.lastRun]) and its
+            // persisted file list the same way.
+            RunPhase.Idle, is RunPhase.Finished ->
+                LastRunView(lastRun = state.lastRun, files = state.lastRunFiles)
+        }
+    }
+}
+
+@Composable
+private fun LastRunView(lastRun: RunRecord?, files: List<TransferredFileLine>) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        if (lastRun == null) {
+            Text("No backup has run yet", style = MaterialTheme.typography.bodyLarge)
+            return@Column
+        }
+        Text(
+            "Last run: ${lastRun.added} added, ${lastRun.skipped} skipped, ${lastRun.failed} failed",
+            style = MaterialTheme.typography.bodyLarge,
+        )
+        lastRun.failureReason?.let {
+            Spacer(Modifier.height(4.dp))
+            Text("Failed: $it", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
+        }
+        Spacer(Modifier.height(16.dp))
+        if (files.isEmpty()) {
+            Text("Nothing new to back up", style = MaterialTheme.typography.bodyMedium)
+        } else {
+            TransferredFileList(files, Modifier.fillMaxSize())
         }
     }
 }
@@ -107,43 +137,12 @@ private fun RunningView(d: RunProgressSnapshot) {
         if (d.files.isEmpty()) {
             Text("Waiting for the first file…", style = MaterialTheme.typography.bodySmall)
         } else {
-            LazyColumn(modifier = Modifier.fillMaxSize()) {
-                items(d.files) { line ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 3.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                        Text(
-                            "✓ ${line.path}",
-                            style = MaterialTheme.typography.bodySmall,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier
-                                .weight(1f, fill = false)
-                                .padding(end = 12.dp),
-                        )
-                        Text(formatBytes(line.bytes), style = MaterialTheme.typography.bodySmall)
-                    }
-                }
-            }
+            TransferredFileList(d.files, Modifier.fillMaxSize())
         }
     }
 }
 
-/** Coarse, human-readable byte size ("0 B", "4.2 MB", "61 GB"). */
-private fun formatBytes(bytes: Long): String {
-    if (bytes < 1024) return "$bytes B"
-    val units = listOf("KB", "MB", "GB", "TB")
-    var value = bytes.toDouble() / 1024
-    var unit = 0
-    while (value >= 1024 && unit < units.lastIndex) {
-        value /= 1024
-        unit++
-    }
-    return if (value >= 100) "${value.toInt()} ${units[unit]}" else "%.1f %s".format(value, units[unit])
-}
+private fun formatBytes(bytes: Long): String = formatFileSize(bytes)
 
 private fun formatRate(bytesPerSec: Double): String =
     if (bytesPerSec < 1.0) "—" else "${formatBytes(bytesPerSec.toLong())}/s"

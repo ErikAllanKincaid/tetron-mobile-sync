@@ -19,6 +19,8 @@ import xyz.tetron.sync.media.AndroidMediaAccess
 import xyz.tetron.sync.notifications.SyncNotifier
 import xyz.tetron.sync.pipeline.AndroidDeviceStateProvider
 import xyz.tetron.sync.pipeline.EngineTransferRunner
+import xyz.tetron.sync.pipeline.FileRunHistoryStore
+import xyz.tetron.sync.pipeline.RunFileLog
 import xyz.tetron.sync.pipeline.RunHistoryStore
 import xyz.tetron.sync.pipeline.SharedPreferencesRunHistoryStore
 import xyz.tetron.sync.pipeline.SyncPipeline
@@ -72,7 +74,23 @@ class AppContainer(context: Context) {
     }
     val mediaAccess = AndroidMediaAccess(appContext, scopeProvider = { settingsStore.backupScope() })
     val deviceState = AndroidDeviceStateProvider(appContext)
-    val historyStore: RunHistoryStore = SharedPreferencesRunHistoryStore(appContext)
+    /** SYNC-009: a rotating [FileRunHistoryStore.MAX_RUNS]-run log. On
+     *  first construction it seeds itself from the pre-2026-09-02
+     *  single-record `SharedPreferences` store so an existing install's
+     *  last run is not lost. */
+    val historyStore: RunHistoryStore =
+        FileRunHistoryStore(java.io.File(appContext.filesDir, "run_history.log")).also { store ->
+            if (store.lastRun() == null) {
+                SharedPreferencesRunHistoryStore(appContext).lastRun()?.let(store::recordRun)
+            }
+        }
+
+    /** SYNC-009: the last run's transferred-file list, persisted for the
+     *  Progress screen (written by [xyz.tetron.sync.ui.home.HomeViewModel]
+     *  on completion, read by it and the Progress screen). Covers
+     *  Home-triggered runs; a periodic/network-change run still records a
+     *  History summary but not a per-file list. */
+    val runFileLog = RunFileLog(java.io.File(appContext.filesDir, "last_run_files.tsv"))
 
     /** Fixed ~6h window ([GateNotificationCoalescer.DEFAULT_WINDOW_MILLIS]).
      *  It used to be a Settings field; that was jargon with no user value
@@ -111,6 +129,7 @@ class AppContainer(context: Context) {
         onNotify = notifier::notifyGated,
         onRunCompleted = notifier::notifyRunCompleted,
         deletionRequester = deletionRequester,
+        runFileLog = runFileLog,
     )
 
     /** SYNC-006's trigger layer, real wiring deferred until SYNC-008/009 --

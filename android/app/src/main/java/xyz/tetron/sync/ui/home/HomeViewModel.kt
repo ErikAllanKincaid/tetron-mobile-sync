@@ -25,6 +25,7 @@ import xyz.tetron.sync.media.MediaAccessGrant
 import xyz.tetron.sync.pipeline.PipelineResult
 import xyz.tetron.sync.pipeline.RunRecord
 import xyz.tetron.sync.pipeline.SyncTarget
+import xyz.tetron.sync.pipeline.TransferredFileLine
 
 /** The Home screen's "big button" state -- also what the Progress screen
  *  reads (same [HomeViewModel] instance, Activity-scoped, since a run
@@ -62,6 +63,11 @@ data class HomeUiState(
      *  screen fall out of [RunPhase.Running] when a run started elsewhere
      *  (periodic/network-change trigger) finishes. */
     val lastRun: RunRecord? = null,
+    /** SYNC-009: the persisted transferred-file list of the last
+     *  Home-triggered run -- the Progress screen shows it in the
+     *  finished/idle state, not only while running. Empty after a run that
+     *  transferred nothing ("Nothing new to back up"). */
+    val lastRunFiles: List<TransferredFileLine> = emptyList(),
 )
 
 /**
@@ -193,6 +199,11 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
             rosterPeers = snapshot?.peers ?: emptyList(),
             mediaAccessGrant = container.mediaAccess.currentState().grant,
             lastRun = container.historyStore.lastRun(),
+            // SYNC-009: cheap local file read on the same IO poll that
+            // already does a cross-process bridge call and a prefs read;
+            // picks up a run's list within one tick whichever trigger ran
+            // it.
+            lastRunFiles = container.runFileLog.read(),
         )
     }
 
