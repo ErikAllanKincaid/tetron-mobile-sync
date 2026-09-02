@@ -24,6 +24,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import xyz.tetron.sync.pipeline.RunRecord
+import xyz.tetron.sync.pipeline.TransferredFileLine
 import xyz.tetron.sync.ui.describeGateReason
 import xyz.tetron.sync.ui.home.HomeViewModel
 import xyz.tetron.sync.ui.home.RunPhase
@@ -40,6 +42,13 @@ import xyz.tetron.sync.ui.home.RunProgressSnapshot
  * keeps visible motion while a single large file is transferring and the
  * numbers are momentarily static.
  *
+ * SYNC-009 (2026-09-02): the transferred-file list survives the run. After
+ * a Home-triggered run finishes it stays visible in the finished/idle
+ * state (from [xyz.tetron.sync.pipeline.RunFileLog], so it also survives
+ * process death), scrollable in full -- the in-run list keeps its 200-row
+ * cap for render performance, this one does not. A run that transferred
+ * nothing shows "Nothing new to back up", not a blank pane.
+ *
  * A cancel affordance is spec'd but not built here: the engine's
  * `run_client` (src/lib.rs) is a fully synchronous, blocking FFI call with
  * no cancellation token in its surface. Real cancellation needs new
@@ -55,18 +64,68 @@ fun ProgressScreen(viewModel: HomeViewModel) {
             .padding(24.dp),
     ) {
         when (val phase = state.runPhase) {
-            RunPhase.Idle -> Text("No backup in progress", style = MaterialTheme.typography.bodyLarge)
             is RunPhase.Running -> RunningView(phase.detail ?: RunProgressSnapshot())
             is RunPhase.Gated -> Text(
                 "Last attempt was blocked: ${describeGateReason(phase.reason)}",
                 style = MaterialTheme.typography.bodyLarge,
             )
-            is RunPhase.Finished -> {
-                val record = phase.record
+            // Idle and Finished are the same view -- a Home-started run
+            // reaches Finished, a periodic/network-change run leaves this
+            // ViewModel at Idle, and both should show the last run's
+            // summary (from the history store, [state.lastRun]) and its
+            // persisted file list the same way.
+            RunPhase.Idle, is RunPhase.Finished ->
+                LastRunView(lastRun = state.lastRun, files = state.lastRunFiles)
+        }
+    }
+}
+
+@Composable
+private fun LastRunView(lastRun: RunRecord?, files: List<TransferredFileLine>) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        if (lastRun == null) {
+            Text("No backup has run yet", style = MaterialTheme.typography.bodyLarge)
+            return@Column
+        }
+        Text(
+            "Last run: ${lastRun.added} added, ${lastRun.skipped} skipped, ${lastRun.failed} failed",
+            style = MaterialTheme.typography.bodyLarge,
+        )
+        lastRun.failureReason?.let {
+            Spacer(Modifier.height(4.dp))
+            Text("Failed: $it", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
+        }
+        Spacer(Modifier.height(16.dp))
+        if (files.isEmpty()) {
+            Text("Nothing new to back up", style = MaterialTheme.typography.bodyMedium)
+        } else {
+            FileList(files, Modifier.fillMaxSize())
+        }
+    }
+}
+
+/** The newest-first "✓ path  ·  size" transfer list, shared by the live and
+ *  the persisted views. */
+@Composable
+private fun FileList(lines: List<TransferredFileLine>, modifier: Modifier = Modifier) {
+    LazyColumn(modifier = modifier) {
+        items(lines) { line ->
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 3.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
                 Text(
-                    "Last run: ${record.added} added, ${record.skipped} skipped, ${record.failed} failed",
-                    style = MaterialTheme.typography.bodyLarge,
+                    "✓ ${line.path}",
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier
+                        .weight(1f, fill = false)
+                        .padding(end = 12.dp),
                 )
+                Text(formatBytes(line.bytes), style = MaterialTheme.typography.bodySmall)
             }
         }
     }
@@ -107,27 +166,7 @@ private fun RunningView(d: RunProgressSnapshot) {
         if (d.files.isEmpty()) {
             Text("Waiting for the first file…", style = MaterialTheme.typography.bodySmall)
         } else {
-            LazyColumn(modifier = Modifier.fillMaxSize()) {
-                items(d.files) { line ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 3.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                        Text(
-                            "✓ ${line.path}",
-                            style = MaterialTheme.typography.bodySmall,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier
-                                .weight(1f, fill = false)
-                                .padding(end = 12.dp),
-                        )
-                        Text(formatBytes(line.bytes), style = MaterialTheme.typography.bodySmall)
-                    }
-                }
-            }
+            FileList(d.files, Modifier.fillMaxSize())
         }
     }
 }

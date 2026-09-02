@@ -2,9 +2,7 @@
 package xyz.tetron.sync.ui.home
 
 import uniffi.tetron_mobile_sync.SyncProgressEvent
-
-/** One completed file, for the Progress screen's live transfer list. */
-data class TransferredFileLine(val path: String, val bytes: Long)
+import xyz.tetron.sync.pipeline.TransferredFileLine
 
 /** An immutable view of a run's progress, rebuilt from [RunProgressTracker]
  *  on every engine event and stashed in [RunPhase.Running]. */
