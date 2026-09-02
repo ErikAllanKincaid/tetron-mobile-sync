@@ -6,9 +6,11 @@ import java.util.UUID
 /**
  * SYNC-010: the per-device label is the first path component written under
  * the receiver module (`rsync://<ip>:<port>/<module>/<device-label>/...`),
- * so it must be exactly one safe path segment. This is the pure
- * validation/normalisation used by the Settings field and by
- * [SharedPreferencesSettingsStore] when it fills in a fallback.
+ * so it must be exactly one safe path segment. The label is not
+ * user-editable -- [SharedPreferencesSettingsStore] seeds it once from the
+ * phone's mesh hostname (see [generateFallback]). [validate] /
+ * [normalizedOrNull] are also reused to check the advanced
+ * "Receiver module name" override, which has the same one-safe-segment rule.
  */
 object DeviceLabel {
 

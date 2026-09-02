@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 package xyz.tetron.sync.ui.settings
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -12,12 +13,15 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
@@ -41,7 +45,6 @@ import xyz.tetron.sync.scope.MediaEntry
 import xyz.tetron.sync.scope.MediaKind
 import xyz.tetron.sync.pipeline.SyncTarget
 import xyz.tetron.sync.scope.Preset
-import xyz.tetron.sync.settings.DeviceLabel
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -49,13 +52,14 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 /**
  * SYNC-009 Settings screen. Mesh-peer selection lives on Home
  * ([xyz.tetron.sync.ui.home.HomeScreen]); this screen carries gate toggles,
- * what-gets-backed-up scope, an Advanced section (bandwidth cap + the
- * device-label override), delete-after-backup opt-in, the periodic-backup
- * interval (opt-in, "Never" by default), and a bottom "Connection" section
- * holding the two values that must match the receiver exactly -- the port
- * and, for advanced setups, the module name. Notification channel copy is a
- * separate, not-yet-built slice (spec/sync.py: "exact copy is
- * implementation-time").
+ * what-gets-backed-up scope, a collapsed "Advanced" expander (bandwidth
+ * cap), delete-after-backup opt-in, the periodic-backup interval (opt-in,
+ * "Never" by default), and a bottom "Connection" section holding the two
+ * values that must match the receiver exactly -- the port and, for advanced
+ * setups, the module name. The per-device folder name is derived from the
+ * phone's mesh hostname automatically (SYNC-010) and has no field here.
+ * Notification channel copy is a separate, not-yet-built slice (spec/sync.py:
+ * "exact copy is implementation-time").
  */
 @Composable
 fun SettingsScreen(viewModel: SettingsViewModel) {
@@ -113,10 +117,6 @@ fun SettingsScreen(viewModel: SettingsViewModel) {
         AdvancedSection(
             scope = state.backupScope,
             onScopeChange = viewModel::setBackupScope,
-            target = state.target,
-            deviceLabelError = state.deviceLabelError,
-            ownHostname = state.ownHostname,
-            onCommitDeviceLabel = viewModel::setDeviceLabel,
         )
 
         Spacer(Modifier.height(24.dp))
@@ -179,92 +179,6 @@ private fun OwnMeshIpRow(ownMeshIp: String?) {
         style = MaterialTheme.typography.bodyMedium,
         modifier = Modifier.fillMaxWidth(),
     )
-}
-
-/**
- * SYNC-010: the per-device folder name the receiver stores this phone's
- * backup under. Defaults to this phone's mesh hostname (else `phone-<hex>`),
- * so most people never touch it -- it lives in Advanced. Changing it after
- * backups have run starts a fresh folder on the receiver and leaves the old
- * one untouched, so a confirm dialog gates the change.
- */
-@Composable
-private fun DeviceLabelField(
-    target: SyncTarget?,
-    error: String?,
-    currentHostname: String?,
-    onCommit: (String) -> Unit,
-) {
-    if (target == null) return
-    val persisted = target.deviceLabel
-    var text by remember(persisted) { mutableStateOf(persisted) }
-    var showConfirm by remember { mutableStateOf(false) }
-    val trimmed = text.trim()
-    val changed = trimmed != persisted
-    val liveValid = DeviceLabel.validate(text) is DeviceLabel.Result.Valid
-    // M6c: the phone's mesh hostname changed since the label was snapshotted.
-    // Offer to adopt it (through the same confirm dialog), never silently.
-    val hostnameSuggestion = currentHostname
-        ?.takeIf { it != persisted && DeviceLabel.normalizedOrNull(it) == it }
-
-    Text("Device label", style = MaterialTheme.typography.bodySmall)
-    Spacer(Modifier.height(4.dp))
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        OutlinedTextField(
-            value = text,
-            onValueChange = { text = it },
-            singleLine = true,
-            isError = error != null || (text.isNotEmpty() && !liveValid),
-            modifier = Modifier.weight(1f),
-        )
-        TextButton(
-            onClick = { showConfirm = true },
-            enabled = changed && liveValid,
-        ) { Text("Save") }
-    }
-    Text(
-        text = error
-            ?: "Files land in $trimmed/ inside your backup folder on the receiver.",
-        style = MaterialTheme.typography.bodySmall,
-    )
-
-    if (hostnameSuggestion != null) {
-        Text(
-            "This phone's mesh hostname is now \"$hostnameSuggestion\". Backups still go to \"$persisted\".",
-            style = MaterialTheme.typography.bodySmall,
-        )
-        TextButton(onClick = {
-            text = hostnameSuggestion
-            showConfirm = true
-        }) { Text("Use \"$hostnameSuggestion\"") }
-    }
-
-    if (showConfirm) {
-        AlertDialog(
-            onDismissRequest = { showConfirm = false },
-            title = { Text("Change device label?") },
-            text = {
-                Text(
-                    "Photos already backed up under \"$persisted\" stay on the " +
-                        "receiver in that folder. New backups go to \"$trimmed\". " +
-                        "Nothing is moved.",
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    showConfirm = false
-                    onCommit(text)
-                }) { Text("Change") }
-            },
-            dismissButton = {
-                TextButton(onClick = { showConfirm = false }) { Text("Cancel") }
-            },
-        )
-    }
 }
 
 /**
@@ -645,16 +559,20 @@ private fun LargestRow(entry: MediaEntry) {
     }
 }
 
+/**
+ * Collapsed by default -- a normal user never needs anything in here. Just
+ * the bandwidth cap now; the per-device folder name is derived from the
+ * mesh hostname automatically (SYNC-010) with no field.
+ */
 @Composable
 private fun AdvancedSection(
     scope: BackupScope,
     onScopeChange: (BackupScope) -> Unit,
-    target: SyncTarget?,
-    deviceLabelError: String?,
-    ownHostname: String?,
-    onCommitDeviceLabel: (String) -> Unit,
 ) {
-    SectionHeader("Advanced")
+    var expanded by remember { mutableStateOf(false) }
+    ExpanderHeader("Advanced", expanded) { expanded = !expanded }
+    if (!expanded) return
+
     val limitOn = scope.bwlimitKib != null
     SwitchRow("Limit upload bandwidth", limitOn) { on ->
         onScopeChange(scope.copy(bwlimitKib = if (on) DEFAULT_BWLIMIT_KIB else null))
@@ -666,12 +584,25 @@ private fun AdvancedSection(
             onValueChange = { kbs -> onScopeChange(scope.copy(bwlimitKib = kbs.coerceAtLeast(1).toLong())) },
         )
     }
+}
 
-    Spacer(Modifier.height(16.dp))
-    DeviceLabelField(
-        target = target,
-        error = deviceLabelError,
-        currentHostname = ownHostname,
-        onCommit = onCommitDeviceLabel,
-    )
+/** A tappable `<details>`-style section header with an expand/collapse
+ *  chevron -- same visual weight as [SectionHeader]. */
+@Composable
+private fun ExpanderHeader(title: String, expanded: Boolean, onToggle: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onToggle)
+            .padding(vertical = 8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(title, style = MaterialTheme.typography.titleMedium)
+        Icon(
+            imageVector = if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+            contentDescription = if (expanded) "Collapse" else "Expand",
+        )
+    }
+    if (expanded) Spacer(Modifier.height(4.dp))
 }

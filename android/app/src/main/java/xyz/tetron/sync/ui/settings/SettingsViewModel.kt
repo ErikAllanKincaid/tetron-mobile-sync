@@ -33,9 +33,6 @@ data class SettingsUiState(
     /** `null` == "never" (periodic backup is opt-in, spec/sync.py SYNC-006). */
     val workCadenceHours: Long? = null,
     val ownMeshIp: String? = null,
-    /** This phone's own mesh hostname (MOBILE-024). Used by the Advanced
-     *  device-label field to offer adopting it when it has changed. */
-    val ownHostname: String? = null,
     val engineInfoLine: String = "",
     /** SYNC-012: the persistent backup scope + its derived [Preset] + the
      *  local backlog estimate ([estimateLoading] while the `MediaStore`
@@ -44,9 +41,6 @@ data class SettingsUiState(
     val preset: Preset = Preset.Everything,
     val estimate: BacklogEstimate = BacklogEstimate.EMPTY,
     val estimateLoading: Boolean = false,
-    /** SYNC-010: non-null while the device-label field holds an invalid
-     *  value; the reason string to show inline. */
-    val deviceLabelError: String? = null,
     /** Non-null while the advanced "Receiver module name" override field
      *  holds an invalid value. */
     val moduleNameError: String? = null,
@@ -101,7 +95,7 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
     private suspend fun refreshOwnMeshIp() {
         val response = container.bridge.current()
         val snapshot = (response as? BridgeResponse.Snapshot)?.snapshot
-        _uiState.update { it.copy(ownMeshIp = snapshot?.ownMeshIp, ownHostname = snapshot?.ownHostname) }
+        _uiState.update { it.copy(ownMeshIp = snapshot?.ownMeshIp) }
     }
 
     fun setGateConfig(config: GateConfig) {
@@ -119,27 +113,6 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
         container.settingsStore.setTarget(updated)
         _uiState.update { it.copy(target = updated) }
     }
-
-    /** SYNC-010: the per-device folder the receiver stores this phone under
-     *  (`<module>/<device-label>/...`). Validated to one safe path
-     *  component; an invalid value sets [SettingsUiState.deviceLabelError]
-     *  and is not persisted. Like [setTargetPort], reachable only once a
-     *  target exists. Changing it starts a new folder on the receiver and
-     *  leaves the old one in place -- the UI confirms before calling this. */
-    fun setDeviceLabel(raw: String) {
-        val current = _uiState.value.target ?: return
-        when (val result = DeviceLabel.validate(raw)) {
-            is DeviceLabel.Result.Invalid ->
-                _uiState.update { it.copy(deviceLabelError = result.reason) }
-            is DeviceLabel.Result.Valid -> {
-                val updated = current.copy(deviceLabel = result.label)
-                container.settingsStore.setTarget(updated)
-                _uiState.update { it.copy(target = updated, deviceLabelError = null) }
-            }
-        }
-    }
-
-    fun clearDeviceLabelError() = _uiState.update { it.copy(deviceLabelError = null) }
 
     /** Advanced only: the rsync module name. It must match the receiver
      *  exactly (same contract as [setTargetPort]) -- there is no discovery.
