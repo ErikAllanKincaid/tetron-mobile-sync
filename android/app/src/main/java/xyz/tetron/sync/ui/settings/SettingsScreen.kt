@@ -44,6 +44,7 @@ import xyz.tetron.sync.scope.BackupScope
 import xyz.tetron.sync.scope.MediaEntry
 import xyz.tetron.sync.scope.MediaKind
 import xyz.tetron.sync.pipeline.SyncTarget
+import xyz.tetron.sync.ui.EyebrowTextStyle
 import xyz.tetron.sync.ui.MonoTextStyle
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -360,6 +361,16 @@ private fun WhatGetsBackedUpSection(
     SwitchRow("Other files", scope.includeOtherFiles) { onScopeChange(scope.copy(includeOtherFiles = it)) }
     Text(
         "\"Other files\" covers anything new your camera starts saving. Turn it off and only the types above are backed up.",
+        style = MaterialTheme.typography.bodySmall,
+    )
+
+    Spacer(Modifier.height(16.dp))
+    Text("FOLDERS", style = MaterialTheme.typography.labelLarge.merge(EyebrowTextStyle))
+    Spacer(Modifier.height(4.dp))
+    Text("Camera roll (always backed up)", style = MaterialTheme.typography.bodyLarge)
+    SwitchRow("Pictures", scope.includePictures) { onScopeChange(scope.copy(includePictures = it)) }
+    Text(
+        "Loose photos and videos in your Pictures folder (app exports, saved images). Screenshots and app subfolders are not included. The types above still apply.",
         style = MaterialTheme.typography.bodySmall,
     )
 

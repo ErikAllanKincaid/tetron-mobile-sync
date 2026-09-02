@@ -50,6 +50,13 @@ class ScopeFilterTest {
         assertEquals(MediaKind.Jpeg, ScopeFilter.classify("photo.jpeg", null))
     }
 
+    @Test fun classify_sync013_jpeg_heic_variants_by_extension() {
+        // SYNC-013 widened MediaTypeSets.DEFAULT for the null-MIME case.
+        assertEquals(MediaKind.Jpeg, ScopeFilter.classify("scan.jpe", null))
+        assertEquals(MediaKind.Jpeg, ScopeFilter.classify("download.JFIF", null))
+        assertEquals(MediaKind.Heic, ScopeFilter.classify("IMG.hif", null))
+    }
+
     @Test fun classify_unknown_is_other() {
         assertEquals(MediaKind.Other, ScopeFilter.classify("motion.webp", "image/webp"))
         assertEquals(MediaKind.Other, ScopeFilter.classify("note.txt", "text/plain"))

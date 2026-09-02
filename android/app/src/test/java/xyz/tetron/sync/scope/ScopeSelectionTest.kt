@@ -30,6 +30,18 @@ class ScopeSelectionTest {
         assertEquals(0, sel.oversizeSkippedCount)
     }
 
+    @Test fun sync013_default_scope_flags() {
+        val d = BackupScope()
+        assertEquals(true, d.includeJpeg)
+        assertEquals(true, d.includeHeic)
+        assertEquals(true, d.includeVideos)
+        assertEquals(true, d.includeOtherFiles)
+        assertEquals(false, d.includeRaw)
+        assertEquals(false, d.includePictures)
+        assertEquals(null, d.maxSizeBytes)
+        assertEquals(null, d.bwlimitKib)
+    }
+
     @Test fun sync013_default_scope_drops_raw() {
         // SYNC-013: the new-install default has Raw OFF -- the two .dng
         // siblings are excluded, everything else in the roll stays.

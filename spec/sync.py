@@ -1531,11 +1531,13 @@ class SyncFilterControls(Requirement):
         notification (paired with A5's separate count).
     B6  Default extension sets as listed under control 1 -- accepted for v1.
 
-    Superseded by SYNC-013 (2026-09-02): A2 (the pre-29 raw-walk branch is
-    removed, MediaStore staging becomes unconditional), A4 and B2 (the
-    preset mechanism is removed entirely). B3 (size cap off by default)
-    stands. The default extension sets (B6) are widened with `jpe`, `jfif`,
-    `hif`. The `BackupScope()` default gains Raw = OFF for new installs.
+    Superseded by SYNC-013 (2026-09-02): A4 and B2 (the preset mechanism is
+    removed entirely). A2 STANDS for pre-29 (API 26-28) -- `RELATIVE_PATH`
+    is an API 29 column, so those devices keep the `DCIM/Camera`-only
+    recursive walk with no type or folder scope. B3 (size cap off by
+    default) stands. The default extension sets (B6) are widened with
+    `jpe`, `jfif`, `hif`. The `BackupScope()` default gains Raw = OFF for
+    new installs.
 
     ACCEPTANCE: JVM unit tests cover the scope model end to end -- the
     `ScopeFilter` decision for every toggle state (each type individually
@@ -1661,11 +1663,12 @@ class SyncSourceFolders(Requirement):
       oc-rsync rebuilds that tree under the push destination, so the
       receiver mirrors it with NO receiver-side change -- one shared
       module, subdirectories for free.
-    - Drop the pre-API-29 raw recursive-walk branch: once `rootPath` is the
-      common ancestor a raw walk would sweep all of external storage. Make
-      the MediaStore-query-and-stage path unconditional on every API level
-      (it was always correct, just previously unnecessary pre-29). Net: one
-      code path, not two. SYNC-012 decision A2 is void.
+    - Keep the pre-API-29 (26-28) branch as the `DCIM/Camera`-only recursive
+      walk it already is: `RELATIVE_PATH` is an API 29 column, so the
+      multi-directory MediaStore query cannot run there, and the type scope
+      never applied there either (SYNC-012 A2 stands). Folder toggles are
+      an API 29+ feature. The multi-dir MediaStore staging IS unconditional
+      from API 29 up (there is no separate pre-33 path).
     - The SYNC-012 backlog estimate and Preview bottom sheet MUST union in
       the enabled folders -- they scan only `DCIM/Camera` today, and the
       estimate is the only thing that shows the one-time cost before a

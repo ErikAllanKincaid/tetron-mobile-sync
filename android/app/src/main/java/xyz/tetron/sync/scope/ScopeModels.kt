@@ -28,6 +28,12 @@ package xyz.tetron.sync.scope
  * pipeline copies it into `SyncRunOptions.bwlimit_kib` (SYNC-002's existing
  * FFI field).
  *
+ * SYNC-013: [includePictures] is a source-*directory* flag, not a file
+ * type -- it adds the top level of `Pictures/` (never its subfolders, so
+ * `Pictures/Screenshots/` stays out) to the roster. It defaults off and is
+ * orthogonal to the type flags: a `Pictures/` file still has to pass the
+ * JPEG/HEIC/Raw/Video/Other toggles.
+ *
  * `null` for [maxSizeBytes] / [bwlimitKib] means "no cap" / "no limit"
  * (both default OFF, decision B3).
  */
@@ -37,6 +43,7 @@ data class BackupScope(
     val includeRaw: Boolean = false,
     val includeVideos: Boolean = true,
     val includeOtherFiles: Boolean = true,
+    val includePictures: Boolean = false,
     val maxSizeBytes: Long? = null,
     val bwlimitKib: Long? = null,
 )
