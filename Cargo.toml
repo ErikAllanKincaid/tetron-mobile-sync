@@ -104,9 +104,11 @@ crossbeam-channel = "0.5"
 # Concurrent hash map - for shared state across daemon sessions
 dashmap = "6.1"
 # Pure-Rust SSH client - embedded SSH transport alternative to system ssh binary.
-# 0.60+ retires GHSA-f5v4-2wr6-hqmg / RUSTSEC-2023-0071 (Marvin Attack on rsa
-# 0.9.x) by upgrading to rsa 0.10 with the constant-time rewrite. The keys
-# helpers (formerly russh-keys) are now re-exported under russh::keys.
+# 0.60+ moves to rsa 0.10, but that does NOT retire RUSTSEC-2023-0071 (Marvin
+# Attack): RustSec lists no patched rsa version and rsa 0.10.0-rc.18 is still
+# affected (checked 2026-10-20), so the advisory is ignored in
+# .cargo/audit.toml with the reason it is unreachable in shipped builds. The
+# keys helpers (formerly russh-keys) are now re-exported under russh::keys.
 russh = { version = "0.62.1", default-features = false, features = ["flate2", "ring", "rsa"] }
 # QUIC transport (feature-gated) - quinn's sans-IO core with the rustls/ring
 # provider, driven directly from a dedicated I/O thread (no tokio, no quinn

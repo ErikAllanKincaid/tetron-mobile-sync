@@ -1,0 +1,19 @@
+# Config for `cargo audit`. Accepted, tracked advisories only -- a new,
+# unreviewed advisory is NOT covered here and correctly fails the audit.
+[advisories]
+ignore = [
+    # rsa 0.10.0-rc.18: Marvin Attack, timing side channel in RSA private-key
+    # operations. RustSec has published NO patched version (patched = [] is
+    # intentional; rsa 0.9.10 stable and 0.10.0-rc.18 are both affected as of
+    # 2026-09-12), so there is nothing to upgrade to.
+    # Reachable only through the vendored oc-rsync's optional `embedded-ssh`
+    # feature (rsync_io -> russh -> ssh-key -> rsa). That feature is not enabled
+    # by this crate: `cargo tree` for the shipped Android target
+    # (aarch64-linux-android, default features) contains no russh/ssh-key/rsa,
+    # and tag-release.yml builds with `cargo ndk ... build` and no extra
+    # features. The package only appears in Cargo.lock because the workspace
+    # resolves optional dependencies. Checked 2026-10-20.
+    # Revisit when RustCrypto/RSA ships constant-time padding (RSA#626), or
+    # before anything enables `embedded-ssh`.
+    "RUSTSEC-2023-0071",
+]
