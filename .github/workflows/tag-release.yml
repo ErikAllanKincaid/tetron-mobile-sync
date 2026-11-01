@@ -92,6 +92,10 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        # The action's default package list includes the legacy `tools`
+        # package, which current cmdline-tools no longer provide.
+        with:
+          packages: platform-tools
 
       - name: Install Android NDK
         run: |
