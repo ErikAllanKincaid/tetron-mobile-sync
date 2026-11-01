@@ -1,0 +1,35 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 53732e5..7da465b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -327,7 +327,7 @@ windows-sys = "0.61"
+ # Extended attribute helpers - shared by apple-fs, cli, daemon (dev), engine (dev), metadata (optional)
+ xattr = "1.6"
+ # Zstandard codec - shared by compress and protocol (optional)
+-zstd = "0.13"
++zstd = "0.14"
+ 
+ [workspace.metadata.docs.rs]
+ all-features = true
+diff --git a/crates/engine/Cargo.toml b/crates/engine/Cargo.toml
+index 989b820..d86b82f 100644
+--- a/crates/engine/Cargo.toml
++++ b/crates/engine/Cargo.toml
+@@ -38,7 +38,7 @@ rustix = { workspace = true, features = ["fs", "param", "process"] }
+ tempfile = { workspace = true }
+ tokio = { workspace = true, optional = true, features = ["fs", "io-util", "sync", "rt"] }
+ filetime = { workspace = true }
+-zstd = { version = "0.13", optional = true }
++zstd = { version = "0.14", optional = true }
+ 
+ [target.'cfg(target_os = "macos")'.dependencies]
+ apple-fs = { path = "../apple-fs" }
+@@ -185,7 +185,7 @@ xattr = { workspace = true }
+ libc = { workspace = true }
+ criterion = { workspace = true }
+ rand = { workspace = true }
+-zstd = "0.13"
++zstd = "0.14"
+ 
+ [[bench]]
+ name = "optimizations_benchmark"

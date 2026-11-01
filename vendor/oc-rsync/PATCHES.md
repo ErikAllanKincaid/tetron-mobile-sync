@@ -12,11 +12,14 @@ vendored, not submoduled, so the app always builds from a self-contained tree).
 
 ## Regenerating
 
-Apply `patches/android-portability.diff` on a pristine `ce6d7f8` checkout:
+Apply the patches in `patches/` on a pristine `ce6d7f8` checkout, then let
+Cargo refresh the lockfile for the zstd version change:
 
 ```
 git checkout ce6d7f8
 git apply patches/android-portability.diff
+git apply patches/zstd-0.14.diff
+cargo update -p zstd@0.13.3
 ```
 
 This reproduces this directory exactly. Verified 2026-08-18: a clean checkout
@@ -62,6 +65,14 @@ All patches exist to make the tree cross-compile for Android (`aarch64-linux-and
 5. **makedev import (build, metadata):**
    - `crates/metadata/src/special.rs` — use `nix::libc::makedev` instead of
      `nix::sys::stat::makedev` (the latter is `cfg`'d away on Android in nix).
+
+6. **zstd 0.14 (security, build):** `zstd` 0.13 pulls in `zstd-safe` 7 and
+   `zstd-sys` 2.0, which carry RUSTSEC-2026-0391, -0398, -0403 and -0410. The
+   workspace dependency in `Cargo.toml` and `crates/engine/Cargo.toml` (its
+   optional spill-compression codec and its dev-dependency) move to `zstd`
+   0.14, which uses `zstd-safe` 8.2 and `zstd-sys` 2.1.2. oc-rsync uses only
+   the stream encoder and decoder, which 0.14 keeps unchanged; it builds with
+   and without `spill-compression`. In `patches/zstd-0.14.diff`.
 
 ## Embedded-build note (SYNC-002)
 
