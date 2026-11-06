@@ -4,14 +4,14 @@ An Android app that backs up your phone's camera roll to a computer you own, aut
 
 ## What it does
 
-Your phone and your home computer both join the same [tetron](https://github.com/ErikAllanKincaid/tetron) mesh network -- a private, encrypted network between your own devices, not a public service. Once they're both on it, this app watches your camera roll and copies new photos and videos to your home computer whenever it's safe and convenient to do so: normally only over Wi-Fi, only when connected directly rather than through a relay, and (optionally) only while charging or above a battery threshold you choose. You can also just tap a button to back up right now. The transfer itself uses `rsync`, the same well-established file-sync protocol used by countless backup tools, so an interrupted transfer picks up where it left off instead of starting over.
+Your phone and your home computer both join the same [tetron](https://github.com/tetronos/tetron) mesh network -- a private, encrypted network between your own devices, not a public service. Once they're both on it, this app watches your camera roll and copies new photos and videos to your home computer whenever it's safe and convenient to do so: normally only over Wi-Fi, only when connected directly rather than through a relay, and (optionally) only while charging or above a battery threshold you choose. You can also just tap a button to back up right now. The transfer itself uses `rsync`, the same well-established file-sync protocol used by countless backup tools, so an interrupted transfer picks up where it left off instead of starting over.
 
 Everything runs one-way, phone to home: this app never deletes or modifies anything unless you explicitly turn on "delete after backup," and even then it only ever deletes files that a given backup run actually finished copying.
 
 ## Setting up
 
-1. Install [tetron](https://github.com/ErikAllanKincaid/tetron) and its companion mobile app on your phone, and join your mesh network -- this app relies on that connection already existing, and has no networking of its own.
-2. On the computer you want backups to land on, install [tetron-sync-receiver](https://github.com/ErikAllanKincaid/tetron-sync-receiver) and set up at least one shared folder and one allowed device (your phone). See that project's own README for exact steps -- it can be done entirely from a terminal, or by clicking through [tetron-webui](https://github.com/ErikAllanKincaid/tetron-webui)'s dashboard if you run that too.
+1. Install [tetron](https://github.com/tetronos/tetron) and its companion mobile app on your phone, and join your mesh network -- this app relies on that connection already existing, and has no networking of its own.
+2. On the computer you want backups to land on, install [tetron-sync-receiver](https://github.com/tetronos/tetron-sync-receiver) and set up at least one shared folder and one allowed device (your phone). See that project's own README for exact steps -- it can be done entirely from a terminal, or by clicking through [tetron-webui](https://github.com/tetronos/tetron-webui)'s dashboard if you run that too.
 3. Open this app. If it's the first time it has talked to the mesh, you'll see a banner asking you to grant it access -- tap through and allow it.
 4. Grant photo/video access when prompted.
 5. In Settings, pick your home computer from the device list, and enter the folder name you shared in step 2.
@@ -32,7 +32,7 @@ Everything runs one-way, phone to home: this app never deletes or modifies anyth
 
 ## How this relates to tetron-sync-receiver
 
-This app is the phone side of a two-piece system. [tetron-sync-receiver](https://github.com/ErikAllanKincaid/tetron-sync-receiver) is the piece that runs on the receiving computer: it exposes shared folders, keeps a list of which devices are allowed to connect, and accepts the transfers this app sends. Neither piece works alone -- this app needs somewhere to send backups to, and tetron-sync-receiver needs something sending it files. They're separate projects (and separate licenses -- this app is GPL-3.0, tetron-sync-receiver is MPL-2.0) because a phone backup app and a headless receiver service are genuinely different pieces of software with different audiences, not because of any technical requirement to keep them apart.
+This app is the phone side of a two-piece system. [tetron-sync-receiver](https://github.com/tetronos/tetron-sync-receiver) is the piece that runs on the receiving computer: it exposes shared folders, keeps a list of which devices are allowed to connect, and accepts the transfers this app sends. Neither piece works alone -- this app needs somewhere to send backups to, and tetron-sync-receiver needs something sending it files. They're separate projects (and separate licenses -- this app is GPL-3.0, tetron-sync-receiver is MPL-2.0) because a phone backup app and a headless receiver service are genuinely different pieces of software with different audiences, not because of any technical requirement to keep them apart.
 
 ## License
 
